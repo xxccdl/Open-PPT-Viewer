@@ -175,6 +175,11 @@ pub fn install(
     }
     write_registry(&opts.dir, &exe, opts)?;
 
+    // 5.5 收掉「按用户装过的那一份」，并把它留在 HKCU 里的关联影子改指到这次装的位置。
+    //
+    // 不做这一步，老师升级完双击课件起来的还是那个旧副本 —— 详见函数注释。
+    settle_legacy_user_install(&opts.dir, &exe);
+
     // 6. 运行环境（WebView2）：新系统上一般已经有了，没有才装
     if !p.step("正在检查运行环境…", 78.0) {
         return Err("已取消".into());
@@ -477,6 +482,95 @@ fn remove_registry(scope: Scope) {
 }
 
 // ---------------------------------------------------------------------------
+// 旧副本（按用户装过的那一份）
+// ---------------------------------------------------------------------------
+
+/// 收掉「按用户装过的那一份」，并把它留在 HKCU 里的关联影子改指到这次装的位置。
+///
+/// # 为什么必须做这一步
+///
+/// 文件关联的 ProgID 是**分档**写的：按机器装（`C:\Program Files`）写 HKLM，
+/// 按用户装（`%LOCALAPPDATA%\Programs\OpenPPTView`）写 HKCU —— 而 HKCR 的
+/// 解析顺序是 **HKCU 优先**。一台机器上先后装过这两种，旧的那份就永远压着新的：
+/// 老师升级到最新版、双击课件，起来的还是旧副本那个进程。
+/// 他看到的只有一句「打开的还是老版本」，而从「默认打开方式」界面里
+/// 完全看不出问题（那儿显示的确实是 OpenPPTView）。
+///
+/// 所以每次安装都顺手做两件事：旧位置还在（且不是这次装的地方）就删掉它，
+/// 再把 HKCU 里那几条指向它的命令改指到新位置。做完之后
+/// 「双击课件 → 起来的一定是这一份」不再依赖老师先手动跑一次新版。
+///
+/// 删不掉不算失败（可能被占用、被策略保护）：宁可留下一个空目录，
+/// 也不该让整个安装因为这一步报错。
+fn settle_legacy_user_install(target: &Path, exe: &Path) {
+    let legacy = crate::per_user_dir();
+    if legacy.as_os_str().is_empty() || legacy == target || !legacy.exists() {
+        return;
+    }
+
+    log::info!("发现按用户装过的旧副本 {}，收掉它", legacy.display());
+    // 老师可能正开着那一份：先请它退出（`--quit`），再删文件
+    stop_running_app(&legacy);
+    remove_program_files(&legacy);
+    let _ = fs::remove_dir_all(&legacy);
+
+    // 旧副本自己的卸载登记与偏好写在 HKCU 那一档，一并清掉，
+    // 免得「应用和功能」里留一条指向已删程序的卸载项
+    remove_user_scope_records();
+
+    repoint_user_association(exe);
+}
+
+/// 清掉旧副本写在 HKCU 的卸载登记与偏好。
+///
+/// **不碰** `HKCU\Software\Classes` 下的 ProgID：那几个键才是「当前默认
+/// 打开方式」生效的地方（HKCR 里 HKCU 优先），删掉会让老师双击课件
+/// 毫无反应。它们要留下，只是改指到新位置（见 [`repoint_user_association`]）。
+fn remove_user_scope_records() {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let _ = hkcu.delete_subkey_all(UNINST_KEY);
+    let _ = hkcu.delete_subkey_all(PREF_KEY);
+}
+
+/// 把 HKCU 里**已经存在**的 ProgID 改指到这次装的位置。
+///
+/// 只在键已经存在时改：不存在说明老师没把「打开方式」交给过我们，
+/// 这时安装程序不该抢着创建 —— 那个入口在应用里的「注册到本应用」按钮上。
+fn repoint_user_association(exe: &Path) {
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_WRITE};
+    use winreg::RegKey;
+
+    let Ok(classes) =
+        RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags("Software\\Classes", KEY_WRITE)
+    else {
+        return;
+    };
+
+    let exe_s = exe.to_string_lossy().to_string();
+    let mut touched = false;
+    // 三种格式一起改：漏掉 pdf 的话，老师双击 pdf 起来的还是旧副本
+    for ext in [".pptx", ".ppsx", ".pdf"] {
+        let prog_id = format!("{PRODUCT}{ext}");
+        if classes.open_subkey(&prog_id).is_err() {
+            continue;
+        }
+        if let Ok((k, _)) = classes.create_subkey(format!("{prog_id}\\shell\\open\\command")) {
+            let _ = k.set_value("", &format!("\"{exe_s}\" \"%1\""));
+            touched = true;
+        }
+        if let Ok((k, _)) = classes.create_subkey(format!("{prog_id}\\DefaultIcon")) {
+            let _ = k.set_value("", &format!("\"{exe_s}\",0"));
+        }
+    }
+    if touched {
+        log::info!("HKCU 下的文件关联已改指到 {}", exe.display());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 运行环境：WebView2
 // ---------------------------------------------------------------------------
 
@@ -734,11 +828,48 @@ fn schedule_delete_on_reboot(path: &Path) {
     let _ = unsafe { MoveFileExW(PCWSTR(p.as_ptr()), None, MOVEFILE_DELAY_UNTIL_REBOOT) };
 }
 
-/// 装完把应用拉起来（以当前登录用户身份，不要以管理员身份跑界面）。
+/// 装完把应用拉起来 —— **以当前登录用户的身份，不带管理员权限**。
+///
+/// # 为什么不能直接 `ShellExecuteW`
+///
+/// 安装程序是提权跑的，它拉起来的子进程**继承管理员权限**，而老师那边会立刻撞上：
+///
+/// - 从资源管理器往窗口里拖课件会被系统挡掉（UIPI 不允许普通权限进程
+///   往高权限窗口投递拖放）；
+/// - 双击课件、让系统按关联启动我们时，新起的那一份是**普通权限**，
+///   它把文件转交给那个管理员权限的常驻实例这一步同样会被 UIPI 挡掉 ——
+///   老师看到的是「双击了，什么都没发生」。实测过：普通权限的 `--quit`
+///   也叫不动管理员权限的那个实例。
+///
+/// 所以先请资源管理器替我们启动：它自己是普通权限，由它拉起的就是普通权限
+/// （安装程序里最常用的换 token 办法，不必自己去复制外壳令牌）。
+/// 万一没起来（极端环境里没有 shell），再退回直接启动 ——
+/// 带管理员权限总比不回来强。
 pub fn launch_app(dir: &Path) {
     let exe = dir.join(EXE_NAME);
     let file = wide(exe.as_os_str());
     let verb = wide_str("open");
+
+    // ① 请资源管理器代启动
+    let explorer = wide_str("explorer.exe");
+    let delegated = unsafe {
+        ShellExecuteW(
+            None,
+            PCWSTR(verb.as_ptr()),
+            PCWSTR(explorer.as_ptr()),
+            PCWSTR(file.as_ptr()),
+            None,
+            SW_SHOWNORMAL,
+        )
+        .0 as isize
+            > 32
+    };
+    if delegated && wait_until_started() {
+        return;
+    }
+
+    // ② 兜底：直接启动（这一份会带管理员权限）
+    log::warn!("请资源管理器代启动没成功，改为直接启动（这一份会带管理员权限）");
     unsafe {
         ShellExecuteW(
             None,
@@ -749,6 +880,20 @@ pub fn launch_app(dir: &Path) {
             SW_SHOWNORMAL,
         );
     }
+}
+
+/// 等应用真的起来（最多 10 秒）。
+///
+/// 「资源管理器代启动」成没成只能这样确认：那条路上 `ShellExecuteW` 的返回值
+/// 只说明请求递出去了，不代表应用已经起来。
+fn wait_until_started() -> bool {
+    for _ in 0..40 {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        if process_running(EXE_NAME) {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]

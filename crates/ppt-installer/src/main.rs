@@ -256,7 +256,10 @@ fn default_install_dir() -> PathBuf {
 }
 
 /// 当前用户目录下的安装位置（`%LOCALAPPDATA%\Programs\OpenPPTView`）。
-fn per_user_dir() -> PathBuf {
+///
+/// 按机器装的时候也要用它：旧版本可能是按用户装的，那一份得收掉
+/// （见 `install::settle_legacy_user_install`）。
+pub(crate) fn per_user_dir() -> PathBuf {
     let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
     Path::new(&base).join("Programs").join(install::PRODUCT)
 }

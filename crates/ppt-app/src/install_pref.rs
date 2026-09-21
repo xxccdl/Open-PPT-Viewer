@@ -10,6 +10,8 @@
 //! 「老师后来在应用里改过」> 「安装时选的」> 「自动识别」。
 //! 所以这里只负责把安装时的选择交出去，应用里的改动由前端记着（见 `loadInputMode`）。
 
+use std::path::PathBuf;
+
 use serde::Serialize;
 
 /// 注册表里放我们这一摊的键。
@@ -23,6 +25,13 @@ pub struct InstallPreference {
     pub input_mode: String,
     /// 安装时是否勾了「在桌面上放一个快捷方式」。
     pub desktop_shortcut: bool,
+    /// 装在哪。
+    ///
+    /// 应用用它回答一个很具体的问题：**我是不是装在这台机器上的那一份**。
+    /// 只有那一份才有资格把文件关联改指到自己（见
+    /// [`crate::associations::repair_if_needed`]）—— 否则直接跑编译产物
+    /// 也会顺手把老师的 `.pptx` 抢过去。
+    pub install_location: Option<PathBuf>,
 }
 
 /// 读安装时的选择。
@@ -48,9 +57,16 @@ pub fn read() -> Option<InstallPreference> {
             continue;
         }
         let desktop: u32 = key.get_value("DesktopShortcut").unwrap_or(1);
+        let dir: String = key.get_value("InstallLocation").unwrap_or_default();
+        let dir = dir.trim().to_string();
         return Some(InstallPreference {
             input_mode: mode,
             desktop_shortcut: desktop != 0,
+            install_location: if dir.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(dir))
+            },
         });
     }
     None

@@ -20,8 +20,19 @@
 //! 才需要调起系统设置界面让老师点一次「设为默认值」。
 //!
 //! 全程只写 `HKCU`，不需要管理员权限，也不碰 `UserChoice`。
+//!
+//! # 同一台机器上装过两次会怎样
+//!
+//! ProgID 是**分档**写的：按机器装（`C:\Program Files`）写 HKLM，按用户装
+//! （`%LOCALAPPDATA%\Programs\OpenPPTView`）写 HKCU —— 而 HKCR 的解析顺序是
+//! **HKCU 优先**。于是「先按用户装过一次、后来按机器升级」的机器上，
+//! 旧副本留在 HKCU 的那条命令一直压着新的：老师升级到最新版、双击课件，
+//! 起来的还是那个旧副本，他看到的是「打开的还是老版本」。
+//!
+//! 所以 [`status`] 不只看 ProgID 在不在，还要看它的命令**指着谁**；
+//! [`repair_if_needed`] 把「指着别的副本」也一并改回来。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// 应用在注册表里使用的名字（`RegisteredApplications` 的键名、
 /// 以及系统设置里显示的名字）。
@@ -66,9 +77,14 @@ pub struct AssocStatus {
     pub ext: String,
     /// 友好名称。
     pub label: String,
-    /// 是否已注册为本应用的「打开方式」候选项。
+    /// ProgID 是否已登记（「打开方式」候选项里有我们）。
     pub registered: bool,
-    /// 当前的系统默认程序是否就是本应用。
+    /// 那条 ProgID 的打开命令指着的是不是**当前这一份**程序。
+    ///
+    /// 与 `registered` 分开是因为它们是两件事：键在、但命令指着另一个副本，
+    /// 双击课件起来的就不是你现在用的这个版本（见 [`repair_if_needed`]）。
+    pub points_here: bool,
+    /// 当前的系统默认程序是否就是本应用，**并且真的能打开**。
     pub is_default: bool,
     /// 当前默认程序的名字（若非本应用，用于告知老师现状）。
     pub current_handler: Option<String>,
@@ -166,25 +182,42 @@ pub fn register_all(exe: &Path) -> Result<AssocOutcome, String> {
     Ok(AssocOutcome { items, all_default })
 }
 
-/// 自愈：默认打开方式指着我们、但我们的 ProgID 已经不在了，就补回来。
+/// 自愈：默认打开方式指着我们、但那条 ProgID 不能把我们叫起来，就修回来。
 ///
-/// # 为什么需要这个
+/// # 两种要修的情况
 ///
-/// 卸载会把 `OpenPPTView.pptx` 这个 ProgID 删掉，而
+/// 一、**ProgID 被删了**。卸载会删掉 `OpenPPTView.pptx`，而
 /// `FileExts\...\UserChoice` 是 **Windows 保护的键**（值里带哈希，
 /// 程序写不进去）—— 它会一直指着那个已经不存在的 ProgID。
 /// 于是老师双击课件**毫无反应**：系统找不到处理程序，也没有任何提示。
 /// 重装一次本来能好，但「重装之后第一次双击仍然没反应」谁都会以为是程序坏了。
 ///
-/// 所以每次启动顺手看一眼：只要有一个格式处于「指着我们、ProgID 却没了」，
-/// 就把整套关联重新登记一遍（`register_all` 是幂等的）。
+/// 二、**ProgID 指着另一个副本**（见模块开头那段）：按用户装过的那份留在
+/// HKCU 的命令压着 HKLM 里的新的，双击课件起来的是旧版本。
+///
+/// 两种情况都不是「老师选了别的程序」，所以每次启动顺手看一眼，
+/// 命中就把整套关联重新登记一遍（`register_all` 是幂等的）。
 /// 返回是否真的修补过，便于记日志。
+///
+/// # `may_repoint`：谁能改「指着别人的那一条」
+///
+/// 键被删了谁都能补（补的是我们自己的键）；但把一条**已经存在、只是指着
+/// 另一个副本**的命令改指到自己，只有「装在这台机器上的那一份」才该做 ——
+/// 否则开发时直接跑编译产物（`target\release\ppt-app.exe`）也会顺手把老师的
+/// `.pptx` 抢过去，而这一整段代码本来就是为了消灭「打开的是另一个版本」。
 #[cfg(windows)]
-pub fn repair_if_dangling(exe: &Path) -> bool {
-    let dangling = status().iter().any(|s| {
-        !s.registered && s.current_handler.as_deref() == Some(prog_id(&s.ext).as_str())
+pub fn repair_if_needed(exe: &Path, may_repoint: bool) -> bool {
+    let need = status().iter().any(|s| {
+        // 老师选了别的程序就完全不插手
+        if s.current_handler.as_deref() != Some(prog_id(&s.ext).as_str()) {
+            return false;
+        }
+        if !s.registered {
+            return true;
+        }
+        !s.points_here && may_repoint
     });
-    if !dangling {
+    if !need {
         return false;
     }
     register_all(exe).is_ok()
@@ -192,8 +225,56 @@ pub fn repair_if_dangling(exe: &Path) -> bool {
 
 /// 非 Windows：没有关联可修。
 #[cfg(not(windows))]
-pub fn repair_if_dangling(_exe: &Path) -> bool {
+pub fn repair_if_needed(_exe: &Path, _may_repoint: bool) -> bool {
     false
+}
+
+/// 从一条打开命令里取出可执行文件路径。
+///
+/// 命令形如 `"C:\…\OpenPPTView.exe" "%1"`（[`register_all`] 与安装程序都这么写）。
+/// 解析失败返回 `None` —— 宁可当「不是我们」，也不要误判成「就是这一份」。
+fn command_exe(cmd: &str) -> Option<String> {
+    let cmd = cmd.trim();
+    // 带引号就取引号里那一段（路径里有空格时必然带引号）
+    let path = if let Some(rest) = cmd.strip_prefix('"') {
+        rest.split('"').next()?
+    } else {
+        cmd.split_whitespace().next()?
+    };
+    if path.is_empty() {
+        None
+    } else {
+        Some(path.to_string())
+    }
+}
+
+/// 某个 ProgID 的打开命令里写的是哪个 exe。
+#[cfg(windows)]
+fn registered_exe(pid: &str) -> Option<PathBuf> {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+
+    let cmd: String = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(format!("Software\\Classes\\{pid}\\shell\\open\\command"))
+        .ok()?
+        .get_value("")
+        .ok()?;
+    command_exe(&cmd).map(PathBuf::from)
+}
+
+/// 这条命令指着的是不是当前这一份程序。
+///
+/// 注册表里存的可能是另一种写法（大小写、短名、链接），所以先规范化再比，
+/// 规范化不了才退回不区分大小写的字符串比较。
+#[cfg(windows)]
+fn points_at(path: &Path, exe: &Path) -> bool {
+    if path == exe {
+        return true;
+    }
+    match (path.canonicalize(), exe.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => path.to_string_lossy().eq_ignore_ascii_case(&exe.to_string_lossy()),
+    }
 }
 
 /// 查询当前关联状态。
@@ -204,6 +285,9 @@ pub fn status() -> Vec<AssocStatus> {
 
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
 
+    // 当前这一份程序是谁：关联指着别处时，界面得能如实说出来
+    let me = std::env::current_exe().ok();
+
     SPECS
         .iter()
         .map(|spec| {
@@ -212,6 +296,13 @@ pub fn status() -> Vec<AssocStatus> {
             let registered = hkcu
                 .open_subkey(format!("Software\\Classes\\{pid}"))
                 .is_ok();
+
+            // 键在 ≠ 能叫起我们来：命令可能指着另一个副本（见模块开头那段）
+            let points_here = registered
+                && me
+                    .as_deref()
+                    .zip(registered_exe(&pid).as_deref())
+                    .is_some_and(|(me, target)| points_at(target, me));
 
             // UserChoice 优先；没有它时才看 Classes 的默认值
             let user_choice = hkcu
@@ -229,18 +320,20 @@ pub fn status() -> Vec<AssocStatus> {
                 .filter(|s| !s.is_empty());
 
             let handler = user_choice.or(fallback);
-            // 必须**同时**满足：系统当前指向我们的 ProgID，且那个 ProgID 真的还在。
+            // 「已经是默认」要三件事同时成立：系统指着我们、那条 ProgID 还在、
+            // 而且它真的能把我们叫起来。
             //
-            // 只看前者会在一种真实出现过的状态上撒谎：卸载时我们删掉了自己的
-            // ProgID，但 `FileExts\...\UserChoice` 是 Windows 保护的键
-            // （值里带哈希，程序写不进去），它会一直指着那个已经不存在的 ProgID。
-            // 这时候双击课件其实打不开，界面就不该说「已经是默认了」。
-            let is_default = registered && handler.as_deref() == Some(pid.as_str());
+            // 少一条都会撒谎，而这两种状态都真实出现过：卸载删掉 ProgID 之后
+            // `FileExts\...\UserChoice` 还指着它（双击毫无反应）；按用户装过的
+            // 那份把命令改成了旧副本（双击起来的是老版本）。
+            // 界面应该说「还没设好」，而不是「已经是默认了」。
+            let is_default = registered && points_here && handler.as_deref() == Some(pid.as_str());
 
             AssocStatus {
                 ext: spec.ext.to_string(),
                 label: spec.label.to_string(),
                 registered,
+                points_here,
                 is_default,
                 current_handler: handler,
             }
@@ -326,6 +419,27 @@ mod tests {
             assert!(!s.ext.starts_with('.'), "扩展名不应带点：{}", s.ext);
             assert!(!s.label.is_empty());
         }
+    }
+
+    #[test]
+    fn command_exe_survives_paths_with_spaces() {
+        // 这条解析错了，就会把「指着另一个副本」当成「指着自己」——
+        // 也就是这次报的那个问题：双击课件起来的是老版本，界面还说已是默认。
+        assert_eq!(
+            command_exe("\"C:\\Program Files\\OpenPPTView\\OpenPPTView.exe\" \"%1\"").as_deref(),
+            Some("C:\\Program Files\\OpenPPTView\\OpenPPTView.exe")
+        );
+        assert_eq!(
+            command_exe("\"C:\\Users\\a b\\AppData\\Local\\Programs\\OpenPPTView\\OpenPPTView.exe\" \"%1\"").as_deref(),
+            Some("C:\\Users\\a b\\AppData\\Local\\Programs\\OpenPPTView\\OpenPPTView.exe")
+        );
+        // 不带引号的写法也得认
+        assert_eq!(
+            command_exe("C:\\OpenPPTView.exe %1").as_deref(),
+            Some("C:\\OpenPPTView.exe")
+        );
+        assert_eq!(command_exe("   "), None);
+        assert_eq!(command_exe(""), None);
     }
 
     #[test]

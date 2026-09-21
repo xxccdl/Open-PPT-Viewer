@@ -1148,6 +1148,72 @@ Task 36 让画面来源换成了「整本矢量 PDF」，画得准了，但把�
 > `--remote-debugging-port` + CDP 的 `Runtime.evaluate` 点按钮完成的 ——
 > 走的仍是页面里那些真实的 handler，不是绕过界面直接调后端。
 
+## Task 44: 「升级完了，双击课件起来的还是老版本」 —— 已交付
+
+老师升级到最新版、退出，再双击一个 `.pptx` —— 起来的却是旧版本。
+
+### 一、根因：关联是**分档**写的，而 HKCR 里 HKCU 优先
+
+- ProgID 跟着安装方式走：按机器装（`C:\Program Files`）写 HKLM，
+  按用户装（`%LOCALAPPDATA%\Programs\OpenPPTView`）写 HKCU。
+- 这台机器上先后装过这两种：早先按用户装的那份把
+  `HKCU\Software\Classes\OpenPPTView.pptx\shell\open\command`
+  指向了它自己；后来按机器升级写的是 HKLM。
+  **HKCR 的解析顺序是 HKCU 优先**，于是那条影子一直压着新的。
+- 界面上完全看不出来：`FileExts\.pptx\UserChoice` = `OpenPPTView.pptx`，
+  「默认打开方式」显示的确实就是 OpenPPTView。
+- 实测（修复前）：`HKCR\OpenPPTView.pptx\shell\open\command` =
+  `"C:\Users\65411\AppData\Local\Programs\OpenPPTView\OpenPPTView.exe" "%1"`
+  —— 那是 9/20 22:33 装下的旧副本，文件还在磁盘上。
+  同一时刻 `.pdf` 已经指向 Program Files（那份是应用自己登记的），
+  所以只有 `.pptx` 有问题 —— 这个不一致本身就是「两个来源在写同一个键」的证据。
+
+### 二、修法
+
+- [x] `associations::status` 的「已注册」以前只看 ProgID 键在不在，
+  现在还要看它的命令**指着谁**（新增 `points_here`）。键在、但指着另一个副本，
+  就不算「能打开」，界面也不该说「已经是默认了」。
+- [x] `repair_if_dangling` → `repair_if_needed`：把「指着另一个副本」也纳入自愈。
+  但**只有装在这台机器上的那一份**才有资格改（`may_repoint` 用
+  `InstallLocation` 判断）—— 否则开发时直接跑 `target\release\ppt-app.exe`
+  也会把老师的 `.pptx` 抢过去，又造出一次「打开的是另一个版本」。
+- [x] 安装器装完顺手 `settle_legacy_user_install`：发现有按用户装过的旧副本
+  （且不是这次装的地方）就收掉它 —— 先 `--quit` 请它退出、删目录、清掉它
+  写在 HKCU 的卸载登记与偏好 —— 再把 HKCU 里那几条指向它的命令改指到新位置。
+  这样「双击课件 → 起来的一定是这一份」不再依赖老师先手动跑一次新版。
+- [x] 设置页 / 欢迎页跟着诚实：`pointsHere` 为假时如实显示
+  「注册指向的是另一个副本，点『注册到本应用』改过来」。
+
+### 三、顺手修掉的第二个问题：装完拉起来的那份是**管理员权限**
+
+安装程序是提权的，`ShellExecuteW` 拉起的子进程继承管理员权限。实测两条后果：
+
+- 从资源管理器往窗口里拖课件会被 UIPI 挡掉（普通权限进程不能往高权限窗口拖放）；
+- **双击课件时新起的普通权限实例，没法把文件转交给那个常驻的高权限实例**
+  （消息同样被 UIPI 挡掉）—— 老师看到的是「双击了，什么都没发生」。
+  实测：普通权限的 `--quit` 叫不动管理员权限的那个实例，提权的可以。
+
+修法：`launch_app` 改成**请资源管理器代启动**（它自己是普通权限，由它拉起
+就是普通权限 —— 安装程序里最常见的换 token 办法，不必自己去复制外壳令牌），
+起来之后用 `process_running` 确认；没起来再退回直接启动。
+
+### 四、验证
+
+- [x] `cargo test -p ppt-app`：15 passed（含新增的命令行解析测试
+  `command_exe_survives_paths_with_spaces`）
+- [x] 修复前 / 后对比，同一台机器：
+   `HKCR\OpenPPTView.pptx\shell\open\command`
+   `…\Local\Programs\OpenPPTView\OpenPPTView.exe` → `C:\Program Files\OpenPPTView\OpenPPTView.exe`
+- [x] 安装日志：`发现按用户装过的旧副本 …\Local\Programs\OpenPPTView，收掉它` +
+  `HKCU 下的文件关联已改指到 C:\Program Files\OpenPPTView\OpenPPTView.exe`
+- [x] 三种格式（`.pptx` / `.ppsx` / `.pdf`）现在都指回新的安装位置；
+  旧副本目录、它在 HKCU 的卸载登记与偏好都已清掉
+- [x] **按关联打开真的走到新版**：从普通权限的 shell 打开一个 `.pptx`，
+  应用日志出现 `已打开 光合作用-测试课件.pptx（8 页，960×540pt）`
+  —— 既证明起的是新装的那份，也证明装完拉起来的那份是普通权限（转交通了）
+- [x] 实测确认过 Explorer 代启动确实降权：由它拉起的实例，普通权限的 `--quit`
+  能叫停；而安装程序直接拉起的那个，只有提权的 `--quit` 能叫停
+
 # Task Dependencies
 
 - Task 2 依赖 Task 1

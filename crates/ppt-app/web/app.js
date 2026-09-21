@@ -4083,14 +4083,18 @@ async function refreshAssoc() {
       list.innerHTML = '';
       for (const it of items) {
         const chip = document.createElement('span');
-        const state = it.isDefault ? 'default' : it.registered ? 'registered' : '';
+        // `pointsHere` 才是「这一份程序真的在管这个格式」：注册表里那条
+        // 可能指着同名的另一个副本（按用户装过的那份），双击起来的是它
+        const state = it.isDefault ? 'default' : it.pointsHere ? 'registered' : '';
         chip.className = `assoc-chip ${state}`.trim();
         chip.textContent = `.${it.ext}`;
         chip.title = it.isDefault
           ? `${it.label}：已是默认打开方式`
-          : it.registered
+          : it.pointsHere
             ? `${it.label}：已注册，当前默认是 ${it.currentHandler || '其它程序'}`
-            : `${it.label}：尚未注册`;
+            : it.registered
+              ? `${it.label}：注册指向的是另一个副本，点「注册到本应用」改过来`
+              : `${it.label}：尚未注册`;
         list.appendChild(chip);
       }
     }

@@ -823,6 +823,23 @@ fn install_preference() -> Option<install_pref::InstallPreference> {
     install_pref::read()
 }
 
+/// 本进程是不是「装在这台机器上的那一份」。
+///
+/// 只有它才有资格把文件关联改指到自己（见 [`associations::repair_if_needed`]）：
+/// 直接跑编译产物（`target\release\ppt-app.exe`）时也去改，等于亲手造出
+/// 「双击课件打开的是另一个版本」——只不过是开发构建那一份。
+/// 读不到安装记录（绿色版、开发时直接跑 exe）就当作不是。
+fn is_installed_copy(exe: &Path) -> bool {
+    let Some(dir) = install_pref::read().and_then(|p| p.install_location) else {
+        return false;
+    };
+    let Some(me) = exe.parent() else {
+        return false;
+    };
+    // Windows 的路径不区分大小写
+    me == dir || me.to_string_lossy().eq_ignore_ascii_case(&dir.to_string_lossy())
+}
+
 /// 通知前端「办公软件的第一页已经出好了」。
 #[derive(Serialize, Clone)]
 struct RasterReady {
@@ -2358,11 +2375,14 @@ fn main() {
                 return Ok(());
             }
 
-            // 文件关联自愈：默认打开方式指着我们、ProgID 却被删了（卸载干过这事），
-            // 双击课件会**毫无反应**。启动时顺手补回来，见 `repair_if_dangling`。
+            // 文件关联自愈：默认打开方式指着我们，但那条 ProgID 要么被卸载删了、
+            // 要么指着**另一个副本**（按用户装过的那份压着现在这份），
+            // 老师双击课件看到的就是「没反应」或者「打开的是老版本」。
+            // 见 `associations::repair_if_needed`。
             if let Ok(exe) = std::env::current_exe() {
-                if associations::repair_if_dangling(&exe) {
-                    log::info!("文件关联指向了已不存在的 ProgID，已重新登记");
+                let mine = is_installed_copy(&exe);
+                if associations::repair_if_needed(&exe, mine) {
+                    log::info!("文件关联指向的不是这一份程序，已按当前版本重新登记");
                 }
             }
 

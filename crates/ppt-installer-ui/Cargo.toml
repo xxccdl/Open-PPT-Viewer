@@ -1,0 +1,14 @@
+[package]
+name = "ppt-installer-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "安装程序的界面：自己画的控件、配色与排版（不依赖 WebView2 与任何 UI 框架）"
+
+[dependencies]
+ppt-core = { workspace = true }
+ppt-text = { workspace = true }
+ppt-render = { workspace = true }
+log = { workspace = true }
+# `png-format` 只为开发期的预览模式：把界面渲染成 PNG，肉眼过一遍再上真机
+tiny-skia = { version = "0.12.0", features = ["png-format"] }

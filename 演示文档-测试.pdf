@@ -1,0 +1,65 @@
+%PDF-1.7
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R 5 0 R 7 0 R] /Count 3 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 9 0 R >> >> /Contents 4 0 R >>
+endobj
+4 0 obj
+<< /Length 279 >>
+stream
+BT /F1 32 Tf 60 760 Td (OpenPPTView PDF Test) Tj ET
+1 0 0 rg 60 620 220 90 re f
+0 0.5 1 rg 320 620 220 90 re f
+0 0.7 0 rg 60 500 480 90 re f
+BT /F1 16 Tf 60 450 Td (Standard Helvetica font - page 1 of 3) Tj ET
+BT /F1 16 Tf 60 420 Td (Bottom-left origin: red bar is highest) Tj ET
+endstream
+endobj
+5 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 9 0 R >> >> /Contents 6 0 R >>
+endobj
+6 0 obj
+<< /Length 136 >>
+stream
+0.9 0.6 0 rg 60 60 480 700 re f
+BT /F1 28 Tf 100 700 Td (Page 2) Tj ET
+BT /F1 16 Tf 100 660 Td (Solid rectangle covering the page) Tj ET
+endstream
+endobj
+7 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 9 0 R >> >> /Contents 8 0 R >>
+endobj
+8 0 obj
+<< /Length 212 >>
+stream
+BT /F1 28 Tf 60 760 Td (Page 3 - vectors) Tj ET
+0 0 0 rg 60 400 400 10 re f
+BT /F1 14 Tf 60 360 Td (A thin horizontal rule below this text) Tj ET
+1 0.5 0 rg 60 120 140 140 re f
+0.2 0.2 0.9 rg 340 120 140 140 re f
+endstream
+endobj
+9 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+xref
+0 10
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000127 00000 n 
+0000000254 00000 n 
+0000000584 00000 n 
+0000000711 00000 n 
+0000000898 00000 n 
+0000001025 00000 n 
+0000001288 00000 n 
+trailer
+<< /Size 10 /Root 1 0 R >>
+startxref
+1358
+%%EOF

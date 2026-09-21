@@ -1,0 +1,26 @@
+[package]
+name = "ppt-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SceneGraph 光栅化渲染器"
+
+[dependencies]
+ppt-core = { workspace = true }
+ppt-text = { workspace = true }
+log = { workspace = true }
+tiny-skia = "0.12.0"
+num_cpus = "1.17.0"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp", "tiff"] }
+ttf-parser = "0.25"
+
+[dev-dependencies]
+# 端到端测试需要真实的 PPTX 解析器，验证「解析 → 渲染」整条链路
+ppt-format-pptx = { workspace = true }
+# `render_pdf` 示例用来看「WPS/Office 导出的 PDF」被光栅化成什么样
+ppt-format-pdf = { workspace = true }
+zip = { version = "8.6.0", default-features = false, features = [
+    "deflate",
+    "deflate-flate2",
+    "deflate-flate2-zlib-rs",
+] }

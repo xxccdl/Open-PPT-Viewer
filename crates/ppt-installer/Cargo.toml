@@ -1,0 +1,56 @@
+[package]
+name = "ppt-installer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OpenPPTView 安装程序：自绘界面的原生安装器（不依赖 NSIS / WebView2）"
+
+# 注意这里**故意不叫** `OpenPPTView-Setup`。
+#
+# `cargo build` 直接产出的这个 exe 只是安装器的壳，**尾部还没有追加载荷**，
+# 单独运行必然报「安装包中缺少程序数据」。而成品安装包由
+# `packaging/windows/make-setup.ps1` 生成，名字才是 `OpenPPTView-Setup.exe`。
+# 两者曾经同名，结果就是有人（合理地）从构建目录里拿了那个壳去装，
+# 得到一句莫名其妙的报错。名字分开，就没得选错。
+[[bin]]
+name = "ppt-installer"
+path = "src/main.rs"
+
+[features]
+# 默认带上「以管理员身份运行」的清单；本机自测时用 --no-default-features 关掉，
+# 免得每次运行都要过一遍 UAC。
+default = ["admin-manifest"]
+admin-manifest = []
+
+[dependencies]
+ppt-installer-ui = { path = "../ppt-installer-ui" }
+ppt-core = { workspace = true }
+log = { workspace = true }
+tiny-skia = "0.12.0"
+winreg = "0.55"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
+    "Win32_Storage_FileSystem",
+    # 卸载时要找到并结束正在运行的 OpenPPTView（删不掉被锁住的 exe）
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+    "Win32_System_Com",
+    # 下载 WebView2 引导器用的 urlmon
+    "Win32_System_Com_Urlmon",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    # DWM 的 MARGINS 在 Controls 下
+    "Win32_UI_Controls",
+    # GetDpiForWindow
+    "Win32_UI_HiDpi",
+    # ReleaseCapture
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    # SHBrowseForFolderW / FOLDERID_*
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+] }

@@ -1,0 +1,21 @@
+[package]
+name = "ppt-format-pptx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PPTX 格式解析：OOXML → SceneGraph"
+
+[dependencies]
+ppt-core = { workspace = true }
+ppt-text = { workspace = true }
+log = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.11.0"
+
+[dev-dependencies]
+# 集成测试需要自行拼装最小 PPTX 包
+zip = { version = "8.6.0", default-features = false, features = [
+    "deflate",
+    "deflate-flate2",
+    "deflate-flate2-zlib-rs",
+] }

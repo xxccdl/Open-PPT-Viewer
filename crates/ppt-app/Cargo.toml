@@ -1,0 +1,43 @@
+[package]
+name = "ppt-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Tauri 应用：窗口、命令、自定义协议与文件关联"
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [] }
+
+[dependencies]
+ppt-core = { workspace = true }
+ppt-text = { workspace = true }
+ppt-render = { workspace = true }
+ppt-pipeline = { workspace = true }
+ppt-format-pptx = { workspace = true }
+ppt-format-pdf = { workspace = true }
+# 借用本机 WPS / Office 内核导出矢量 PDF（见 `ppt-convert`）
+ppt-convert = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# `protocol-asset`：让 <video>/<audio> 能以流式方式播放导出的媒体文件。
+# 关掉它就只剩 blob://（整段视频读进 JS 内存），老机器上承受不起
+# `tray-icon`：关窗后进程留在后台，得有个托盘图标让老师能把它真正关掉
+tauri = { version = "2.11.5", features = ["protocol-asset", "tray-icon"] }
+tauri-plugin-dialog = "2.7.3"
+# 单实例：第二次双击课件时把路径转交给已经开着的那个进程，自己随即退出。
+# 这是「打开过一次之后，再打开就是秒开」的关键 —— 见 `main.rs` 的说明
+tauri-plugin-single-instance = "2"
+
+# 默认打开方式自动注册：只需读写 HKCU，纯 Rust 实现，无需管理员权限
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
+# `ShellExecuteW`：把外部链接/文件交给系统默认程序。
+#
+# 以前这里走的是 `cmd /C start`，URL 里一个 `&` 就会被 cmd 当命令分隔符，
+# 正常的带参链接点了毫无反应（见 `open_external` 的说明）。
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }

@@ -1,0 +1,23 @@
+# 构建产物
+#
+# `.cargo/config.toml` 里可能把 target-dir 指到别处（见 README「给小硬盘腾地方」），
+# 这条是兜底
+/target/
+
+# 本机私有配置：里面是绝对路径，换台机器就不成立
+/.cargo/config.toml
+
+# 打包产物与第三方引导器：都能重新生成，体积也大
+# （安装包 15MB+，WebView2 引导器 1.8MB）
+/packaging/out/
+/packaging/windows/redist/
+
+# 调试用的临时目录
+/.tmp-deck/
+
+# 编辑器与系统
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini

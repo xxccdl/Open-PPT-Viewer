@@ -1,0 +1,21 @@
+[package]
+name = "ppt-text"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "字体解析、文本整形、CJK 断行与文本布局"
+
+[dependencies]
+ppt-core = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+# 显式声明 `memmap`：字体数据以内存映射方式共享，
+# 未用到的字体不会占用物理内存（见 `fonts::LoadedFont` 的说明）
+fontdb = { version = "0.24.0", features = ["fs", "memmap"] }
+# 自行建立字体文件的 mmap：fontdb 只保存路径，不保留映射，
+# 因此按需读取必须由我们完成（见 `fonts::FontDataStore`）
+memmap2 = "0.9.11"
+ttf-parser = "0.25.1"
+rustybuzz = "0.20.1"
+unicode-linebreak = "0.1.5"

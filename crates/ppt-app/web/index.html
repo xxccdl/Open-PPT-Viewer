@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+    <title>OpenPPTView</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <!-- 图标精灵：统一 24×24 线性风格，避免 emoji -->
+    <svg width="0" height="0" style="position: absolute" aria-hidden="true">
+      <defs>
+        <g id="i-open">
+          <path d="M3 7a2 2 0 0 1 2-2h3.6l1.6 2H19a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
+        </g>
+        <g id="i-sidebar">
+          <rect x="3" y="4" width="18" height="16" rx="2" />
+          <path d="M9 4v16" />
+        </g>
+        <g id="i-prev"><path d="M15 5l-7 7 7 7" /></g>
+        <g id="i-next"><path d="M9 5l7 7-7 7" /></g>
+        <g id="i-chevron"><path d="M6 9l6 6 6-6" /></g>
+        <g id="i-first"><path d="M6 5v14M18 5l-8 7 8 7" /></g>
+        <g id="i-last"><path d="M18 5v14M6 5l8 7-8 7" /></g>
+        <g id="i-zoom-in">
+          <circle cx="11" cy="11" r="6.5" />
+          <path d="M20 20l-4.2-4.2M11 8.5v5M8.5 11h5" />
+        </g>
+        <g id="i-zoom-out">
+          <circle cx="11" cy="11" r="6.5" />
+          <path d="M20 20l-4.2-4.2M8.5 11h5" />
+        </g>
+        <g id="i-fit">
+          <rect x="3.5" y="5.5" width="17" height="13" rx="1.5" />
+          <path d="M8 9.5h8M8 12h8M8 14.5h5" />
+        </g>
+        <g id="i-present">
+          <rect x="3" y="4" width="18" height="12" rx="1.5" />
+          <path d="M12 16v4M8.5 20h7" />
+        </g>
+        <g id="i-pointer"><path d="M5.5 3.3l12.6 7.3-5.5 1.4-1.4 5.5z" /></g>
+        <g id="i-pen">
+          <path d="M4 20l1-4L16.5 4.5a2.1 2.1 0 0 1 3 3L8 19z" />
+          <path d="M14.5 6.5l3 3" />
+        </g>
+        <g id="i-laser">
+          <circle cx="12" cy="12" r="3" />
+          <path d="M12 2.5v3.2M12 18.3v3.2M2.5 12h3.2M18.3 12h3.2" />
+          <path d="M5.8 5.8l2.3 2.3M15.9 15.9l2.3 2.3M18.2 5.8l-2.3 2.3M8.1 15.9l-2.3 2.3" />
+        </g>
+        <g id="i-exit">
+          <path d="M10 5H6.5A1.5 1.5 0 0 0 5 6.5v11A1.5 1.5 0 0 0 6.5 19H10" />
+          <path d="M14.5 8.5L18 12l-3.5 3.5M18 12H9" />
+        </g>
+        <g id="i-highlighter">
+          <path d="M5 19h6M8 16l7.5-7.5a2 2 0 0 1 2.8 2.8L10.8 18.8z" />
+          <path d="M14 6l4 4" />
+        </g>
+        <g id="i-eraser">
+          <path d="M8.5 20H19" />
+          <path d="M15.5 4.5l4 4a1.5 1.5 0 0 1 0 2.1l-7.3 7.3a1.5 1.5 0 0 1-2.1 0l-4-4a1.5 1.5 0 0 1 0-2.1l7.3-7.3a1.5 1.5 0 0 1 2.1 0z" />
+        </g>
+        <g id="i-undo"><path d="M9 8H5V4" /><path d="M5 8a8 8 0 1 1 0 8" /></g>
+        <g id="i-redo"><path d="M15 8h4V4" /><path d="M19 8a8 8 0 1 0 0 8" /></g>
+        <g id="i-clear">
+          <path d="M4 7h16M9 7V5h6v2M6 7l1 13h10l1-13" />
+        </g>
+        <g id="i-black"><circle cx="12" cy="12" r="8.5" /></g>
+        <g id="i-play"><path d="M8 5.5v13l11-6.5z" /></g>
+        <g id="i-spot">
+          <circle cx="12" cy="10" r="4" />
+          <path d="M7 20l2.5-6M17 20l-2.5-6" />
+        </g>
+        <g id="i-notes">
+          <rect x="4" y="3.5" width="16" height="17" rx="2" />
+          <path d="M8 8h8M8 12h8M8 16h4" />
+        </g>
+        <g id="i-save">
+          <path d="M5 4h11l3 3v13H5z" />
+          <path d="M8 4v6h7V4M8 20v-6h8v6" />
+        </g>
+        <g id="i-timer">
+          <circle cx="12" cy="13" r="7.5" />
+          <path d="M12 9.5V13l2.5 2M9.5 3h5" />
+        </g>
+      </defs>
+    </svg>
+
+    <div id="app">
+      <header id="topbar">
+        <div class="tb-group">
+          <button class="icon-btn" id="btn-open" title="打开课件 (Ctrl+O)">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-open" /></svg>
+          </button>
+          <button class="icon-btn" id="btn-sidebar" title="显示/隐藏缩略图 (Ctrl+B)">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-sidebar" /></svg>
+          </button>
+        </div>
+
+        <div class="tb-sep"></div>
+
+        <div class="tb-group">
+          <button class="icon-btn" id="btn-first" title="第一页 (Home)" disabled>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-first" /></svg>
+          </button>
+          <button class="icon-btn" id="btn-prev" title="上一页 (PageUp / ←)" disabled>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-prev" /></svg>
+          </button>
+          <input class="page-input" id="page-input" type="text" inputmode="numeric" value="1" disabled title="输入页码后回车跳转" />
+          <span class="page-total" id="page-total">/ 0</span>
+          <span class="step-badge" id="step-badge"></span>
+          <button class="icon-btn" id="btn-next" title="下一页 (Space / PageDown / →)" disabled>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-next" /></svg>
+          </button>
+          <button class="icon-btn" id="btn-last" title="最后一页 (End)" disabled>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-last" /></svg>
+          </button>
+        </div>
+
+        <div class="tb-sep"></div>
+
+        <div class="tb-group">
+          <button class="icon-btn" id="btn-zoom-out" title="缩小 (Ctrl+-)" disabled>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-zoom-out" /></svg>
+          </button>
+          <button class="icon-btn" id="btn-zoom-reset" title="适应窗口 (Ctrl+0)" disabled>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-fit" /></svg>
+          </button>
+          <button class="icon-btn" id="btn-zoom-in" title="放大 (Ctrl+=)" disabled>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-zoom-in" /></svg>
+          </button>
+        </div>
+
+        <div class="tb-spacer"></div>
+
+        <span class="file-name" id="file-name"></span>
+
+        <div class="tb-spacer"></div>
+
+        <div class="tb-group">
+          <button class="icon-btn" id="btn-notes" title="显示/隐藏讲稿备注" disabled>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-notes" /></svg>
+          </button>
+          <button class="icon-btn" id="btn-save" title="保存标注 (Ctrl+S)" disabled>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-save" /></svg>
+          </button>
+          <button class="icon-btn" id="btn-present" title="开始放映 (F5)" disabled>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-present" /></svg>
+          </button>
+        </div>
+      </header>
+
+      <aside id="sidebar">
+        <div id="thumbs"></div>
+      </aside>
+
+      <main id="stage">
+        <canvas id="slide-layer"></canvas>
+        <!-- 视频/音频原位播放层：夹在幻灯片与标注层之间，
+             拿笔时整体让位（见 style.css 的 .ink-active） -->
+        <div id="media-layer"></div>
+        <canvas id="ink-layer"></canvas>
+
+        <div id="overlay"></div>
+        <div id="spotlight"></div>
+        <canvas id="laser"></canvas>
+        <div id="timer">00:00</div>
+
+        <div id="spinner"></div>
+
+        <!-- 「办公软件正在出第一页」的等待界面。
+             出图分两步：打开课件 + 导出首页。实测一份 174MB / 39 页的课件
+             是 1.8 秒 + 0.4 秒，典型小课件 1 秒出头；剩下的页在后台排队。
+             这段时间**刻意不先把自研画面放出来**：自研内核在复杂课件上会出错，
+             先给一份错的再换，老师只会记住那份错的。 -->
+        <div id="prepare">
+          <div class="prepare-card">
+            <div class="prepare-ring"></div>
+            <div class="prepare-title">正在生成画面</div>
+            <div class="prepare-sub">用本机办公软件出第一页，通常一两秒；之后就越翻越快</div>
+          </div>
+        </div>
+
+        <div id="toast"></div>
+
+        <!-- 标注工具条 -->
+        <div id="toolbar" class="hidden">
+          <button class="icon-btn" id="t-pointer" title="鼠标：不落笔，可点超链接 (V)">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-pointer" /></svg>
+          </button>
+          <button class="icon-btn" id="t-pen" title="画笔 (P)">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-pen" /></svg>
+          </button>
+          <button class="icon-btn" id="t-highlighter" title="荧光笔 (H)">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-highlighter" /></svg>
+          </button>
+          <button class="icon-btn" id="t-eraser" title="橡皮 (E)">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-eraser" /></svg>
+          </button>
+
+          <div class="tb-sep"></div>
+          <div class="tb-group" id="swatches"></div>
+
+          <div class="tb-sep"></div>
+          <div class="tb-group" id="widths"></div>
+
+          <div class="tb-sep"></div>
+          <button class="icon-btn" id="t-undo" title="撤销 (Ctrl+Z)">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-undo" /></svg>
+          </button>
+          <button class="icon-btn" id="t-redo" title="重做 (Ctrl+Y)">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-redo" /></svg>
+          </button>
+          <button class="icon-btn" id="t-clear" title="清空本页标注">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-clear" /></svg>
+          </button>
+
+          <div class="tb-sep"></div>
+          <button class="icon-btn" id="t-black" title="黑屏 (B)">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-black" /></svg>
+          </button>
+          <button class="icon-btn" id="t-spot" title="聚光灯 (S)">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-spot" /></svg>
+          </button>
+        </div>
+
+        <div id="notes" class="hidden">
+          <div id="notes-title">讲稿备注</div>
+          <div id="notes-body"></div>
+        </div>
+      </main>
+    </div>
+
+    <!-- 放映工具条
+         鼠标：靠近屏幕底部升起，停用后淡出
+         触屏：常驻不消失，默认缩在左下角，点左侧箭头展开成整条 -->
+    <div id="present-bar">
+      <button class="icon-btn dock-toggle" id="p-dock" title="收起 / 展开工具条">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-chevron" /></svg>
+      </button>
+
+      <button class="icon-btn" id="p-prev" title="上一页 (← / PageUp)" data-label="上一页">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-prev" /></svg>
+      </button>
+      <button class="icon-btn" id="p-next" title="下一页 (→ / Space)" data-label="下一页">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-next" /></svg>
+      </button>
+
+      <div class="tb-sep"></div>
+
+      <button class="icon-btn" id="p-pointer" title="鼠标：不落笔、单击翻页 (V)" data-label="鼠标">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-pointer" /></svg>
+      </button>
+      <button class="icon-btn" id="p-pen" title="画笔 (P)" data-label="画笔">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-pen" /></svg>
+      </button>
+      <button class="icon-btn" id="p-highlighter" title="荧光笔 (H)" data-label="荧光笔">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-highlighter" /></svg>
+      </button>
+      <button class="icon-btn" id="p-eraser" title="橡皮 (E)" data-label="橡皮">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-eraser" /></svg>
+      </button>
+      <button class="icon-btn" id="p-undo" title="撤销 (Ctrl+Z)" data-label="撤销">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-undo" /></svg>
+      </button>
+      <button class="icon-btn" id="p-clear" title="清空本页标注 (Delete)" data-label="清空">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-clear" /></svg>
+      </button>
+
+      <div class="tb-sep"></div>
+      <div class="tb-group" id="p-swatches"></div>
+
+      <div class="tb-sep"></div>
+
+      <button class="icon-btn" id="p-black" title="黑屏 (B)" data-label="黑屏">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-black" /></svg>
+      </button>
+      <button class="icon-btn" id="p-spot" title="聚光灯 (S)" data-label="聚光">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-spot" /></svg>
+      </button>
+      <button class="icon-btn" id="p-laser" title="激光笔 (L)" data-label="激光">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-laser" /></svg>
+      </button>
+
+      <div class="tb-sep"></div>
+
+      <button class="icon-btn" id="p-exit" title="结束放映 (Esc)" data-label="退出">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-exit" /></svg>
+      </button>
+    </div>
+
+    <div id="present-page">1 / 1</div>
+
+    <!-- 超链接/动作按钮的悬停提示框（放映时指示「这里可点」） -->
+    <div id="link-hint"></div>
+
+    <div id="ctx-menu">
+      <button class="ctx-item" data-act="next">下一页<span class="key">Space</span></button>
+      <button class="ctx-item" data-act="prev">上一页<span class="key">←</span></button>
+      <div class="ctx-sep"></div>
+      <button class="ctx-item" data-act="pointer">鼠标（翻页）<span class="key">V</span></button>
+      <button class="ctx-item" data-act="pen">画笔<span class="key">P</span></button>
+      <button class="ctx-item" data-act="eraser">橡皮<span class="key">E</span></button>
+      <button class="ctx-item" data-act="clear">清空本页标注<span class="key">Del</span></button>
+      <div class="ctx-sep"></div>
+      <button class="ctx-item" data-act="black">黑屏<span class="key">B</span></button>
+      <button class="ctx-item" data-act="laser">激光笔<span class="key">L</span></button>
+      <div class="ctx-sep"></div>
+      <button class="ctx-item" data-act="exit">结束放映<span class="key">Esc</span></button>
+    </div>
+
+    <div id="present-fade"></div>
+
+    <div id="welcome">
+      <h1>OpenPPTView</h1>
+      <p>为讲课场景打造的课件放映器<br />把 .pptx / .pdf 拖到窗口任意位置即可打开</p>
+      <button class="primary-btn" id="btn-welcome-open">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-open" /></svg>
+        选择课件
+      </button>
+      <div class="recent-list" id="recent-list"></div>
+
+      <!-- 设备与使用习惯：首次使用时引导老师完成一次设置 -->
+      <div id="device-panel">
+        <div class="assoc-head">
+          <span class="assoc-title">您用什么操作</span>
+        </div>
+        <div class="mode-chips" id="mode-chips">
+          <button class="mode-chip" data-mode="auto">自动识别</button>
+          <button class="mode-chip" data-mode="touch">触摸屏</button>
+          <button class="mode-chip" data-mode="mouse">鼠标键盘</button>
+        </div>
+        <p class="assoc-hint" id="mode-hint"></p>
+      </div>
+
+      <!-- 默认打开方式：首次使用时引导老师完成一次设置 -->
+      <div id="assoc-panel">
+        <div class="assoc-head">
+          <span class="assoc-title">默认打开方式</span>
+          <div class="assoc-actions">
+            <button class="link-btn" id="btn-assoc-register">注册到本应用</button>
+            <button class="link-btn" id="btn-assoc-settings">系统默认应用</button>
+          </div>
+        </div>
+        <div class="assoc-list" id="assoc-list"></div>
+        <p class="assoc-hint" id="assoc-hint"></p>
+      </div>
+    </div>
+
+    <script src="app.js"></script>
+  </body>
+</html>

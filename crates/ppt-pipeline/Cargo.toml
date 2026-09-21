@@ -1,0 +1,21 @@
+[package]
+name = "ppt-pipeline"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "两级缓存与优先级预渲染调度管线"
+
+[dependencies]
+ppt-core = { workspace = true }
+ppt-render = { workspace = true }
+log = { workspace = true }
+rayon = "1.12.0"
+lru = "0.18.4"
+ppt-text.workspace = true
+# PDF 的「原生档」位图要按显示尺寸缩小，用与渲染器同一套画布实现
+tiny-skia = "0.12.0"
+
+[dev-dependencies]
+# `page_latency` 示例要能同时打开 PDF 与 PPTX 两种来源
+ppt-format-pdf = { workspace = true }
+ppt-format-pptx = { workspace = true }

@@ -1,0 +1,1392 @@
+/* OpenPPTView 界面样式
+ *
+ * 设计取向：
+ * - 浅色玻璃质感，参考 macOS / VS Code 的克制风格，不用重色块
+ * - 圆角统一 10px，控件触摸热区 ≥ 44px（触控一体机上要好按）
+ * - 动画只用 transform / opacity，保证老机器上不触发重排
+ * - 不出现 emoji，图标一律用内联 SVG
+ */
+
+:root {
+  --bg: #f2f2f4;
+  --stage-bg: #e8e8ec;
+  --panel: rgba(255, 255, 255, 0.78);
+  --panel-solid: #ffffff;
+  --border: rgba(0, 0, 0, 0.09);
+  --border-strong: rgba(0, 0, 0, 0.16);
+  --text: #1d1d1f;
+  --text-dim: #6e6e73;
+  --text-faint: #a1a1a6;
+  --accent: #0071e3;
+  --accent-soft: rgba(0, 113, 227, 0.1);
+  --danger: #d70015;
+  --radius: 10px;
+  --radius-lg: 14px;
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.06);
+  --shadow: 0 4px 16px rgba(0, 0, 0, 0.1);
+  --shadow-lg: 0 12px 40px rgba(0, 0, 0, 0.16);
+  --topbar-h: 48px;
+  --toolbar-h: 60px;
+  --sidebar-w: 190px;
+  --ease: cubic-bezier(0.32, 0.72, 0, 1);
+  --fast: 140ms;
+  --normal: 220ms;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1c1c1e;
+    --stage-bg: #141416;
+    --panel: rgba(44, 44, 46, 0.78);
+    --panel-solid: #2c2c2e;
+    --border: rgba(255, 255, 255, 0.1);
+    --border-strong: rgba(255, 255, 255, 0.2);
+    --text: #f5f5f7;
+    --text-dim: #98989d;
+    --text-faint: #636366;
+    --accent: #0a84ff;
+    --accent-soft: rgba(10, 132, 255, 0.16);
+  }
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  -webkit-tap-highlight-color: transparent;
+}
+
+html,
+body {
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-family: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--bg);
+  /* 触摸屏适配：
+   * - `manipulation` 去掉双击缩放与 300ms 点击延迟，同时**保留原生滚动**；
+   * - 若在 body 上写 `none`，按规范会向下取交集，侧边栏与备注就滚不动了。
+   *   因此「不滚动」的约束只加在舞台（见 #stage）。
+   */
+  touch-action: manipulation;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+  overscroll-behavior: none;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+
+svg {
+  display: block;
+  flex: none;
+}
+
+/* ---------- 布局 ---------- */
+
+#app {
+  display: grid;
+  grid-template-rows: var(--topbar-h) 1fr;
+  grid-template-columns: auto 1fr;
+  grid-template-areas:
+    "topbar topbar"
+    "sidebar stage";
+  height: 100%;
+}
+
+#topbar {
+  grid-area: topbar;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px;
+  background: var(--panel);
+  backdrop-filter: saturate(180%) blur(20px);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
+  border-bottom: 1px solid var(--border);
+  z-index: 20;
+}
+
+#sidebar {
+  grid-area: sidebar;
+  width: var(--sidebar-w);
+  background: var(--panel);
+  backdrop-filter: saturate(180%) blur(20px);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
+  border-right: 1px solid var(--border);
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 10px;
+  transition: width var(--normal) var(--ease), padding var(--normal) var(--ease);
+  z-index: 10;
+}
+
+#sidebar.collapsed {
+  width: 0;
+  padding: 10px 0;
+  border-right-color: transparent;
+}
+
+/* 需要手指滚动的区域显式声明 —— 舞台上禁用了触摸滚动，
+ * 这些面板必须自己开回来，否则触控一体机上翻不动缩略图 */
+#sidebar,
+#notes,
+#ctx-menu,
+.recent-list {
+  touch-action: pan-y;
+  overscroll-behavior: contain;
+}
+
+#stage {
+  grid-area: stage;
+  position: relative;
+  overflow: hidden;
+  background: var(--stage-bg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* 舞台内只允许书写/手势，交给脚本处理（双指缩放、平移、书写） */
+  touch-action: none;
+}
+
+/* 幻灯片、媒体层与标注层叠放（标注在最上）。
+ *
+ * 居中方式：`left/top: 50%` 把**左上角**放到舞台中心，
+ * 必须再 `translate(-50%, -50%)` 才真正居中。
+ * 缺了这句会让幻灯片跑到右下角并被裁掉（曾踩过）。
+ *
+ * 双指平移通过 `--pan-x/--pan-y` 叠加在居中变换之后 ——
+ * 两种模式共用同一套定位，避免「放映会居中、窗口不会」这类分叉。
+ * `transform-origin` 保持 center：`screenToPt()` 依赖
+ * `getBoundingClientRect()`，它已经把变换算进去了。 */
+#slide-layer,
+#media-layer,
+#ink-layer {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%) translate(var(--pan-x, 0px), var(--pan-y, 0px));
+  transform-origin: center center;
+  will-change: transform;
+}
+
+#slide-layer {
+  z-index: 4;
+  image-rendering: auto;
+}
+
+#ink-layer {
+  z-index: 6;
+  touch-action: none;
+  cursor: crosshair;
+}
+
+#ink-layer.pan-mode {
+  cursor: grab;
+}
+
+#ink-layer.panning {
+  cursor: grabbing;
+}
+
+/* ---------- 顶栏控件 ---------- */
+
+.tb-group {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.tb-sep {
+  width: 1px;
+  height: 22px;
+  margin: 0 6px;
+  background: var(--border-strong);
+}
+
+.tb-spacer {
+  flex: 1;
+}
+
+.icon-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 8px;
+  color: var(--text-dim);
+  transition: background var(--fast) var(--ease), color var(--fast) var(--ease);
+}
+
+.icon-btn:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.icon-btn:active {
+  transform: scale(0.94);
+}
+
+.icon-btn.on {
+  background: var(--accent);
+  color: #fff;
+}
+
+.icon-btn:disabled {
+  opacity: 0.32;
+  pointer-events: none;
+}
+
+/* 触控一体机上把热区放大到 44px。
+ *
+ * # 为什么用 `html.touch-mode` 而不是 `@media (pointer: coarse)`
+ *
+ * 因为「用不用触摸屏」需要能被老师**手动指定**：一体机、平板、带触摸屏的
+ * 笔记本对外接鼠标的探测结果并不一致，而这是使用习惯，不该随插拔鼠标变化。
+ * 由脚本按「自动识别 or 向导里的选择」统一决定，CSS 只认这一个开关。 */
+html.touch-mode .icon-btn {
+  width: 44px;
+  height: 44px;
+}
+
+/* 触摸没有「精确指向」这回事，所有可点控件都撑到 44px 起步 */
+html.touch-mode .page-input {
+  width: 60px;
+  height: 40px;
+  font-size: 15px;
+}
+
+html.touch-mode .swatch {
+  width: 34px;
+  height: 34px;
+}
+
+html.touch-mode .width-btn {
+  width: 42px;
+  height: 42px;
+}
+
+html.touch-mode .ctx-item {
+  padding: 12px 14px;
+  font-size: 15px;
+}
+
+html.touch-mode .recent-item {
+  padding: 12px 14px;
+}
+
+html.touch-mode .tb-sep {
+  height: 28px;
+}
+
+/* 工具条上控件变大了，间距也要跟上，否则会误触隔壁 */
+html.touch-mode #toolbar,
+html.touch-mode #present-bar {
+  gap: 6px;
+  padding: 10px 12px;
+}
+
+.file-name {
+  font-weight: 600;
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.page-input {
+  width: 46px;
+  height: 28px;
+  text-align: center;
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  background: var(--panel-solid);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  outline: none;
+}
+
+.page-input:focus {
+  border-color: var(--accent);
+}
+
+.page-total {
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 本页动画进度。没有动画时不占位，避免工具条宽度跳来跳去 */
+.step-badge {
+  display: none;
+  margin-left: 8px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  white-space: nowrap;
+}
+
+.step-badge.on {
+  display: inline-block;
+}
+
+/* ---------- 缩略图 ---------- */
+
+.thumb {
+  position: relative;
+  margin-bottom: 8px;
+  border-radius: 6px;
+  overflow: hidden;
+  border: 2px solid transparent;
+  background: var(--panel-solid);
+  box-shadow: var(--shadow-sm);
+  cursor: pointer;
+  transition: border-color var(--fast) var(--ease), transform var(--fast) var(--ease);
+}
+
+.thumb:hover {
+  transform: translateY(-1px);
+}
+
+.thumb.active {
+  border-color: var(--accent);
+}
+
+.thumb canvas {
+  display: block;
+  width: 100%;
+  height: auto;
+  background: #fff;
+}
+
+.thumb-no {
+  position: absolute;
+  left: 4px;
+  bottom: 4px;
+  min-width: 18px;
+  padding: 1px 5px;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.55);
+  border-radius: 4px;
+}
+
+/* ---------- 底部标注工具条 ---------- */
+
+#toolbar {
+  position: absolute;
+  left: 50%;
+  bottom: 18px;
+  transform: translateX(-50%) translateY(0);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 8px;
+  background: var(--panel);
+  backdrop-filter: saturate(180%) blur(20px);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow);
+  z-index: 15;
+  transition: transform var(--normal) var(--ease), opacity var(--normal) var(--ease);
+}
+
+#toolbar.hidden {
+  transform: translateX(-50%) translateY(90px);
+  opacity: 0;
+  pointer-events: none;
+}
+
+.swatch {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.12);
+  transition: transform var(--fast) var(--ease), border-color var(--fast) var(--ease);
+}
+
+.swatch:hover {
+  transform: scale(1.12);
+}
+
+.swatch.on {
+  border-color: var(--accent);
+  transform: scale(1.12);
+}
+
+.width-btn {
+  width: 30px;
+  height: 30px;
+  border-radius: 7px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-dim);
+}
+
+.width-btn.on {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.width-dot {
+  border-radius: 50%;
+  background: currentColor;
+}
+
+/* ---------- 备注面板 ---------- */
+
+#notes {
+  position: absolute;
+  right: 16px;
+  bottom: 18px;
+  width: 300px;
+  max-height: 42%;
+  padding: 12px 14px;
+  background: var(--panel);
+  backdrop-filter: saturate(180%) blur(20px);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow);
+  overflow-y: auto;
+  z-index: 14;
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  color: var(--text-dim);
+  transition: transform var(--normal) var(--ease), opacity var(--normal) var(--ease);
+}
+
+#notes.hidden {
+  transform: translateY(20px);
+  opacity: 0;
+  pointer-events: none;
+}
+
+#notes-title {
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 6px;
+}
+
+/* ---------- 放映模式覆盖层 ---------- */
+
+#overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  pointer-events: none;
+  opacity: 0;
+}
+
+#overlay.black {
+  background: #000;
+  opacity: 1;
+}
+
+#overlay.white {
+  background: #fff;
+  opacity: 1;
+}
+
+/* 聚光灯：用径向遮罩压暗四周 */
+#spotlight {
+  position: absolute;
+  inset: 0;
+  z-index: 32;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity var(--fast) var(--ease);
+  background: radial-gradient(
+    circle var(--spot-r, 180px) at var(--spot-x, 50%) var(--spot-y, 50%),
+    transparent 0%,
+    transparent 62%,
+    rgba(0, 0, 0, 0.82) 100%
+  );
+}
+
+#spotlight.on {
+  opacity: 1;
+}
+
+/* 激光笔轨迹 */
+#laser {
+  position: absolute;
+  inset: 0;
+  z-index: 33;
+  pointer-events: none;
+}
+
+/* 放映计时器 */
+#timer {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  padding: 6px 12px;
+  font-variant-numeric: tabular-nums;
+  font-size: 14px;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(8px);
+  border-radius: 8px;
+  z-index: 34;
+  opacity: 0;
+  transition: opacity var(--normal) var(--ease);
+}
+
+#timer.on {
+  opacity: 1;
+}
+
+/* ---------- 欢迎页 ---------- */
+
+#welcome {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 18px;
+  z-index: 40;
+  background: var(--stage-bg);
+  transition: opacity var(--normal) var(--ease);
+}
+
+#welcome.hidden {
+  opacity: 0;
+  pointer-events: none;
+}
+
+#welcome h1 {
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+}
+
+#welcome p {
+  color: var(--text-dim);
+  line-height: 1.7;
+  text-align: center;
+}
+
+.primary-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 40px;
+  padding: 0 20px;
+  font-weight: 500;
+  color: #fff;
+  background: var(--accent);
+  border-radius: 10px;
+  transition: transform var(--fast) var(--ease), filter var(--fast) var(--ease);
+}
+
+.primary-btn:hover {
+  filter: brightness(1.08);
+}
+
+.primary-btn:active {
+  transform: scale(0.97);
+}
+
+.recent-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 320px;
+  max-width: 480px;
+}
+
+.recent-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  color: var(--text-dim);
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: background var(--fast) var(--ease);
+}
+
+.recent-item:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+/* ---------- 默认打开方式面板 ---------- */
+
+#assoc-panel {
+  width: 100%;
+  max-width: 480px;
+  margin-top: 4px;
+  padding: 12px 14px;
+  background: var(--panel);
+  backdrop-filter: saturate(180%) blur(20px);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  text-align: left;
+}
+
+.assoc-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.assoc-title {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.assoc-actions {
+  display: flex;
+  gap: 4px;
+}
+
+/* 文字按钮：次要操作不该抢主按钮的视觉重量 */
+.link-btn {
+  padding: 5px 9px;
+  font-size: 12px;
+  color: var(--accent);
+  border-radius: 7px;
+  transition: background var(--fast) var(--ease);
+}
+
+.link-btn:hover {
+  background: var(--accent-soft);
+}
+
+.link-btn:disabled {
+  color: var(--text-faint);
+  pointer-events: none;
+}
+
+.assoc-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.assoc-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 9px;
+  font-size: 12px;
+  color: var(--text-dim);
+  background: var(--panel-solid);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+}
+
+/* 状态点：绿=已是默认，蓝=已注册，灰=未注册 */
+.assoc-chip::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-faint);
+}
+
+.assoc-chip.registered::before {
+  background: var(--accent);
+}
+
+.assoc-chip.default::before {
+  background: #2ec27e;
+}
+
+.assoc-chip.default {
+  color: var(--text);
+  border-color: rgba(46, 194, 126, 0.4);
+}
+
+.assoc-hint {
+  margin-top: 8px;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text-faint);
+}
+
+/* 设备与使用习惯：和「默认打开方式」同款面板，两件事排在一起不显得杂 */
+#device-panel {
+  width: 100%;
+  max-width: 480px;
+  margin-top: 4px;
+  padding: 12px 14px;
+  background: var(--panel);
+  backdrop-filter: saturate(180%) blur(20px);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  text-align: left;
+}
+
+.mode-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* 三选一：选中态要一眼看得出来，不能只靠颜色深浅 */
+.mode-chip {
+  padding: 7px 16px;
+  font-size: 13px;
+  color: var(--text-dim);
+  background: var(--panel-solid);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  transition: background var(--fast) var(--ease), color var(--fast) var(--ease),
+    border-color var(--fast) var(--ease);
+}
+
+.mode-chip:hover {
+  color: var(--text);
+  border-color: var(--text-faint);
+}
+
+.mode-chip.on {
+  color: #fff;
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+html.touch-mode .link-btn {
+  padding: 11px 14px;
+  font-size: 14px;
+}
+
+/* ---------- 内嵌视频/音频 ---------- */
+
+/* 播放器默认压在标注层**之上**：只有这样才能点到进度条、音量这些控件。
+ * 拿笔时反过来（见 .ink-active）—— 老师的笔迹必须落在视频画面上。 */
+#media-layer {
+  z-index: 7;
+  pointer-events: none;
+}
+
+#media-layer.ink-active {
+  z-index: 5;
+}
+
+/* 一块媒体的占位框：默认只显示播放按钮，点击后才出现画面。
+ * 未播放时**不遮挡**幻灯片 —— 老师要能点它背后的内容。 */
+.media-box {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+}
+
+/* 只在「鼠标」模式下可点：拿笔时这一层整体让位，笔迹才能落在视频上 */
+#media-layer:not(.ink-active) .media-box {
+  pointer-events: auto;
+}
+
+.media-play {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.35);
+  transition: transform 160ms var(--ease), background 160ms var(--ease);
+}
+
+.media-play:hover {
+  background: rgba(0, 0, 0, 0.72);
+  transform: scale(1.06);
+}
+
+.media-play:active {
+  transform: scale(0.96);
+}
+
+.media-play svg {
+  margin-left: 3px; /* 三角形视觉居中 */
+}
+
+html.touch-mode .media-play {
+  width: 68px;
+  height: 68px;
+}
+
+/* 播放中：按钮退场，画面接管整块热区 */
+.media-box video {
+  display: none;
+  width: 100%;
+  height: 100%;
+  background: #000;
+  border-radius: 4px;
+  object-fit: contain;
+}
+
+.media-box.playing video {
+  display: block;
+}
+
+.media-box.playing .media-play {
+  display: none;
+}
+
+/* 纯音频没有画面。空闲时**不加任何底色** —— 喇叭图标是封页图画出来的，
+ * 盖一层灰底反而把图标糊掉了。 */
+.media-box.audio.playing {
+  background: rgba(0, 0, 0, 0.06);
+  border-radius: 8px;
+}
+
+.media-box.audio audio {
+  display: none;
+  width: 100%;
+}
+
+.media-box.audio.playing audio {
+  display: block;
+}
+
+/* 拖拽进入时的提示 */
+#app.dragging::after {
+  content: "松开以打开课件";
+  position: absolute;
+  inset: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border: 2px dashed var(--accent);
+  border-radius: var(--radius-lg);
+  z-index: 50;
+  pointer-events: none;
+}
+
+/* ---------- 提示条 ---------- */
+
+#toast {
+  position: absolute;
+  left: 50%;
+  top: 64px;
+  transform: translateX(-50%) translateY(-12px);
+  max-width: 70%;
+  padding: 10px 16px;
+  background: var(--panel-solid);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  color: var(--text);
+  line-height: 1.5;
+  z-index: 60;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--normal) var(--ease), transform var(--normal) var(--ease);
+}
+
+#toast.on {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+
+#toast.error {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+/* 加载指示：只在超过 150ms 时才显示，避免快机器上闪一下 */
+#spinner {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 28px;
+  height: 28px;
+  margin: -14px 0 0 -14px;
+  border: 2.5px solid var(--border-strong);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  opacity: 0;
+  pointer-events: none;
+  z-index: 45;
+  transition: opacity var(--fast) var(--ease);
+}
+
+#spinner.on {
+  opacity: 1;
+}
+
+/* ---------- 「正在用 WPS 生成画面」----------
+ *
+ * 这是一次**有说明的等待**，不是不明所以的转圈：
+ * 首次打开没导出过的课件要等几秒，把原因和预期讲清楚，
+ * 老师才不会以为程序卡死了。
+ */
+#prepare {
+  position: absolute;
+  inset: 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg);
+  z-index: 40;
+}
+
+#prepare.on {
+  display: flex;
+}
+
+.prepare-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  padding: 28px 36px;
+  border-radius: 16px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  box-shadow: 0 12px 40px rgb(0 0 0 / 18%);
+  text-align: center;
+}
+
+.prepare-ring {
+  width: 34px;
+  height: 34px;
+  border: 3px solid var(--border-strong);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+.prepare-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.prepare-sub {
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ---------- 放映模式（对标 WPS 放映）----------
+ *
+ * WPS 放映的几个关键特征，这里逐条对齐：
+ * 1. 幻灯片按「保持宽高比、尽量放大」铺满屏幕，四周留黑边（letterbox）
+ * 2. 不显示任何常驻界面；鼠标移到屏幕下方才浮出工具栏
+ * 3. 工具栏停用 2.5 秒后自动淡出
+ * 4. 左下角显示页码，短暂显示后淡出
+ * 5. 单击 = 下一页（与 WPS 一致），右键 = 上一页
+ */
+
+body.presenting {
+  /* 放映时整页纯黑，避免投影边缘漏出桌面 */
+  background: #000;
+}
+
+body.presenting #app {
+  display: block;
+  height: 100%;
+}
+
+body.presenting #topbar,
+body.presenting #sidebar,
+body.presenting #notes,
+body.presenting #toolbar,
+body.presenting #welcome {
+  display: none !important;
+}
+
+body.presenting #stage {
+  position: fixed;
+  inset: 0;
+  background: #000;
+  display: block;
+  overflow: hidden;
+}
+
+/* 放映时幻灯片仍走同一套居中 + 平移变换，这里不再改写定位。
+ *
+ * 为什么不把幻灯片改成 `transform: none` + 绝对坐标：
+ * 那会让两种模式各有一套定位逻辑，改一处忘一处就会错位
+ * （窗口模式曾因此把幻灯片丢到右下角）。 */
+
+/* 放映模式的光标：**必须由 CSS 控制**。
+ *
+ * 早期版本在 Rust 侧调 `set_cursor_visible(false)`，那是窗口级隐藏，
+ * 之后无论 CSS 写什么光标都换不回来 —— 「鼠标」模式下全屏后
+ * 完全看不到光标，老师既点不准按钮也不知道自己在哪。
+ * 现在的规则：
+ *   鼠标/指针模式 → 显示普通箭头；静置 2.5 秒后隐藏（WPS 的行为）
+ *   画笔/荧光笔/橡皮 → 始终显示十字，否则找不到落笔点 */
+body.presenting #ink-layer {
+  cursor: default;
+}
+
+body.presenting #ink-layer.show-cursor {
+  cursor: crosshair;
+}
+
+/* 用 :not 保证拿笔时不会被空闲计时器把十字光标抹掉 */
+body.presenting #ink-layer.cursor-hidden:not(.show-cursor) {
+  cursor: none;
+}
+
+/* 放映工具栏：默认藏在屏幕外，鼠标靠近底部时升起 */
+#present-bar {
+  position: fixed;
+  left: 50%;
+  bottom: 0;
+  transform: translateX(-50%) translateY(110%);
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 8px 10px;
+  /* 纯色，不用毛玻璃。
+   *
+   * 放映时这条正好盖在幻灯片画布上，而画布是个合成层：带
+   * `backdrop-filter` 的那一版在 WebView2 里**整条都画不出来**
+   * —— DOM 查得到、class 也对、位置也在屏幕内，屏幕上就是没有。
+   * 工具条是讲课时唯一的控件，宁可少一点质感也不能看不见。 */
+  background: rgba(32, 32, 35, 0.96);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-bottom: none;
+  border-radius: 12px 12px 0 0;
+  box-shadow: 0 -6px 30px rgba(0, 0, 0, 0.5);
+  z-index: 70;
+  opacity: 0;
+  transition: transform 260ms var(--ease), opacity 200ms var(--ease);
+  pointer-events: none;
+}
+
+#present-bar.on {
+  transform: translateX(-50%) translateY(0);
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* 收起态：贴在左下角的一颗小胶囊。
+ *
+ * # 为什么要有这个形态
+ *
+ * 触屏上根本没有「悬停」这回事 —— 工具条一旦自动淡出，老师就得反复去够
+ * 屏幕最底边把它叫回来，站在讲台前那个动作很别扭。所以触屏下工具条**常驻**，
+ * 默认缩成左下角一小条，想用全量工具时点箭头展开。
+ *
+ * 位置靠 transform 而不是 `left`：transform 走合成层，动画不掉帧；
+ * `left` 会触发布局，收起/展开时会顿一下。
+ * 往左挪的距离 = 「整条居中」与「贴左边 14px」之差。 */
+#present-bar.on.docked {
+  /* 算清楚这条：`left: 50%` 的百分比基准是**视口宽**，
+     而 `translateX()` 里的百分比基准是**元素自身宽**。
+     以前写成 `-50vw + 50% + 14px`，多加了半个自身宽度 ——
+     胶囊停在离左边约 200px 处，而且展开/收起时还会跟着宽度漂。
+     要贴左边 14px，只需要把「居中那一下」抵消掉。 */
+  transform: translateX(calc(-50vw + 14px)) translateY(-14px);
+  padding: 6px;
+  border-radius: 16px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.16);
+  box-shadow: 0 8px 26px rgba(0, 0, 0, 0.5);
+}
+
+/* 老师把胶囊拖走之后：位置完全由内联的 left/top 说了算，
+   上面那条贴边变换必须让开。同优先级，靠写在后面生效。 */
+#present-bar.on.placed {
+  left: 0;
+  top: 0;
+  bottom: auto;
+  transform: none;
+  cursor: grab;
+}
+
+#present-bar.on.placed:active {
+  cursor: grabbing;
+}
+
+/* 收起态只留最常用的几个，其余藏起来 —— 老人不需要一眼看到全部功能 */
+#present-bar.docked #p-highlighter,
+#present-bar.docked #p-undo,
+#present-bar.docked #p-clear,
+#present-bar.docked #p-black,
+#present-bar.docked #p-spot,
+#present-bar.docked #p-laser,
+#present-bar.docked .tb-sep,
+#present-bar.docked #p-swatches {
+  display: none;
+}
+
+/* 展开/收起箭头：收起时朝上（提示「可以展开」），展开时朝下 */
+#present-bar .dock-toggle svg {
+  transition: transform 220ms var(--ease);
+}
+#present-bar.docked .dock-toggle svg {
+  transform: rotate(180deg);
+}
+
+#present-bar .icon-btn {
+  color: rgba(255, 255, 255, 0.82);
+}
+
+#present-bar .icon-btn:hover {
+  background: rgba(255, 255, 255, 0.14);
+  color: #fff;
+}
+
+#present-bar .icon-btn.on {
+  background: var(--accent);
+  color: #fff;
+}
+
+#present-bar .tb-sep {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+#present-bar .swatch {
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.28);
+}
+
+/* 适老：触摸设备上把放映工具条做大做明确。
+ *
+ * 三条：① 按钮撑到 58px；② 图标放大；③ 每个按钮配一行中文标签 ——
+ * 让不太用电脑的老师也不必靠猜图标。 */
+html.touch-mode #present-bar {
+  gap: 4px;
+  padding: 8px 12px;
+  max-width: calc(100vw - 20px);
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+}
+
+html.touch-mode #present-bar:not(.docked) .icon-btn {
+  flex-direction: column;
+  gap: 3px;
+  width: auto;
+  min-width: 60px;
+  height: 62px;
+  padding: 6px 8px;
+}
+
+html.touch-mode #present-bar:not(.docked) .icon-btn::after {
+  content: attr(data-label);
+  font-size: 12px;
+  line-height: 1;
+  letter-spacing: 0.02em;
+}
+
+html.touch-mode #present-bar .icon-btn svg {
+  width: 22px;
+  height: 22px;
+}
+
+/* 最小化态也要够大够好按 */
+html.touch-mode #present-bar.docked .icon-btn {
+  width: 48px;
+  height: 48px;
+}
+html.touch-mode #present-bar.docked .icon-btn svg {
+  width: 20px;
+  height: 20px;
+}
+
+html.touch-mode #present-bar .swatch {
+  width: 30px;
+  height: 30px;
+}
+
+/* 连接热区悬停提示。
+ *
+ * 设计取向：**只做「这里能点」这一个信息**，不加箭头/文字气泡 ——
+ * 课件本身的按钮已经有自己的外观，再叠一层花哨的提示会干扰讲课。
+ * 一条细描边 + 极淡的外发光足够，且不遮挡任何内容。 */
+#link-hint {
+  position: fixed;
+  z-index: 69;
+  pointer-events: none;
+  border: 2px solid var(--accent);
+  border-radius: 5px;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.55), 0 0 12px rgba(0, 113, 227, 0.45);
+  opacity: 0;
+  transition: opacity 130ms var(--ease);
+}
+
+#link-hint.on {
+  opacity: 1;
+}
+
+/* 放映时背景是幻灯片，白描边反而更清晰 */
+body.presenting #link-hint {
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35), 0 0 14px rgba(10, 132, 255, 0.55);
+}
+
+/* 放映页码：常驻在左下角、最小化工具条的正上方。
+ *
+ * 页码以前是「显示 1.6 秒后淡出」，现在改成常驻 ——
+ * 讲课时老师要随时知道讲到第几页，翻页时轻轻弹一下做提示就够了。 */
+#present-page {
+  position: fixed;
+  left: 14px;
+  bottom: 84px;
+  padding: 7px 16px;
+  font-size: 16px;
+  font-variant-numeric: tabular-nums;
+  color: rgba(255, 255, 255, 0.9);
+  /* 同上：放映时盖在画布上，不用毛玻璃 */
+  background: rgba(0, 0, 0, 0.72);
+  border-radius: 9px;
+  z-index: 68;
+  opacity: 0;
+  transition: opacity 400ms var(--ease);
+  pointer-events: none;
+}
+
+#present-page.on {
+  opacity: 1;
+}
+
+/* 翻页提示：一次短促的放大，够醒目但不打断讲课 */
+#present-page.flash {
+  animation: page-flash 640ms var(--ease);
+}
+
+@keyframes page-flash {
+  0% {
+    transform: scale(1);
+  }
+  35% {
+    transform: scale(1.12);
+    box-shadow: 0 0 0 7px rgba(255, 255, 255, 0.16);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
+/* 放映计时器移到右下，避免与页码挤在一起 */
+body.presenting #timer {
+  top: auto;
+  bottom: 26px;
+  right: 26px;
+}
+
+/* 右键菜单（放映时的选项） */
+#ctx-menu {
+  position: fixed;
+  z-index: 80;
+  min-width: 178px;
+  padding: 5px;
+  background: rgba(38, 38, 40, 0.96);
+  backdrop-filter: blur(24px);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 10px;
+  box-shadow: var(--shadow-lg);
+  opacity: 0;
+  transform: scale(0.96);
+  transform-origin: top left;
+  pointer-events: none;
+  transition: opacity 120ms var(--ease), transform 120ms var(--ease);
+}
+
+#ctx-menu.on {
+  opacity: 1;
+  transform: scale(1);
+  pointer-events: auto;
+}
+
+.ctx-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  width: 100%;
+  padding: 8px 11px;
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.92);
+  text-align: left;
+  border-radius: 7px;
+  transition: background var(--fast) var(--ease);
+}
+
+.ctx-item:hover {
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.ctx-item .key {
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.45);
+  font-variant-numeric: tabular-nums;
+}
+
+.ctx-sep {
+  height: 1px;
+  margin: 5px 8px;
+  background: rgba(255, 255, 255, 0.12);
+}
+
+/* 过渡：进入/退出放映时的黑场淡入，避免闪烁 */
+#present-fade {
+  position: fixed;
+  inset: 0;
+  background: #000;
+  z-index: 90;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 180ms var(--ease);
+}
+
+#present-fade.on {
+  opacity: 1;
+}
+
+/* 滚动条 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}

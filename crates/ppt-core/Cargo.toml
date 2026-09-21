@@ -1,0 +1,22 @@
+[package]
+name = "ppt-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OPC/ZIP 按需读取、OOXML 解析与 SceneGraph 中间表示"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+memmap2 = "0.9.11"
+# 只保留 deflate：OOXML 容器仅使用 store/deflate。
+# 默认 feature 会拉入 zstd/bzip2/xz/lzma/aes，既增大体积又引入 C 依赖。
+zip = { version = "8.6.0", default-features = false, features = [
+    "deflate",
+    "deflate-flate2",
+    "deflate-flate2-zlib-rs",
+] }
+quick-xml = "0.42.0"
+sha2 = "0.11.0"

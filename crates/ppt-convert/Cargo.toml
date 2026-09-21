@@ -1,0 +1,27 @@
+[package]
+name = "ppt-convert"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "借用本机 WPS / Microsoft Office 内核出画面：逐页位图（默认）或整本矢量 PDF"
+
+[dependencies]
+log = { workspace = true }
+ppt-core = { path = "../ppt-core" }
+# 只解 PNG：那是我们让办公软件导出的格式，别的格式不会出现在这条链路上。
+# 关掉默认 feature 免得把 jpeg/webp/tiff 的解码器也编进安装包。
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+
+[target.'cfg(windows)'.dependencies]
+# 这几项都是 `VARIANT` / `DISPPARAMS` 的前置 feature：
+# `VARIANT` 被 `Win32_System_Ole` + `Win32_System_Variant` 双重门控，
+# 少一个都编译不过（见 windows 的 `Variant/mod.rs` 顶部 cfg）
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    # 转换期间把办公软件的进程降到「低于正常」优先级，别和老师的翻页抢 CPU
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
+] }

@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ppt-core",
+    "crates/ppt-text",
+    "crates/ppt-render",
+    "crates/ppt-pipeline",
+    "crates/ppt-format-pptx",
+    "crates/ppt-format-pdf",
+    "crates/ppt-convert",
+    "crates/ppt-app",
+    "crates/ppt-installer-ui",
+    "crates/ppt-installer",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["OpenPPTView Contributors"]
+description = "极速课件讲演器 —— 为学校老师讲课场景打造的本地 PPT/PDF 放映器"
+
+[workspace.dependencies]
+ppt-core = { path = "crates/ppt-core" }
+ppt-text = { path = "crates/ppt-text" }
+ppt-render = { path = "crates/ppt-render" }
+ppt-pipeline = { path = "crates/ppt-pipeline" }
+ppt-format-pptx = { path = "crates/ppt-format-pptx" }
+ppt-format-pdf = { path = "crates/ppt-format-pdf" }
+ppt-convert = { path = "crates/ppt-convert" }
+ppt-app = { path = "crates/ppt-app" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+log = "0.4"
+
+# 老机器优化：发布构建以体积与速度优先
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true

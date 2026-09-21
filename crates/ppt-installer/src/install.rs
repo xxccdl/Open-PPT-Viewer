@@ -126,6 +126,15 @@ pub fn install(
     self_exe: &Path,
     p: &mut dyn Progress,
 ) -> Result<(), String> {
+    // 0. 让开位置。
+    //
+    // 升级时应用多半正开着，而它的 exe 被 Windows 锁着 —— 不先请它退出，
+    // 第 2 步写主程序就会失败（老师看到的是「装到一半报错」）。
+    if !p.step("正在关闭正在运行的 OpenPPTView…", 2.0) {
+        return Err("已取消".into());
+    }
+    stop_running_app(&opts.dir);
+
     // 1. 目录
     if !p.step("正在准备安装位置…", 4.0) {
         return Err("已取消".into());
@@ -179,6 +188,42 @@ pub fn install(
 
     p.step("装好了", 100.0);
     Ok(())
+}
+
+/// 已经装过的话，上一次的安装位置与老师的选择。
+///
+/// # 为什么升级必须用它
+///
+/// 「静默安装」如果每次都按默认值来（装到默认目录、操作方式重置成「自动」、
+/// 无条件建桌面快捷方式），一次自动升级就会把老师的设置抹掉，
+/// 装在自定义位置的还会**变成两份**。升级要的是**原地换掉文件**。
+///
+/// 安装位置连同「操作方式 / 桌面快捷方式」一起写在 `PREF_KEY` 下，
+/// 所以这里一次就能问全。读不到就返回 `None`，由调用方用默认值。
+pub fn existing_install() -> Option<Options> {
+    use winreg::enums::HKEY_LOCAL_MACHINE;
+    use winreg::RegKey;
+
+    let key = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey(PREF_KEY).ok()?;
+    let dir: String = key.get_value("InstallLocation").ok()?;
+    let dir = PathBuf::from(dir.trim());
+    // 目录被老师删掉/挪走时就当没装过：不然会往一个空目录里装，
+    // 而系统里那份「卸载信息」还是旧的
+    if dir.as_os_str().is_empty() || !dir.join(EXE_NAME).exists() {
+        return None;
+    }
+
+    let mode: String = key.get_value("InputMode").unwrap_or_default();
+    let shortcut: u32 = key.get_value("DesktopShortcut").unwrap_or(1);
+    Some(Options {
+        dir,
+        desktop_shortcut: shortcut != 0,
+        input_mode: if mode.is_empty() {
+            "auto".to_string()
+        } else {
+            mode
+        },
+    })
 }
 
 fn write_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -550,19 +595,18 @@ pub fn uninstall(dir: &Path, p: &mut dyn Progress) -> Result<(), String> {
     Ok(())
 }
 
-/// 把装在 `dir` 里的程序关掉。
+/// 请正在运行的 OpenPPTView 让开位置（装/卸载都要先做这一步）。
 ///
-/// # 为什么非关不可
-///
-/// 正在运行的 exe 被 Windows 锁着，**删不掉**。不关它，卸载就只会删掉
-/// 几个无关紧要的文件，主程序和文件夹原样留着 —— 老师看到的就是
-/// 「点了卸载，程序还在，还能双击打开」，等于没卸。
+/// 正在运行的 exe 被 Windows 锁着，**写不掉也删不掉**。不关它：
+/// 卸载只会删掉几个无关紧要的文件，主程序原样留着 —— 老师看到的是
+/// 「点了卸载，程序还在，还能双击打开」，等于没卸；
+/// 升级则会在写主程序那一步直接失败（「装到一半报错」）。
 ///
 /// 顺序是「先好好说，再动手」：
 /// 1. 用 `--quit` 请它自己退。走的是应用里「先把标注存盘再退」那条路，
 ///    老师写在课件上的笔迹不会白丢；
 /// 2. 等最多 5 秒；
-/// 3. 还不走就强制结束。卸载完还留着一个删不掉的文件，比丢一次标注更糟。
+/// 3. 还不走就强制结束。留着一个改不掉的文件，比丢一次标注更糟。
 fn stop_running_app(dir: &Path) {
     let exe = dir.join(EXE_NAME);
     if !exe.exists() {

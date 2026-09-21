@@ -567,10 +567,26 @@ fn run_silent(job: Job) -> i32 {
     match job {
         Job::Install => match install::read_payload(&self_exe) {
             Ok((app, boot)) => {
-                let opts = Options {
-                    dir: default_install_dir(),
-                    desktop_shortcut: true,
-                    input_mode: "auto".to_string(),
+                // 已经装过就**原地升级**，并沿用老师当初的选择
+                // （安装位置、操作方式、要不要桌面快捷方式）。
+                //
+                // 少了这一条，一次自动升级就会把装在 D 盘的变成两份、
+                // 把「触摸屏」重置成「自动识别」、还给已经删掉快捷方式的
+                // 桌面又塞一个回去。
+                let opts = match install::existing_install() {
+                    Some(prev) => {
+                        log::info!(
+                            "检测到已安装：原地升级到 {}（操作方式 {}）",
+                            prev.dir.display(),
+                            prev.input_mode
+                        );
+                        prev
+                    }
+                    None => Options {
+                        dir: default_install_dir(),
+                        desktop_shortcut: true,
+                        input_mode: "auto".to_string(),
+                    },
                 };
                 match install::install(&app, boot.as_deref(), &opts, &self_exe, &mut p) {
                     Ok(()) => 0,

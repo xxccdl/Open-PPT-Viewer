@@ -144,6 +144,18 @@ const el = {
   ctxMenu: $('ctx-menu'),
   fade: $('present-fade'),
   linkHint: $('link-hint'),
+  /* 设置 */
+  settings: $('settings'),
+  settingsDot: $('settings-dot'),
+  setVersion: $('set-version'),
+  setUpdateHint: $('set-update-hint'),
+  setNotes: $('set-notes'),
+  setNotesBody: $('set-notes-body'),
+  updateBar: $('update-bar'),
+  updateBarFill: $('update-bar-fill'),
+  setCacheTotal: $('set-cache-total'),
+  setCacheDetail: $('set-cache-detail'),
+  btnDoUpdate: $('btn-do-update'),
 };
 
 const slideCtx = el.slide.getContext('2d');
@@ -2329,7 +2341,8 @@ const UPGRADE_TIMEOUT_MS = 20000;
 function waitForUpgrade(path, viewportWidth) {
   return new Promise((resolve) => {
     hideSpinner();
-    el.prepare.classList.add('on');
+    // 文案要重置：旧版 .ppt 转换期间显示的是另一句，这里已经进入出图阶段了
+    showPrepare('正在生成画面', '用本机办公软件出第一页，通常一两秒；之后就越翻越快');
     let settled = false;
     const finish = (ok) => {
       if (settled) return;
@@ -2338,7 +2351,7 @@ function waitForUpgrade(path, viewportWidth) {
       // 只清掉「自己的」挂载：期间老师可能又开了另一份课件，
       // 那时 upgradeWaiter 已经换成新的，不能被这一次超时误清
       if (upgradeWaiter === mine) upgradeWaiter = null;
-      el.prepare.classList.remove('on');
+      hidePrepare();
       resolve(ok);
     };
     const timer = setTimeout(() => {
@@ -2363,9 +2376,44 @@ function waitForUpgrade(path, viewportWidth) {
   });
 }
 
+/**
+ * 旧版（PowerPoint 97-2003）演示文稿的扩展名。
+ *
+ * 真正的格式判断在后端按魔数做；这里只看扩展名，唯一用途是
+ * **给老师一句解释** —— 说明「为什么要等」和「在等什么」。
+ */
+function isLegacyPpt(path) {
+  return /\.(ppt|pps|pot)$/i.test(path || '');
+}
+
+/**
+ * 显示等待界面。
+ *
+ * 文案必须说清**在等什么**：等格式转换和等第一页出图是两件事，
+ * 一句笼统的「正在加载」只会让人觉得卡住了。
+ */
+function showPrepare(title, sub) {
+  el.prepare.querySelector('.prepare-title').textContent = title;
+  el.prepare.querySelector('.prepare-sub').textContent = sub;
+  el.prepare.classList.add('on');
+}
+
+function hidePrepare() {
+  el.prepare.classList.remove('on');
+}
+
 async function openPath(path) {
   if (!path) return;
   showSpinner();
+  // 旧版 .ppt：后端会先让本机办公软件把它转成 .pptx 再打开。
+  // 这一步要几秒，不说明白老师会以为卡死了。
+  const legacy = isLegacyPpt(path);
+  if (legacy) {
+    showPrepare(
+      '正在转换旧版 .ppt',
+      '用本机办公软件把它转成 .pptx，首次通常几秒；转好之后就直接打开'
+    );
+  }
   try {
     // 出图档位按屏幕定，所以要在打开之前算出来一起传下去
     const viewportWidth = rasterWidthHint();
@@ -2421,6 +2469,8 @@ async function openPath(path) {
   } catch (e) {
     toast(String(e), true);
   } finally {
+    // 转换失败（或中途退出）时也必须收掉等待界面，否则会一直盖在屏幕上
+    if (legacy) hidePrepare();
     hideSpinner();
   }
 }
@@ -2796,8 +2846,6 @@ function applyInputMode() {
   for (const chip of document.querySelectorAll('.mode-chip')) {
     chip.classList.toggle('on', chip.dataset.mode === inputMode);
   }
-  const hint = $('mode-hint');
-  if (!hint) return;
 
   const detected = SYSTEM_COARSE ? '触摸屏' : '鼠标键盘';
   const origin =
@@ -2807,12 +2855,17 @@ function applyInputMode() {
         ? '上次在应用里选的'
         : `自动识别为「${detected}」`;
 
-  hint.textContent =
+  const text =
     `${origin}。` +
     (isTouchMode()
       ? '按钮更大、带中文标签。'
       : '界面更紧凑。') +
     '放映时工具条收成左下角的小胶囊（可以拖到顺手的位置），点左侧箭头展开；随时可以在这里改。';
+
+  // 欢迎页与设置页各有一份（靠类名绑定），两处必须显示同一句话
+  for (const hint of document.querySelectorAll('.mode-hint')) {
+    hint.textContent = text;
+  }
 }
 
 function setInputMode(mode) {
@@ -3374,8 +3427,11 @@ function onKeyDown(e) {
     case 'Escape':
       e.preventDefault();
       // 多级退出（与 WPS 一致）：先关掉临时遮挡，最后才结束放映，
-      // 避免老师误按一次 Esc 就把放映关掉
-      if (el.overlay.classList.contains('black') || el.overlay.classList.contains('white')) {
+      // 避免老师误按一次 Esc 就把放映关掉。
+      // 设置排在**最前**：它盖在所有东西上面，Esc 该先关它。
+      if (!el.settings.classList.contains('hidden')) {
+        closeSettings();
+      } else if (el.overlay.classList.contains('black') || el.overlay.classList.contains('white')) {
         setBlack(false);
       } else if (el.spotlight.classList.contains('on')) {
         setSpotlight(false);
@@ -3742,6 +3798,169 @@ function bindPresentUi() {
   });
 }
 
+/* ---------------- 设置 ----------------
+ *
+ * 五块内容都属于「老师自己会想看一眼」：版本与升级、缓存占了多少、
+ * 默认打开方式、操作习惯、出问题时去哪看日志。
+ *
+ * 「默认打开方式」与「操作习惯」跟欢迎页那两块共用一套渲染
+ * （见 `refreshAssoc` / `applyInputMode`，都按类名绑到所有副本上），
+ * 所以不会出现「两个地方显示的状态不一样」。
+ */
+
+function openSettings() {
+  el.settings.classList.remove('hidden');
+  refreshCacheUsage();
+  // 打开就查一次：点进来多半就是想看有没有新版
+  refreshUpdate();
+}
+
+function closeSettings() {
+  el.settings.classList.add('hidden');
+}
+
+/** 字节数转成人看的形式。 */
+function formatBytes(bytes) {
+  if (!bytes) return '0 MB';
+  const mb = bytes / 1048576;
+  if (mb >= 1024) return `${(mb / 1024).toFixed(2)} GB`;
+  if (mb >= 1) return `${mb.toFixed(1)} MB`;
+  return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+}
+
+async function refreshCacheUsage() {
+  try {
+    const u = await invoke('cache_usage');
+    el.setCacheTotal.textContent = formatBytes(u.total);
+    el.setCacheDetail.textContent =
+      `办公软件出的画面 ${formatBytes(u.raster)}　·　` +
+      `内置渲染缓存 ${formatBytes(u.bitmap)}　·　` +
+      `旧版 .ppt 转换产物 ${formatBytes(u.legacy)}`;
+  } catch (e) {
+    el.setCacheDetail.textContent = `读不到缓存占用：${e}`;
+  }
+}
+
+async function clearCache(btn) {
+  btn.disabled = true;
+  const before = el.setCacheTotal.textContent;
+  try {
+    const u = await invoke('clear_cache', { kind: 'all' });
+    el.setCacheTotal.textContent = formatBytes(u.total);
+    el.setCacheDetail.textContent = `已清理（原来 ${before}）。正在讲的这份课件保留着。`;
+    toast('缓存已清理');
+  } catch (e) {
+    toast(`清理失败：${e}`, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/** 查一次更新，把结果写进「关于与更新」。 */
+async function refreshUpdate() {
+  el.setUpdateHint.textContent = '正在检查新版本…';
+  el.updateBar.hidden = true;
+  el.btnDoUpdate.hidden = true;
+  el.setNotes.hidden = true;
+
+  try {
+    const st = await invoke('check_update');
+    el.setVersion.textContent = st.current;
+
+    // latest 为 null = 仓库里还没有发布过任何版本，这不是错误
+    if (st.latest === null) {
+      el.setUpdateHint.textContent = '仓库里还没有发布过版本，暂时没有可更新的内容。';
+      return;
+    }
+    if (!st.hasUpdate) {
+      el.setUpdateHint.textContent = `已是最新版本（${st.current}）。`;
+      return;
+    }
+
+    el.setUpdateHint.textContent =
+      `发现新版本 ${st.latest}（约 ${st.sizeMb.toFixed(1)} MB）。` +
+      '更新会自动挑最快的下载线路；装好后会自动重新打开。';
+    if (st.notes) {
+      el.setNotesBody.textContent = st.notes;
+      el.setNotes.hidden = false;
+    }
+    el.btnDoUpdate.hidden = false;
+    el.btnDoUpdate.disabled = false;
+    el.btnDoUpdate.textContent = '立即更新';
+    markUpdateDot(true);
+  } catch (e) {
+    el.setUpdateHint.textContent = `检查更新失败：${e}`;
+  }
+}
+
+/** 工具栏上那个小圆点：有新版才亮。 */
+function markUpdateDot(on) {
+  el.settingsDot.hidden = !on;
+}
+
+async function doUpdate(btn) {
+  btn.disabled = true;
+  btn.textContent = '准备中…';
+  try {
+    await invoke('start_update');
+    // 之后全靠 `update-progress` 事件推进度
+  } catch (e) {
+    btn.disabled = false;
+    btn.textContent = '立即更新';
+    el.setUpdateHint.textContent = `更新失败：${e}`;
+    toast(`更新失败：${e}`, true);
+  }
+}
+
+/** 更新进度：后端每推进一步就调一次。 */
+function onUpdateProgress(p) {
+  if (!p) return;
+  if (p.phase === 'probing') {
+    el.setUpdateHint.textContent = '正在挑选最快的下载线路…';
+    el.updateBar.hidden = false;
+    el.updateBarFill.style.width = '2%';
+  } else if (p.phase === 'downloading') {
+    // 文案里已经带了进度与速度，直接显示
+    el.setUpdateHint.textContent = p.message;
+    el.updateBar.hidden = false;
+    el.updateBarFill.style.width = `${Math.max(2, Math.min(100, p.percent)).toFixed(1)}%`;
+  } else if (p.phase === 'verifying') {
+    el.setUpdateHint.textContent = '正在校验安装包…';
+    el.updateBar.hidden = false;
+    el.updateBarFill.style.width = '100%';
+  } else if (p.phase === 'installing') {
+    el.setUpdateHint.textContent = '正在安装，请在弹出的系统提示里点「是」。装好后会自动重新打开。';
+    el.updateBar.hidden = false;
+    el.updateBarFill.style.width = '100%';
+  } else if (p.phase === 'failed') {
+    el.setUpdateHint.textContent = `更新失败：${p.message}`;
+    el.updateBar.hidden = true;
+    el.btnDoUpdate.hidden = false;
+    el.btnDoUpdate.disabled = false;
+    el.btnDoUpdate.textContent = '重试';
+  }
+}
+
+/**
+ * 启动时静默检查一次更新。
+ *
+ * 只做两件事：有新版就在设置按钮上点一个小圆点，并把结果留给设置页。
+ * **不弹窗、不打断**：老师打开课件是要上课，不是来装软件的。
+ */
+async function checkUpdateOnStart() {
+  try {
+    const st = await invoke('check_update');
+    el.setVersion.textContent = st.current;
+    if (st.hasUpdate) {
+      markUpdateDot(true);
+      console.info(`发现新版本 ${st.latest}（当前 ${st.current}），可在设置里更新`);
+    }
+  } catch (e) {
+    // 没网、被墙、仓库还没发布 —— 都不值得打扰老师
+    console.debug('启动时检查更新失败（忽略）', e);
+  }
+}
+
 /* ---------------- 初始化 ---------------- */
 
 function bindUi() {
@@ -3789,8 +4008,35 @@ function bindUi() {
 
   el.pageInput.addEventListener('focus', () => el.pageInput.select());
 
-  $('btn-assoc-register').addEventListener('click', registerAssoc);
-  $('btn-assoc-settings').addEventListener('click', openAssocSettings);
+  // 设置：工具栏入口、关闭、点遮罩空白处关闭
+  $('btn-settings').addEventListener('click', () => {
+    if (el.settings.classList.contains('hidden')) openSettings();
+    else closeSettings();
+  });
+  $('btn-settings-close').addEventListener('click', closeSettings);
+  el.settings.addEventListener('click', (e) => {
+    // 只有点在遮罩本身（不是卡片上）才关
+    if (e.target === el.settings) closeSettings();
+  });
+
+  $('btn-check-update').addEventListener('click', refreshUpdate);
+  $('btn-do-update').addEventListener('click', (e) => doUpdate(e.currentTarget));
+  $('btn-clear-cache').addEventListener('click', (e) => clearCache(e.currentTarget));
+  $('btn-open-log').addEventListener('click', async () => {
+    try {
+      await invoke('open_log_dir');
+    } catch (e) {
+      toast(`打不开日志文件夹：${e}`, true);
+    }
+  });
+
+  // 文件关联：欢迎页与设置页各有一个入口（靠 data-assoc 绑定）
+  for (const btn of document.querySelectorAll('[data-assoc]')) {
+    btn.addEventListener('click', () => {
+      if (btn.dataset.assoc === 'register') registerAssoc();
+      else openAssocSettings();
+    });
+  }
 
   // 操作方式：老师选一次，之后一直按它走（见 `applyInputMode`）
   for (const chip of document.querySelectorAll('.mode-chip')) {
@@ -3825,45 +4071,52 @@ async function loadRecent() {
  */
 
 async function refreshAssoc() {
-  const list = $('assoc-list');
-  const hint = $('assoc-hint');
-  if (!list) return;
+  const lists = document.querySelectorAll('.assoc-list');
+  const hints = document.querySelectorAll('.assoc-summary');
+  if (lists.length === 0) return;
 
+  let text = '';
   try {
     const items = await invoke('associations_status');
-    list.innerHTML = '';
 
-    for (const it of items) {
-      const chip = document.createElement('span');
-      const state = it.isDefault ? 'default' : it.registered ? 'registered' : '';
-      chip.className = `assoc-chip ${state}`.trim();
-      chip.textContent = `.${it.ext}`;
-      chip.title = it.isDefault
-        ? `${it.label}：已是默认打开方式`
-        : it.registered
-          ? `${it.label}：已注册，当前默认是 ${it.currentHandler || '其它程序'}`
-          : `${it.label}：尚未注册`;
-      list.appendChild(chip);
+    for (const list of lists) {
+      list.innerHTML = '';
+      for (const it of items) {
+        const chip = document.createElement('span');
+        const state = it.isDefault ? 'default' : it.registered ? 'registered' : '';
+        chip.className = `assoc-chip ${state}`.trim();
+        chip.textContent = `.${it.ext}`;
+        chip.title = it.isDefault
+          ? `${it.label}：已是默认打开方式`
+          : it.registered
+            ? `${it.label}：已注册，当前默认是 ${it.currentHandler || '其它程序'}`
+            : `${it.label}：尚未注册`;
+        list.appendChild(chip);
+      }
     }
 
     const allDefault = items.length > 0 && items.every((i) => i.isDefault);
     if (allDefault) {
-      hint.textContent = '已全部设为默认，双击课件文件即可直接用本应用打开。';
+      text = '已全部设为默认，双击课件文件即可直接用本应用打开。';
     } else {
       const pending = items.filter((i) => !i.isDefault).map((i) => `.${i.ext}`);
-      hint.textContent = pending.length
+      text = pending.length
         ? `${pending.join(' ')} 还没设为默认。点「注册到本应用」后，` +
           '若系统已锁定默认程序，再到「系统默认应用」里点一次确认即可。'
         : '';
     }
   } catch (e) {
-    hint.textContent = `无法读取关联状态：${e}`;
+    text = `无法读取关联状态：${e}`;
+  }
+  for (const hint of hints) {
+    hint.textContent = text;
   }
 }
 
 async function registerAssoc() {
-  const btn = $('btn-assoc-register');
-  btn.disabled = true;
+  // 欢迎页与设置页各有一个入口，一起禁用，免得连点两次
+  const buttons = [...document.querySelectorAll('[data-assoc="register"]')];
+  for (const b of buttons) b.disabled = true;
   try {
     const outcome = await invoke('register_associations');
     await refreshAssoc();
@@ -3875,7 +4128,7 @@ async function registerAssoc() {
   } catch (e) {
     toast(`注册失败：${e}`, true);
   } finally {
-    btn.disabled = false;
+    for (const b of buttons) b.disabled = false;
   }
 }
 
@@ -3913,6 +4166,16 @@ async function init() {
   } catch (e) {
     console.warn('订阅 open-file 失败', e);
   }
+
+  // 更新的进度由后台线程推过来（测速 → 下载 → 校验 → 安装）
+  try {
+    await T.event.listen('update-progress', (ev) => onUpdateProgress(ev && ev.payload));
+  } catch (e) {
+    console.warn('订阅 update-progress 失败', e);
+  }
+
+  // 静默查一次更新：有新版只在设置入口上点个小圆点，不打断老师
+  checkUpdateOnStart();
 
   // 后台已经用本机办公软件把**当前这份**课件的第一页出好了。
   //

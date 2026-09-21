@@ -53,8 +53,9 @@ impl DocFormat {
         match self {
             DocFormat::Pptx | DocFormat::Pdf => None,
             DocFormat::PptLegacy => Some(
-                "这是 PowerPoint 97-2003 的旧版 .ppt 文件，本版本还不能直接放映；\
-                 请用 PowerPoint 或 WPS 打开它、另存为 .pptx 后再放",
+                "这是旧版 Office 二进制文件（97-2003），而且扩展名看不出是哪一种。\
+                 演示文稿（.ppt / .pps / .pot）本版本会自动转成 .pptx 再打开；\
+                 若它是 Word / Excel 文档，请用对应程序打开",
             ),
             DocFormat::WordLegacy => Some(
                 "这是 Word 文档，不是演示文稿；本版本只放映 .pptx 课件与 .pdf 文档",
@@ -505,9 +506,13 @@ mod tests {
         //
         // 曾经写的是「旧版 .ppt 格式将在后续版本支持」—— 老师拿着一份打不开的
         // 课件站在讲台上，这句话帮不了他：他还得自己猜怎么转格式、转成什么。
+        //
+        // 现在演示文稿（.ppt / .pps / .pot）由 `ppt-app` 转成 .pptx 后自动打开，
+        // 走到这条提示的只剩「OLE2 容器、但扩展名看不出是哪一种」，
+        // 所以这里要说清「拿对应程序打开」，而不是让老师去找转换入口。
         let hint = DocFormat::PptLegacy.unsupported_hint().unwrap();
-        assert!(hint.contains("另存为"), "要指出转换动作：{hint}");
-        assert!(hint.contains(".pptx"), "要说清转成什么：{hint}");
+        assert!(hint.contains("请用对应程序打开"), "要指出怎么办：{hint}");
+        assert!(hint.contains(".ppt"), "要说清哪几种扩展名会被自动转换：{hint}");
         assert!(!hint.contains("后续版本"), "不要只说「以后会支持」：{hint}");
     }
 

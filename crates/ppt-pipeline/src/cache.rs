@@ -228,15 +228,23 @@ const DISK_HEADER_LEN: usize = 16;
 
 impl DiskCache {
     /// 打开（或创建）磁盘缓存目录。
+    ///
+    /// `root` 可以是与别人共用的目录（本应用就是：办公软件出的逐页 PNG
+    /// 住在同一个 `root` 下的 `wps/`）—— 本类型只读写自己那棵
+    /// `v<N>` 子树，占用统计也只算它，见 [`DiskCache::version_root`]。
     pub fn open(root: impl AsRef<Path>, budget_bytes: u64) -> Result<DiskCache> {
         let root = root.as_ref().to_path_buf();
         std::fs::create_dir_all(&root).map_err(|e| {
             Error::other(format!("无法创建缓存目录 {}：{e}", root.display()))
         })?;
 
+        // 顺手清掉旧版本号的目录（只认形如 `v<数字>` 的，别的一律不碰）
         purge_stale_versions(&root);
 
-        let used_bytes = scan_dir_size(&root);
+        // 占用只统计自己这棵子树：把邻居的体积算进来，会让我们一上来就
+        // 觉得「超预算」，然后把刚写下去的缓存立刻删掉
+        let version_root = root.join(format!("v{DISK_VERSION}"));
+        let used_bytes = scan_dir_size(&version_root);
         Ok(DiskCache {
             root,
             budget_bytes,
@@ -244,9 +252,26 @@ impl DiskCache {
         })
     }
 
+    /// 本版本位图缓存自己的根：`<root>/v<N>`。
+    ///
+    /// # 为什么增删都必须限制在这棵子树里
+    ///
+    /// `root` 里不止住着位图缓存。以本应用为例，它还住着
+    /// **「办公软件出的逐页 PNG」**（`<root>/wps/<版本>/<课件>/…`）——
+    /// 那些不是缓存副产物，而是**画面来源**：删掉了，那几页就只能退回
+    /// 自研渲染内核，老师看到的就是「和原稿不一样」。
+    ///
+    /// 这里踩过一次很深的坑：淘汰按修改时间从 `root` 往下删，于是
+    /// 它把最早写的那些**页面图**当最旧文件删了（实测某份课件第 0~10 页
+    /// 的整页图与 0~9 的分帧一起消失，第 11 页往后完好），
+    /// 表现为「有的页面突然变成自研渲染」。
+    fn version_root(&self) -> PathBuf {
+        self.root.join(format!("v{DISK_VERSION}"))
+    }
+
     /// 某个课件的缓存目录（带版本号，便于整体失效）。
     fn dir_for(&self, fingerprint: &str) -> PathBuf {
-        self.root.join(format!("v{DISK_VERSION}")).join(fingerprint)
+        self.version_root().join(fingerprint)
     }
 
     fn path_for(&self, fingerprint: &str, page: usize, bucket: u32) -> PathBuf {
@@ -290,6 +315,8 @@ impl DiskCache {
     }
 
     /// 超出预算时按修改时间淘汰最旧的文件。
+    ///
+    /// 只在自己那棵子树（`<root>/v<N>`）里淘汰，见 [`DiskCache::version_root`]。
     fn enforce_budget(&mut self) {
         if self.used_bytes <= self.budget_bytes {
             return;
@@ -297,7 +324,7 @@ impl DiskCache {
 
         // 收集所有缓存文件及其修改时间
         let mut files: Vec<(PathBuf, u64, std::time::SystemTime)> = Vec::new();
-        collect_files(&self.root, &mut files);
+        collect_files(&self.version_root(), &mut files);
         files.sort_by_key(|(_, _, t)| *t);
 
         for (path, size, _) in files {
@@ -310,15 +337,16 @@ impl DiskCache {
         }
     }
 
-    /// 清空全部磁盘缓存。
+    /// 清空位图磁盘缓存（**不碰 root 下的其它东西**，见 [`DiskCache::version_root`]）。
     pub fn clear(&mut self) -> Result<()> {
-        if self.root.exists() {
-            std::fs::remove_dir_all(&self.root).map_err(|e| {
-                Error::other(format!("无法清空缓存目录 {}：{e}", self.root.display()))
+        let version_root = self.version_root();
+        if version_root.exists() {
+            std::fs::remove_dir_all(&version_root).map_err(|e| {
+                Error::other(format!("无法清空缓存目录 {}：{e}", version_root.display()))
             })?;
         }
-        std::fs::create_dir_all(&self.root).map_err(|e| {
-            Error::other(format!("无法重建缓存目录 {}：{e}", self.root.display()))
+        std::fs::create_dir_all(&version_root).map_err(|e| {
+            Error::other(format!("无法重建缓存目录 {}：{e}", version_root.display()))
         })?;
         self.used_bytes = 0;
         Ok(())
@@ -408,6 +436,16 @@ fn scan_dir_size(dir: &Path) -> u64 {
     dir_size(dir).unwrap_or(0)
 }
 
+/// 这个名字是不是「位图缓存的版本目录」（形如 `v2` / `v10`）。
+///
+/// 规则定义在这里，因为这是位图缓存**自己的**命名规则。淘汰旧版本要用它，
+/// 应用的设置页统计占用也要用它 —— 分散成两份，改命名时一定会漏掉一处，
+/// 而症状是「清理缓存清不干净」这种最难察觉的那种。
+pub fn is_version_dir(name: &str) -> bool {
+    name.strip_prefix('v')
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// 删除非当前版本号的缓存目录。
 ///
 /// 版本号写在目录名里（`v2/<课件指纹>/`），所以升级后旧目录不会被读到；
@@ -421,10 +459,7 @@ fn purge_stale_versions(root: &Path) {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         // 只动形如 `v<数字>` 的目录，其它内容一律不碰
-        let is_version_dir = name
-            .strip_prefix('v')
-            .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()));
-        if is_version_dir && name != keep {
+        if is_version_dir(&name) && name != keep {
             let _ = std::fs::remove_dir_all(entry.path());
         }
     }
@@ -649,6 +684,54 @@ mod tests {
             "应淘汰到预算内，实际 {}",
             c.used_bytes()
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 淘汰与清空都只许动自己那棵 `v<N>` 子树。
+    ///
+    /// 这条钉住的是一个很深的坑：位图缓存与「办公软件出的逐页 PNG」
+    /// （`<root>/wps/…`）共用一个 root，而淘汰曾经从 root 往下删最旧的
+    /// 文件 —— 于是把**页面图**当缓存删掉了，那几页只能退回自研渲染，
+    /// 老师看到的就是「有的页面和原稿不一样」。
+    #[test]
+    fn disk_cache_leaves_siblings_alone() {
+        let dir = temp_dir("openpptview-diskcache-neighbour");
+
+        // 邻居：模拟办公软件出的页面图
+        let page = dir.join("wps").join("v1").join("fingerprint").join("0.png");
+        std::fs::create_dir_all(page.parent().unwrap()).unwrap();
+        std::fs::write(&page, b"page raster, not a bitmap cache file").unwrap();
+
+        // 预算小到一写就超，逼出淘汰
+        let mut c = DiskCache::open(&dir, 1).unwrap();
+        for page_no in 0..3 {
+            c.store("fp", page_no, 100, &Bitmap::new_filled(100, 100, Color::WHITE));
+        }
+
+        assert!(c.used_bytes() <= 1, "应淘汰到预算内");
+        assert!(c.load("fp", 0, 100).is_none(), "自己的缓存该被淘汰掉");
+        assert!(page.is_file(), "淘汰不该碰邻居的文件");
+
+        c.clear().unwrap();
+        assert!(page.is_file(), "清空也不该碰邻居的文件");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 占用统计只算自己那棵子树。
+    ///
+    /// 把邻居的体积算进来，会让我们一上来就觉得「超预算」，
+    /// 然后把刚写下去的缓存立刻删掉 —— 缓存等于失效。
+    #[test]
+    fn disk_cache_size_ignores_siblings() {
+        let dir = temp_dir("openpptview-diskcache-size");
+        let neighbour = dir.join("wps").join("v1").join("big.png");
+        std::fs::create_dir_all(neighbour.parent().unwrap()).unwrap();
+        std::fs::write(&neighbour, vec![0u8; 100 * 1024]).unwrap();
+
+        let c = DiskCache::open(&dir, 64 * 1024 * 1024).unwrap();
+        assert_eq!(c.used_bytes(), 0, "邻居的体积不该算进来");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

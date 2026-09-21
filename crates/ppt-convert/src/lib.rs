@@ -60,11 +60,6 @@ use std::time::Duration;
 mod com;
 pub mod source;
 
-/// `ppSaveAsPDF`：`Presentation.SaveAs` 的文件格式常量。
-///
-/// 与 Office 的 `ppSaveAsPDF` 同值，WPS 亦兼容（已实测）。
-const SAVE_AS_PDF: i32 = 32;
-
 /// `ppAlertsNone`：把所有模态提示关掉。
 ///
 /// 后台线程里一旦弹出模态框，转换就会**永久挂死**（没人去点确定），
@@ -209,10 +204,43 @@ pub struct WarmRequest {
     pub step_plans: Option<StepPlanner>,
 }
 
+/// `Presentation.SaveAs` 的目标格式。
+///
+/// 值取自 Office 的 `PpSaveAsFileType` 枚举；WPS 兼容同一套取值（已实测 PDF）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaveAs {
+    /// `ppSaveAsPDF`：矢量 PDF。
+    Pdf,
+    /// `ppSaveAsOpenXMLPresentation`：`.pptx`。
+    ///
+    /// 用途是**把旧版 `.ppt` 转成能打开的东西**：97-2003 的二进制格式
+    /// 我们没有自己的解析器，而办公软件本身就是那份文件的作者工具 ——
+    /// 让它转一次，比要求老师自己「另存为」靠谱得多。
+    Pptx,
+}
+
+impl SaveAs {
+    fn code(self) -> i32 {
+        match self {
+            SaveAs::Pdf => 32,
+            SaveAs::Pptx => 24,
+        }
+    }
+
+    /// 目标文件应有的扩展名（`SaveAs` 会按它做一次格式判断）。
+    fn extension(self) -> &'static str {
+        match self {
+            SaveAs::Pdf => "pdf",
+            SaveAs::Pptx => "pptx",
+        }
+    }
+}
+
 enum Job {
-    Convert {
-        pptx: PathBuf,
+    SaveAs {
+        src: PathBuf,
         out: PathBuf,
+        format: SaveAs,
         reply: Reply,
     },
     WarmPages {
@@ -225,16 +253,19 @@ enum Job {
 /// 一条待执行的工作（不含回信通道 —— 那是任务信封的一部分）。
 #[cfg(windows)]
 enum Task {
-    /// 整本导出成矢量 PDF。产品路径不用它，留着当「WPS 到底能多快」的
-    /// 基准工具，也方便将来需要矢量时直接拿来（见 `examples/convert.rs`）。
-    Pdf { pptx: PathBuf, out: PathBuf },
+    /// 用办公软件另存为指定格式（矢量 PDF / 旧版 .ppt 转 .pptx）。
+    SaveAs {
+        src: PathBuf,
+        out: PathBuf,
+        format: SaveAs,
+    },
     /// 逐页出位图。
     Warm(Box<WarmRequest>),
 }
 
-/// Pptx → PDF 的转换器。
+/// 借用办公软件做格式转换的转换器。
 ///
-/// 内部只有一条工作线程；多次调用 [`Converter::convert`] 会排队，
+/// 内部只有一条工作线程；多次调用 [`Converter::save_as`] 会排队，
 /// 不会并发唤起多个 WPS 实例（并发实例会争抢用户配置目录而失败）。
 ///
 /// `Sender` 不是 `Sync`，而调用方（Tauri 的 `State`）要求共享状态是 `Sync`，
@@ -249,7 +280,7 @@ pub struct Converter {
 impl Converter {
     /// 起一条转换线程并立即返回；`Application` 在后台预热。
     ///
-    /// 返回后可以马上调用 [`Converter::convert`]，请求会排队等预热完成。
+    /// 返回后可以马上调用 [`Converter::save_as`]，请求会排队等预热完成。
     pub fn spawn(engine: Engine) -> Converter {
         let (tx, rx) = mpsc::channel();
         let join = thread::Builder::new()
@@ -270,17 +301,21 @@ impl Converter {
         self.engine
     }
 
-    /// 把 `pptx` 导出成矢量 PDF 到 `out`。
+    /// 用办公软件把 `src` 另存为 `out`（格式由 `format` 指定）。
     ///
     /// 阻塞当前线程直到出结果（上限 [`CONVERT_TIMEOUT`]）。
-    /// 成功时保证 `out` 已是一份完整、合法的 PDF。
-    pub fn convert(&self, pptx: &Path, out: &Path) -> Result<(), String> {
+    /// 成功时保证 `out` 已是一份完整、合法的产物。
+    ///
+    /// 两个用途：`.pptx → 矢量 PDF`（诊断与备用），
+    /// 以及 **`.ppt → .pptx`**（打开旧版课件之前先把它转成能解析的格式）。
+    pub fn save_as(&self, src: &Path, out: &Path, format: SaveAs) -> Result<(), String> {
         let (reply_tx, reply_rx) = mpsc::channel();
         {
             let tx = self.tx.lock().map_err(|_| "转换器状态损坏".to_string())?;
-            tx.send(Job::Convert {
-                pptx: pptx.to_path_buf(),
+            tx.send(Job::SaveAs {
+                src: src.to_path_buf(),
                 out: out.to_path_buf(),
+                format,
                 reply: reply_tx,
             })
             .map_err(|_| "转换线程已经退出".to_string())?;
@@ -353,7 +388,7 @@ fn worker(engine: Engine, rx: Receiver<Job>) {
             while let Ok(job) = rx.recv() {
                 match job {
                     Job::Stop => break,
-                    Job::Convert { reply, .. } | Job::WarmPages { reply, .. } => {
+                    Job::SaveAs { reply, .. } | Job::WarmPages { reply, .. } => {
                         let _ = reply.send(Err(e.clone()));
                     }
                 }
@@ -383,7 +418,19 @@ fn worker(engine: Engine, rx: Receiver<Job>) {
     while let Ok(job) = rx.recv() {
         let (task, reply): (Task, Reply) = match job {
             Job::Stop => break,
-            Job::Convert { pptx, out, reply } => (Task::Pdf { pptx, out }, reply),
+            Job::SaveAs {
+                src,
+                out,
+                format,
+                reply,
+            } => (
+                Task::SaveAs {
+                    src,
+                    out,
+                    format,
+                },
+                reply,
+            ),
             Job::WarmPages { req, reply } => (Task::Warm(req), reply),
         };
 
@@ -456,7 +503,7 @@ fn rebuild(current: &mut Option<com::Obj>, engine: Engine) {
 #[cfg(windows)]
 fn run_task(app: &com::Obj, task: &Task) -> Result<(), String> {
     match task {
-        Task::Pdf { pptx, out } => export_pdf(app, pptx, out),
+        Task::SaveAs { src, out, format } => export_as(app, src, out, *format),
         Task::Warm(req) => warm_pages_impl(app, req),
     }
 }
@@ -466,7 +513,7 @@ fn worker(_engine: Engine, rx: Receiver<Job>) {
     while let Ok(job) = rx.recv() {
         match job {
             Job::Stop => break,
-            Job::Convert { reply, .. } | Job::WarmPages { reply, .. } => {
+            Job::SaveAs { reply, .. } | Job::WarmPages { reply, .. } => {
                 let _ = reply.send(Err("当前平台不支持借用办公软件内核".to_string()));
             }
         }
@@ -868,18 +915,18 @@ fn hide_paragraphs(
     done
 }
 
-/// 一次完整的「打开 → 另存为 PDF → 关闭」。
+/// 一次完整的「打开 → 另存为 → 关闭」。
 #[cfg(windows)]
-fn export_pdf(app: &com::Obj, pptx: &Path, out: &Path) -> Result<(), String> {
+fn export_as(app: &com::Obj, src: &Path, out: &Path, format: SaveAs) -> Result<(), String> {
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("无法创建目录 {}：{e}", parent.display()))?;
     }
 
     // 先导出到同目录下的临时名字，成功后再改名。
-    // 直接写目标路径的话，中途失败会留下一份半截 PDF，
+    // 直接写目标路径的话，中途失败会留下一份半截产物，
     // 而缓存层只看「文件在不在」—— 半个文件会被当成有效缓存一直用下去。
-    let tmp = partial_path(out);
+    let tmp = partial_path(out, format);
     let _ = std::fs::remove_file(&tmp);
 
     let started = std::time::Instant::now();
@@ -887,7 +934,7 @@ fn export_pdf(app: &com::Obj, pptx: &Path, out: &Path) -> Result<(), String> {
     let doc = presentations.call_obj(
         "Open",
         vec![
-            com::v_bstr(&pptx.to_string_lossy()),
+            com::v_bstr(&src.to_string_lossy()),
             com::v_bool(true),  // ReadOnly：绝不修改老师的原文件
             com::v_bool(false), // Untitled
             com::v_bool(false), // WithWindow = false —— 全程不弹窗的关键
@@ -897,29 +944,31 @@ fn export_pdf(app: &com::Obj, pptx: &Path, out: &Path) -> Result<(), String> {
     // 分阶段计时。
     //
     // 这两个数决定了产品能做到多快：`Open` 是「老师等多久才能看到第一页」
-    // 的下限，`SaveAs` 是「整本矢量图备好」的下限。
+    // 的下限，`SaveAs` 是「产物备好」的下限。
     // 之前只记总耗时，没法判断优化该往哪边使劲。
     let open_ms = started.elapsed().as_secs_f64() * 1000.0;
 
     let save_started = std::time::Instant::now();
     let saved = doc.call(
         "SaveAs",
-        vec![com::v_bstr(&tmp.to_string_lossy()), com::v_i32(SAVE_AS_PDF)],
+        vec![com::v_bstr(&tmp.to_string_lossy()), com::v_i32(format.code())],
     );
     let save_ms = save_started.elapsed().as_secs_f64() * 1000.0;
 
     // 无论成败都要关掉，否则这个文档会一直占着文件锁
     let _ = doc.call("Close", Vec::new());
 
-    log::info!("导出阶段耗时：Open {open_ms:.0}ms + SaveAs {save_ms:.0}ms");
+    log::info!(
+        "另存为 {}：Open {open_ms:.0}ms + SaveAs {save_ms:.0}ms（{}）",
+        format.extension(),
+        src.display()
+    );
 
     saved?;
 
-    let check = validate_pdf(&tmp)
-        .and_then(|_| {
-            std::fs::rename(&tmp, out)
-                .map_err(|e| format!("无法写入 {}：{e}", out.display()))
-        });
+    let check = validate_product(&tmp, format).and_then(|_| {
+        std::fs::rename(&tmp, out).map_err(|e| format!("无法写入 {}：{e}", out.display()))
+    });
     if check.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -928,31 +977,43 @@ fn export_pdf(app: &com::Obj, pptx: &Path, out: &Path) -> Result<(), String> {
 
 /// 同目录下的临时文件名。
 ///
-/// 故意保留 `.pdf` 后缀：`SaveAs` 的格式参数虽然指定了 PDF，
+/// 故意保留目标扩展名：`SaveAs` 的格式参数虽然指定了格式，
 /// 但个别版本仍会按目标扩展名做一次判断。
-fn partial_path(out: &Path) -> PathBuf {
+fn partial_path(out: &Path, format: SaveAs) -> PathBuf {
     let stem = out
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "deck".to_string());
-    out.with_file_name(format!(".{stem}.partial.pdf"))
+    out.with_file_name(format!(".{stem}.partial.{}", format.extension()))
 }
 
-/// 确认产物真的是 PDF。
+/// 确认产物真的是想要的那种文件。
 ///
 /// 引擎可能「成功返回但写出空文件」（例如源文件损坏时某些版本的行为），
-/// 这里把这种情况挡在缓存之外，让调用方回退到自研渲染。
-fn validate_pdf(path: &Path) -> Result<(), String> {
+/// 这里把这种情况挡在缓存之外，让调用方回退到别的路子。
+#[cfg(windows)]
+fn validate_product(path: &Path, format: SaveAs) -> Result<(), String> {
     let meta = std::fs::metadata(path)
         .map_err(|e| format!("引擎没有产出文件 {}：{e}", path.display()))?;
-    // 一份正常课件的 PDF 不可能只有几百字节；阈值取小一点以免误杀单页课件
+    // 一份正常课件不可能只有几百字节；阈值取小一点以免误杀单页课件
     if meta.len() < 512 {
-        return Err(format!("导出的 PDF 过小（{} 字节），判定为失败", meta.len()));
+        return Err(format!(
+            "导出的 {} 过小（{} 字节），判定为失败",
+            format.extension(),
+            meta.len()
+        ));
     }
-    let head = std::fs::read(path)
-        .map_err(|e| format!("无法读取导出的 PDF：{e}"))?;
-    if !head.starts_with(b"%PDF-") {
-        return Err("导出的文件不是 PDF".to_string());
+    let head = std::fs::read(path).map_err(|e| format!("无法读取导出的文件：{e}"))?;
+    let expect: &[u8] = match format {
+        SaveAs::Pdf => b"%PDF-",
+        // OOXML 都是 ZIP 容器
+        SaveAs::Pptx => &[0x50, 0x4B, 0x03, 0x04],
+    };
+    if !head.starts_with(expect) {
+        return Err(format!(
+            "导出的文件不是 {}（头部对不上）",
+            format.extension()
+        ));
     }
     Ok(())
 }
@@ -971,15 +1032,26 @@ mod tests {
     fn partial_path_stays_next_to_the_target() {
         // 临时文件必须与目标同目录：跨卷 rename 会失败
         let out = Path::new(r"C:\cache\v9\abc123\deck.pdf");
-        let partial = partial_path(out);
+        let partial = partial_path(out, SaveAs::Pdf);
         assert_eq!(partial.parent(), out.parent());
         assert_ne!(partial, out);
         assert!(partial.to_string_lossy().ends_with(".pdf"));
     }
 
     #[test]
+    fn partial_path_keeps_the_target_extension() {
+        // SaveAs 会看扩展名，所以临时文件也必须带对的那个
+        let partial = partial_path(Path::new(r"C:\cache\legacy\课件-1234-5678.pptx"), SaveAs::Pptx);
+        assert!(
+            partial.to_string_lossy().ends_with(".pptx"),
+            "临时文件应以目标扩展名结尾：{}",
+            partial.display()
+        );
+    }
+
+    #[test]
     fn partial_path_survives_a_name_without_extension() {
-        let partial = partial_path(Path::new(r"C:\cache\deck"));
+        let partial = partial_path(Path::new(r"C:\cache\deck"), SaveAs::Pdf);
         assert_eq!(partial.parent(), Some(Path::new(r"C:\cache")));
     }
 
@@ -989,7 +1061,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("bad.pdf");
         std::fs::write(&path, vec![b'x'; 4096]).unwrap();
-        assert!(validate_pdf(&path).is_err());
+        assert!(validate_product(&path, SaveAs::Pdf).is_err());
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1000,7 +1072,7 @@ mod tests {
         let path = dir.join("tiny.pdf");
         // 前缀对，但太小 —— 引擎「成功返回空产物」就长这样
         std::fs::write(&path, b"%PDF-1.4\n").unwrap();
-        assert!(validate_pdf(&path).is_err());
+        assert!(validate_product(&path, SaveAs::Pdf).is_err());
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1012,7 +1084,40 @@ mod tests {
         let mut body = b"%PDF-1.4\n".to_vec();
         body.resize(2048, b' ');
         std::fs::write(&path, &body).unwrap();
-        assert!(validate_pdf(&path).is_ok());
+        assert!(validate_product(&path, SaveAs::Pdf).is_ok());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn validate_requires_the_right_container() {
+        let dir = std::env::temp_dir().join("oppv-convert-test-container");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 一份 PDF 不该被当成 .pptx 收下
+        let path = dir.join("mislabeled.pptx");
+        let mut body = b"%PDF-1.4\n".to_vec();
+        body.resize(2048, b' ');
+        std::fs::write(&path, &body).unwrap();
+        assert!(
+            validate_product(&path, SaveAs::Pptx).is_err(),
+            "头部不是 ZIP 就不该当成 pptx"
+        );
+
+        // ZIP 头（OOXML 都是 ZIP 容器）应被接受
+        let ok = dir.join("ok.pptx");
+        let mut zip = vec![0x50, 0x4B, 0x03, 0x04];
+        zip.resize(2048, 0);
+        std::fs::write(&ok, &zip).unwrap();
+        assert!(validate_product(&ok, SaveAs::Pptx).is_ok());
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&ok);
+    }
+
+    #[test]
+    fn save_as_codes_match_office() {
+        // 这两个取值来自 Office 的 PpSaveAsFileType，不能凭感觉改
+        assert_eq!(SaveAs::Pdf.code(), 32);
+        assert_eq!(SaveAs::Pptx.code(), 24);
     }
 }

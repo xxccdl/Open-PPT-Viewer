@@ -219,6 +219,7 @@ svg {
 }
 
 .icon-btn {
+  position: relative; /* 「有新版」的小圆点要贴着按钮角 */
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1006,6 +1007,173 @@ html.touch-mode .media-play {
   to {
     transform: rotate(360deg);
   }
+}
+
+/* ---------- 设置 ---------- */
+
+/* 工具栏上的「有新版可升级」小圆点 */
+.icon-btn .dot {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 2px var(--bg);
+}
+
+#settings {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(0, 0, 0, 0.26);
+  z-index: 60; /* 盖住欢迎页(40)、等待界面(40)与右键菜单 */
+  animation: settings-in var(--normal) var(--ease);
+}
+
+#settings.hidden {
+  display: none;
+}
+
+@keyframes settings-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.settings-card {
+  display: flex;
+  flex-direction: column;
+  width: min(560px, 100%);
+  max-height: 100%;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--border);
+  background: var(--panel-solid);
+  box-shadow: var(--shadow-lg);
+  overflow: hidden;
+}
+
+.settings-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.settings-head h2 {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.settings-body {
+  padding: 2px 16px 14px;
+  overflow-y: auto;
+}
+
+.set-sec {
+  padding: 13px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.set-sec:last-child {
+  border-bottom: none;
+}
+
+.set-sec-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 7px;
+}
+
+.set-sec-title {
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.set-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.set-label {
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+
+.set-value {
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.update-bar {
+  margin: 9px 0 3px;
+  height: 4px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  overflow: hidden;
+}
+
+.update-bar-fill {
+  height: 100%;
+  width: 0;
+  border-radius: 999px;
+  background: var(--accent);
+  transition: width var(--normal) var(--ease);
+}
+
+.set-notes {
+  margin-top: 8px;
+}
+
+.set-notes summary {
+  cursor: pointer;
+  font-size: 12.5px;
+  color: var(--text-dim);
+  list-style: none;
+}
+
+.set-notes summary::-webkit-details-marker {
+  display: none;
+}
+
+.set-notes summary::before {
+  content: "▸ ";
+}
+
+.set-notes[open] summary::before {
+  content: "▾ ";
+}
+
+.set-notes pre {
+  margin-top: 6px;
+  max-height: 190px;
+  overflow: auto;
+  padding: 8px 10px;
+  border-radius: var(--radius);
+  background: var(--stage-bg);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  color: var(--text-dim);
+}
+
+/* 「立即更新」是这一步的主操作，让它比旁边的次要按钮显眼一点 */
+.link-btn.strong:not(:disabled) {
+  color: var(--accent);
+  font-weight: 600;
 }
 
 /* ---------- 放映模式（对标 WPS 放映）----------

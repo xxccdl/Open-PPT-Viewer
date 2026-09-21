@@ -29,6 +29,20 @@ tauri-plugin-dialog = "2.7.3"
 # 这是「打开过一次之后，再打开就是秒开」的关键 —— 见 `main.rs` 的说明
 tauri-plugin-single-instance = "2"
 
+# 检查更新与下载升级包。
+#
+# `reqwest` 本来就在依赖树里（tauri 自己带的），这里只是把它开成
+# 「阻塞接口 + 系统 TLS」：`native-tls` 在 Windows 上就是 schannel，
+# 用系统的 TLS，不额外背一整套 rustls，安装包不为此变大。
+# 关掉默认 feature 是为了不把用不到的压缩/编码那一堆拉进来。
+reqwest = { version = "0.13", default-features = false, features = [
+    "blocking",
+    "native-tls",
+] }
+# 校验升级包的 SHA-256：github 的发布信息里带 digest，
+# 对得上才敢让一个要求管理员权限的安装程序跑起来
+sha2 = "0.11.0"
+
 # 默认打开方式自动注册：只需读写 HKCU，纯 Rust 实现，无需管理员权限
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"

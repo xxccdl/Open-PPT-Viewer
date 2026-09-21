@@ -26,6 +26,7 @@
 mod associations;
 mod install_pref;
 mod resident;
+mod update;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -272,7 +273,11 @@ fn raster_dir(fingerprint: &str, bucket: u32) -> PathBuf {
 
 /// 待后台逐页出图的课件。
 struct PendingWarm {
+    /// 拿来出图的文件（旧版 `.ppt` 是缓存里那份转换产物）。
     pptx: PathBuf,
+    /// 老师打开的那个文件。出图就绪事件里带的是它 ——
+    /// 前端拿它跟界面上显示的文件比对，两边必须是同一个字符串。
+    original: PathBuf,
     dir: PathBuf,
     /// 出图像素尺寸（按屏幕自适应算出）。
     width: u32,
@@ -413,6 +418,7 @@ type WarmFlagFn<'a> = &'a dyn Fn(&str) -> Arc<AtomicBool>;
 #[allow(clippy::type_complexity)]
 fn open_pptx(
     path: &Path,
+    original: &Path,
     bucket: u32,
     warm_flag: WarmFlagFn<'_>,
 ) -> Result<(SharedSource, Option<SharedSource>, Option<PendingWarm>), String> {
@@ -450,6 +456,7 @@ fn open_pptx(
     // 出图任务会跳过已有的页，所以补做不会从头再来一遍。
     let pending = (ready < pages || !step_frames_done).then(|| PendingWarm {
         pptx: path.to_path_buf(),
+        original: original.to_path_buf(),
         dir: dir.clone(),
         width: bucket,
         height: ((bucket as f32 * size.h / size.w.max(1.0)).round() as u32).max(1),
@@ -481,9 +488,131 @@ fn open_pptx(
     Ok((display, None, pending))
 }
 
+/// 本机没有办公软件时，打开旧版 `.ppt` 的说明。
+const LEGACY_NO_OFFICE_HINT: &str = "这是 PowerPoint 97-2003 的旧版 .ppt 文件。\
+     把它转成能放的格式需要本机装有 WPS 或 PowerPoint，这台机器上没找到；\
+     请装一个，或先用别的机器把它另存为 .pptx 再拿过来";
+
+/// 打开之前的准备：把**旧版 `.ppt`** 转成能解析的 `.pptx`。
+///
+/// 97-2003 的二进制格式我们没有自己的解析器。而本机那个办公软件
+/// **就是这份课件的作者工具** —— 让它另存为一次，比要求老师自己去
+/// 「另存为」靠谱得多：老师双击一份 `.ppt`，期待的是「看到里面的内容」，
+/// 而不是「先去学一个转换步骤」。
+///
+/// 返回**拿来解析**的路径；不是旧版格式时原样返回。
+///
+/// # 转不成也不能把老师堵死
+///
+/// 本机没装办公软件、或转换失败（文件损坏、加密、正被别的程序占用）时，
+/// 退回原来的行为：交给系统默认程序打开，并说清楚为什么。
+fn prepare_source(path: &Path, state: &tauri::State<'_, AppState>) -> Result<PathBuf, String> {
+    let mut probe = [0u8; 8];
+    let n = std::fs::File::open(path)
+        .and_then(|mut f| {
+            use std::io::Read;
+            f.read(&mut probe)
+        })
+        .map_err(|e| describe_open_failure(path, &e))?;
+
+    // 两个条件都要满足才动手：**容器是 OLE2** 且**扩展名是演示文稿**。
+    // 只看魔数不行 —— `.doc` / `.xls` 与 `.ppt` 共用同一个 OLE2 容器，
+    // 只按魔数判断会把一份 Word 文档送去当演示文稿转换。
+    let legacy_presentation = detect_format(&probe[..n]) == Some(DocFormat::PptLegacy)
+        && detect_format_by_extension(&path.to_string_lossy()) == Some(DocFormat::PptLegacy);
+    if !legacy_presentation {
+        return Ok(path.to_path_buf());
+    }
+
+    let out = legacy_converted_path(path);
+    if out.is_file() {
+        // 已经转过（键里含大小与修改时间，源文件一改就换一个键）
+        log::info!("旧版 .ppt 已有转换产物，直接使用：{}", out.display());
+        return Ok(out);
+    }
+
+    let Some(converter) = state.converter() else {
+        return Err(handoff_to_default_app(path, LEGACY_NO_OFFICE_HINT));
+    };
+
+    log::info!("旧版 .ppt 开始转换：{}", path.display());
+    let started = std::time::Instant::now();
+    if let Err(e) = converter.save_as(path, &out, ppt_convert::SaveAs::Pptx) {
+        log::warn!("旧版 .ppt 转换失败：{e}");
+        let hint = format!(
+            "打不开「{}」：它是 PowerPoint 97-2003 的旧版 .ppt，\
+             自动转成 .pptx 没有成功（{e}）",
+            file_name_of(path)
+        );
+        return Err(handoff_to_default_app(path, &hint));
+    }
+    log::info!(
+        "旧版 .ppt 转换完成：耗时 {:.1}s → {}",
+        started.elapsed().as_secs_f32(),
+        out.display()
+    );
+
+    // 同一份课件的旧产物不必留着：键变了就说明源文件变过，旧的再没人用
+    drop_stale_legacy(path, &out);
+    Ok(out)
+}
+
+/// 转换产物的缓存路径。
+///
+/// 键是「文件名 + 大小 + 修改时间」：老师换了一份同名课件、或在别处改过它，
+/// 键都会变，不会拿到上一次的旧产物。这里刻意**不算文件哈希** ——
+/// 那要多读一遍整份课件（几十 MB），而我们要的只是「变了就换一个键」。
+fn legacy_converted_path(src: &Path) -> PathBuf {
+    let meta = std::fs::metadata(src).ok();
+    let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+    let mtime = meta
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    cache_dir()
+        .join("legacy")
+        .join(format!("{}-{size}-{mtime}.pptx", file_stem_of(src)))
+}
+
+/// 删掉同一份课件的旧转换产物（`keep` 之外、同名的那些）。
+fn drop_stale_legacy(src: &Path, keep: &Path) {
+    let prefix = format!("{}-", file_stem_of(src));
+    let Ok(entries) = std::fs::read_dir(cache_dir().join("legacy")) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == keep {
+            continue;
+        }
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+fn file_stem_of(path: &Path) -> String {
+    path.file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "deck".to_string())
+}
+
+fn file_name_of(path: &Path) -> String {
+    path.file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string_lossy().to_string())
+}
+
 /// 解析课件路径并建立管线。
+///
+/// `path` 是**拿来解析**的文件，`original` 是**老师打开的那个文件**。
+/// 两者平时是同一个；只有旧版 `.ppt` 不同 —— 它要先转成 `.pptx` 才能解析，
+/// 而标题、备注、标注、界面上的文件名都必须用老师的原件
+/// （不然标注会写进缓存目录，老师把课件拷走什么也没带走）。
 fn build_pipeline(
     path: &Path,
+    original: &Path,
     fonts: Arc<FontContext>,
     bucket: u32,
     warm_flag: WarmFlagFn<'_>,
@@ -514,6 +643,16 @@ fn build_pipeline(
         Err(e) => return Err(describe_open_failure(path, &e)),
     };
 
+    // OLE2 容器是 .ppt / .doc / .xls 三家共用的，光看魔数分不出是哪一种。
+    // 走到这里说明它**不是**演示文稿（是的话在 `prepare_source` 里就转成
+    // .pptx 了），那就按扩展名说清楚它到底是什么 ——
+    // 别让老师对着一份 Word 文档被告知「你的课件坏了」。
+    let format = if format == DocFormat::PptLegacy {
+        detect_format_by_extension(&path.to_string_lossy()).unwrap_or(format)
+    } else {
+        format
+    };
+
     if let Some(hint) = format.unsupported_hint() {
         return Err(handoff_to_default_app(path, hint));
     }
@@ -523,7 +662,7 @@ fn build_pipeline(
         Option<SharedSource>,
         Option<PendingWarm>,
     ) = match format {
-        DocFormat::Pptx => open_pptx(path, bucket, warm_flag)?,
+        DocFormat::Pptx => open_pptx(path, original, bucket, warm_flag)?,
         DocFormat::Pdf => {
             let src = PdfSource::open(path).map_err(err_msg)?;
             (Arc::new(src), None, None)
@@ -559,11 +698,13 @@ fn build_pipeline(
         Pipeline::with_interaction(source, interactive, fonts, config).map_err(err_msg)?,
     );
 
-    let annotation_path = annotation_path_for(path);
+    // 标注旁挂在**老师的原件**旁边：转出来的 `.pptx` 住在缓存目录里，
+    // 标注跟着它走等于没存（缓存会被清理，老师也不会把缓存拷走）
+    let annotation_path = annotation_path_for(original);
 
     let info = DocInfo {
-        path: path.to_string_lossy().to_string(),
-        file_name: path
+        path: original.to_string_lossy().to_string(),
+        file_name: original
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default(),
@@ -734,7 +875,9 @@ fn kick_off_warm(app: tauri::AppHandle, state: &AppState, job: PendingWarm) {
 
     // 通知前端的那条通道。转换线程每出一页就发一个页码过来。
     let (page_tx, page_rx) = std::sync::mpsc::channel::<usize>();
-    let path = job.pptx.to_string_lossy().to_string();
+    // 事件里带的是**老师打开的那个文件**：前端拿它跟界面上显示的文件比对，
+    // 旧版 `.ppt` 的转换产物住在缓存里，报那个路径前端一个都认不出来
+    let path = job.original.to_string_lossy().to_string();
     let dir_for_log = key.clone();
     let page_count = job.page_count;
     let started = std::time::Instant::now();
@@ -836,14 +979,22 @@ fn open_document(
     // 1080p 屏出 1920 正好 1:1，4K 大屏出 3840 才不糊
     let bucket = raster_bucket(viewport_width);
 
+    // 旧版 `.ppt` 先转成 `.pptx` 才能解析（见 `prepare_source`）。
+    // `content` 是拿去解析的文件，`p` 始终是老师打开的那个文件。
+    let content = prepare_source(&p, &state).map_err(|e| {
+        log_error("打开课件失败", &e);
+        e
+    })?;
+
     let Opened {
         pipeline,
         info,
         pending_warm,
-    } = build_pipeline(&p, state.fonts(), bucket, &|dir| state.warm_flag(dir)).map_err(|e| {
-        log_error("打开课件失败", &e);
-        e
-    })?;
+    } = build_pipeline(&content, &p, state.fonts(), bucket, &|dir| state.warm_flag(dir))
+        .map_err(|e| {
+            log_error("打开课件失败", &e);
+            e
+        })?;
 
     // 替换旧文档。
     //
@@ -1514,6 +1665,320 @@ fn runtime_stats(state: tauri::State<'_, AppState>) -> Result<RuntimeStats, Stri
 #[allow(dead_code)]
 fn _assert_serde_imports<T: for<'de> Deserialize<'de>>() {}
 
+/* ---------------- 设置：缓存与日志 ---------------- */
+
+/// 应用数据目录（`%LOCALAPPDATA%\OpenPPTView`）。
+fn data_dir() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("OpenPPTView")
+}
+
+/// 日志目录。
+///
+/// 与 [`env_logger_init`] 共用这一处定义：两边各写一份，改目录时必会漏掉一处，
+/// 而症状是「设置页点『打开日志』打开的是个空文件夹」，最难查。
+fn log_dir() -> PathBuf {
+    data_dir().join("logs")
+}
+
+/// 递归算一个目录的字节数（目录不存在算 0）。
+fn dir_size(path: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|e| match e.metadata() {
+            Ok(m) if m.is_dir() => dir_size(&e.path()),
+            Ok(m) => m.len(),
+            Err(_) => 0,
+        })
+        .sum()
+}
+
+/// 各类缓存的占用（设置页「存储」用）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CacheUsage {
+    total: u64,
+    /// 办公软件出的逐页图与动画分帧（`cache/wps`）。
+    raster: u64,
+    /// 自研渲染的位图缓存（`cache/v<N>`）。
+    bitmap: u64,
+    /// 旧版 .ppt 的转换产物（`cache/legacy`）。
+    legacy: u64,
+}
+
+fn measure_cache() -> CacheUsage {
+    let cache = cache_dir();
+    let raster = dir_size(&cache.join("wps"));
+    let legacy = dir_size(&cache.join("legacy"));
+    // 位图缓存是 `cache/v<数字>/…`；命名规则由那边的 `is_version_dir` 定
+    let bitmap = std::fs::read_dir(&cache)
+        .ok()
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| {
+                    ppt_pipeline::cache::is_version_dir(&e.file_name().to_string_lossy())
+                })
+                .map(|e| dir_size(&e.path()))
+                .sum()
+        })
+        .unwrap_or(0);
+    CacheUsage {
+        total: raster + bitmap + legacy,
+        raster,
+        bitmap,
+        legacy,
+    }
+}
+
+#[tauri::command]
+fn cache_usage() -> CacheUsage {
+    measure_cache()
+}
+
+/// 清理可以重新生成的缓存。
+///
+/// `kind` 取 `bitmap` / `raster` / `legacy` / `all`，返回清理后的占用。
+///
+/// # 为什么办公软件出的图要「留着当前这份」
+///
+/// 那些图**就是画面来源**，不是副产物。把正在讲的这份也删了，老师下一页
+/// 就要等它重新出图。清理缓存不该让正在上的课变卡，所以当前课件的那份跳过，
+/// 只清别的课件留下的。
+#[tauri::command(async)]
+fn clear_cache(kind: String, state: tauri::State<'_, AppState>) -> Result<CacheUsage, String> {
+    let cache = cache_dir();
+    let all = kind == "all";
+
+    if all || kind == "bitmap" {
+        let has_doc = {
+            let guard = state.doc.lock().map_err(err_msg)?;
+            match guard.as_ref() {
+                Some(doc) => {
+                    // 交给管线清：它连内存缓存与渲染器内部缓存一起清，
+                    // 只删磁盘文件会留下一堆指向旧像素的内存副本
+                    doc.pipeline.clear_caches();
+                    true
+                }
+                None => false,
+            }
+        };
+        if !has_doc {
+            // 没有打开课件时没有管线可用，直接按命名规则删版本目录
+            if let Ok(entries) = std::fs::read_dir(&cache) {
+                for entry in entries.flatten() {
+                    if ppt_pipeline::cache::is_version_dir(&entry.file_name().to_string_lossy()) {
+                        let _ = std::fs::remove_dir_all(entry.path());
+                    }
+                }
+            }
+        }
+    }
+
+    if all || kind == "raster" {
+        remove_raster_cache(&state)?;
+    }
+
+    if all || kind == "legacy" {
+        let _ = std::fs::remove_dir_all(cache.join("legacy"));
+    }
+
+    log::info!("已清理缓存：{kind}");
+    Ok(measure_cache())
+}
+
+/// 删掉「办公软件出的逐页图」，**当前打开的那份留着**（见 [`clear_cache`]）。
+fn remove_raster_cache(state: &tauri::State<'_, AppState>) -> Result<(), String> {
+    let keep = {
+        let guard = state.doc.lock().map_err(err_msg)?;
+        guard
+            .as_ref()
+            .map(|doc| doc.pipeline.fingerprint().to_string())
+    };
+    let Ok(versions) = std::fs::read_dir(cache_dir().join("wps")) else {
+        return Ok(());
+    };
+    for version in versions.flatten() {
+        let Ok(items) = std::fs::read_dir(version.path()) else {
+            continue;
+        };
+        for item in items.flatten() {
+            let name = item.file_name().to_string_lossy().to_string();
+            if keep.as_deref() == Some(name.as_str()) {
+                continue;
+            }
+            let _ = std::fs::remove_dir_all(item.path());
+        }
+    }
+    Ok(())
+}
+
+/// 打开日志所在的文件夹（设置页与问题排查用）。
+#[tauri::command]
+fn open_log_dir() -> Result<(), String> {
+    let dir = log_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("无法创建日志目录：{e}"))?;
+    shell_execute(&dir.to_string_lossy(), None)
+}
+
+/* ---------------- 检查更新与一键升级 ---------------- */
+
+/// 「关于与更新」要显示的版本情况。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateStatus {
+    /// 当前版本。
+    current: String,
+    /// 最新版本；`None` 表示仓库里**还没有发布过任何版本**。
+    latest: Option<String>,
+    has_update: bool,
+    /// 安装包大小（MB）：下载前先让老师知道要下多少。
+    size_mb: f64,
+    /// 更新说明。
+    notes: Option<String>,
+}
+
+/// 检查有没有新版本。设置页打开时调一次，启动时也静默调一次。
+#[tauri::command(async)]
+fn check_update() -> Result<UpdateStatus, String> {
+    let current = update::current_version().to_string();
+    let Some(release) = update::check_latest()? else {
+        return Ok(UpdateStatus {
+            current,
+            latest: None,
+            has_update: false,
+            size_mb: 0.0,
+            notes: None,
+        });
+    };
+    Ok(UpdateStatus {
+        has_update: update::is_newer(&release.version, &current),
+        size_mb: release.asset_size as f64 / 1048576.0,
+        notes: (!release.notes.is_empty()).then(|| release.notes.clone()),
+        latest: Some(release.version.clone()),
+        current,
+    })
+}
+
+/// 更新进度（前端画进度条用）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateProgress {
+    /// `probing` / `downloading` / `verifying` / `installing` / `failed`。
+    phase: String,
+    percent: f32,
+    message: String,
+    /// 选中的线路速度（MB/s）。
+    speed_mbps: f64,
+}
+
+fn emit_update(app: &tauri::AppHandle, phase: &str, percent: f32, message: &str, speed_mbps: f64) {
+    let _ = app.emit(
+        "update-progress",
+        UpdateProgress {
+            phase: phase.to_string(),
+            percent,
+            message: message.to_string(),
+            speed_mbps,
+        },
+    );
+}
+
+/// 下载并安装新版本。
+///
+/// 立刻返回，进度通过 `update-progress` 事件推给界面 —— 下载十几 MB 要几十秒，
+/// 不能让这条命令一直挂着。
+#[tauri::command(async)]
+fn start_update(app: tauri::AppHandle) -> Result<(), String> {
+    let Some(release) = update::check_latest()? else {
+        return Err("仓库里还没有发布版本，暂时无法更新".to_string());
+    };
+    if !update::is_newer(&release.version, update::current_version()) {
+        return Err("已经是最新版本了".to_string());
+    }
+
+    let handle = app.clone();
+    std::thread::Builder::new()
+        .name("oppv-update".to_string())
+        .spawn(move || {
+            if let Err(e) = run_update(&handle, release) {
+                log::error!("更新失败：{e}");
+                emit_update(&handle, "failed", 0.0, &e, 0.0);
+            }
+        })
+        .map_err(|e| format!("无法启动更新线程：{e}"))?;
+    Ok(())
+}
+
+/// 更新全流程：挑线路 → 下载 → 校验 → 静默安装 → 退出自己。
+fn run_update(app: &tauri::AppHandle, release: update::Release) -> Result<(), String> {
+    log::info!("开始更新到 {}（{}）", release.version, release.asset_url);
+
+    emit_update(app, "probing", 0.0, "正在挑选最快的下载线路…", 0.0);
+    let (url, speed) = update::fastest_source(&release.asset_url)?;
+    let mbps = speed / 1048576.0;
+    log::info!("更新线路已选定（{mbps:.1} MB/s）");
+
+    let dest = std::env::temp_dir().join(format!("OpenPPTView-{}.exe", release.version));
+    let mut last = std::time::Instant::now();
+    let started = std::time::Instant::now();
+    emit_update(app, "downloading", 0.0, "正在下载新版本…", mbps);
+    update::download(&url, &dest, &mut |done, total| {
+        // 事件别发太密：两百毫秒一次足够把进度条画顺
+        if last.elapsed() < std::time::Duration::from_millis(200) {
+            return;
+        }
+        last = std::time::Instant::now();
+        // 速度按**这次下载的实际平均值**算，不用测速阶段的数：
+        // 那个数含着代理回源的等待，比真实带宽低得多，显示出来只会吓人
+        let secs = started.elapsed().as_secs_f64().max(0.001);
+        let rate = done as f64 / 1048576.0 / secs;
+        let (percent, text) = if total > 0 {
+            (
+                done as f32 * 100.0 / total as f32,
+                format!(
+                    "正在下载新版本… {:.1} / {:.1} MB（{rate:.1} MB/s）",
+                    done as f64 / 1048576.0,
+                    total as f64 / 1048576.0
+                ),
+            )
+        } else {
+            (
+                0.0,
+                format!(
+                    "正在下载新版本… {:.1} MB（{rate:.1} MB/s）",
+                    done as f64 / 1048576.0
+                ),
+            )
+        };
+        emit_update(app, "downloading", percent, &text, rate);
+    })?;
+
+    emit_update(app, "verifying", 100.0, "正在校验安装包…", mbps);
+    update::verify(&dest, &release)?;
+
+    emit_update(
+        app,
+        "installing",
+        100.0,
+        "正在安装，请在弹出的系统提示里点「是」",
+        mbps,
+    );
+    update::launch_installer(&dest)?;
+    log::info!("升级程序已启动，本程序即将退出");
+
+    // 给界面一点时间把这句话显示出来，再请自己退出。
+    // 退出走「先把标注落盘」那条路（见 `resident::quit`）。
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    resident::quit(app);
+    Ok(())
+}
+
 /* ---------------- 默认打开方式（文件关联） ---------------- */
 
 /// 查询各扩展名的关联状态，供设置界面展示。
@@ -1730,6 +2195,11 @@ fn open_external(url: String) -> Result<(), String> {
 }
 
 /// 交给 Windows 外壳，用「默认程序」打开一个链接或文件。
+pub fn shell_execute_open(target: &str) -> Result<(), String> {
+    shell_execute(target, None)
+}
+
+/// 交给 Windows 外壳去运行一个程序（可带参数）。
 ///
 /// # 为什么不用 `cmd /C start`
 ///
@@ -1746,9 +2216,15 @@ fn open_external(url: String) -> Result<(), String> {
 /// `ShellExecuteW` 不经过任何命令行解析：目标原样交给外壳去判定用什么程序打开。
 /// 顺带把「引号逃逸注入第二条命令」那一整类风险也消掉了。
 ///
+/// # 升级为什么也走它
+///
+/// 安装程序带「需要管理员权限」的清单，用 `CreateProcess` 直接起会以
+/// `ERROR_ELEVATION_REQUIRED(740)` 失败；交给外壳才会弹出那个
+/// 「是否允许此应用对你的设备进行更改」的系统提示。
+///
 /// 返回值 `HINSTANCE` 在 <= 32 时是错误码（这是 ShellExecute 的历史约定）。
 #[cfg(windows)]
-fn shell_execute_open(target: &str) -> Result<(), String> {
+pub fn shell_execute(target: &str, params: Option<&str>) -> Result<(), String> {
     use windows::core::PCWSTR;
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
@@ -1759,12 +2235,15 @@ fn shell_execute_open(target: &str) -> Result<(), String> {
 
     let verb = wide("open");
     let file = wide(target);
+    // 参数的宽字符串必须活到调用之后
+    let args = params.map(wide);
+    let args_ptr = args.as_ref().map_or(PCWSTR::null(), |a| PCWSTR(a.as_ptr()));
     let ret = unsafe {
         ShellExecuteW(
             None,
             PCWSTR(verb.as_ptr()),
             PCWSTR(file.as_ptr()),
-            None,
+            args_ptr,
             None,
             SW_SHOWNORMAL,
         )
@@ -1778,17 +2257,18 @@ fn shell_execute_open(target: &str) -> Result<(), String> {
 
 /// 非 Windows：交给系统惯例的「打开」命令。
 #[cfg(not(windows))]
-fn shell_execute_open(target: &str) -> Result<(), String> {
+pub fn shell_execute(target: &str, params: Option<&str>) -> Result<(), String> {
     let opener = if cfg!(target_os = "macos") {
         "open"
     } else {
         "xdg-open"
     };
-    std::process::Command::new(opener)
-        .arg(target)
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    let mut cmd = std::process::Command::new(opener);
+    cmd.arg(target);
+    if let Some(p) = params {
+        cmd.arg(p);
+    }
+    cmd.spawn().map(|_| ()).map_err(|e| e.to_string())
 }
 
 /// 把「文件读不出来」翻成老师能照着做的话。
@@ -1942,6 +2422,11 @@ fn main() {
             associations_status,
             register_associations,
             open_default_apps_settings,
+            cache_usage,
+            clear_cache,
+            open_log_dir,
+            check_update,
+            start_update,
             quit_app,
         ])
         .run(tauri::generate_context!())
@@ -2003,11 +2488,7 @@ fn env_logger_init() {
 
     // 日志目录与文件；建不出来就退化成「只有 stderr」，不能因此启动失败
     let file = (|| {
-        let dir = std::env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir)
-            .join("OpenPPTView")
-            .join("logs");
+        let dir = log_dir();
         std::fs::create_dir_all(&dir).ok()?;
         let path = dir.join("openpptview.log");
         // 轮转：上一次的留一份 `.1`，再早的丢弃

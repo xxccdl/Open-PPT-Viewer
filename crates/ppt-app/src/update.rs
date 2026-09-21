@@ -584,4 +584,46 @@ mod tests {
         assert!(got > 100_000, "下到的文件太小，链路可能没走完：{got}");
         assert_eq!(got, last, "进度回调的最后一次应等于文件大小");
     }
+
+    /// 拿**我们自己已发布的版本**走一遍：查最新 → 测速 → 下载 → 按 digest 校验。
+    ///
+    /// 和上一条验的不是同一件事：上一条验「下载链路能通」（所以随便找个公开发布
+    /// 当样本），这条验「我们发出去的那个包真的下得下来、而且和 GitHub 记的
+    /// sha256 对得上」—— 后者才是老师点「立即更新」时会走的路。
+    ///
+    /// 故意**不钉版本号**：钉了就变成每发一版这条测试自己坏掉。
+    ///
+    /// ```text
+    /// cargo test -p ppt-app -- --ignored --nocapture published_release
+    /// ```
+    #[test]
+    #[ignore]
+    fn published_release_is_downloadable() {
+        let release = check_latest()
+            .expect("检查更新失败")
+            .expect("本仓库应当已经发布过版本");
+        println!(
+            "最新版本：{}（{} 字节，{:.1} MB）",
+            release.version,
+            release.asset_size,
+            release.asset_size as f64 / 1048576.0
+        );
+        assert!(release.asset_size > 1_000_000, "安装包不该这么小");
+        assert!(
+            release.sha256.is_some(),
+            "发布里没带 digest，校验就形同虚设"
+        );
+
+        let (best, speed) = fastest_source(&release.asset_url).expect("至少应有一条线路可用");
+        println!("最快线路（{:.1} MB/s）：{best}", speed / 1048576.0);
+
+        let dest = std::env::temp_dir().join("oppv-update-published.exe");
+        download(&best, &dest, &mut |_, _| {}).expect("下载应成功");
+        let got = std::fs::metadata(&dest).unwrap().len();
+        let verdict = verify(&dest, &release);
+        let _ = std::fs::remove_file(&dest);
+        println!("下载完成：{got} 字节");
+        assert_eq!(got, release.asset_size, "下到的字节数应与发布信息一致");
+        verdict.expect("sha256 校验应通过");
+    }
 }

@@ -1120,11 +1120,33 @@ Task 36 让画面来源换成了「整本矢量 PDF」，画得准了，但把�
 
 ### 五、验证
 
-- [x] `cargo test --workspace --exclude ppt-installer` 全绿（ppt-app 14 passed / 1 ignored）
+- [x] `cargo test --workspace --exclude ppt-installer` 全绿（ppt-app 14 passed / 2 ignored）
 - [x] `proxy_round_trip_works`（`--ignored` 真联网）：走 `ghfast.top` 下到
   1764284 字节，大小与进度回调一致 —— 测速、下载、校验三段都真的通了
+- [x] 新增 `published_release_is_downloadable`（`--ignored`）：拿**我们自己已发布的
+  版本**走一遍，查到 0.2.0 → 挑中最快线路 `gh-proxy.com` → 下满 17354472 字节
+  → sha256 与 Release 的 digest 一致。不钉版本号，所以每发一版它都不会自己坏
+- [x] 界面：启动时的静默检查点亮了设置入口的小圆点；设置页开出
+  「发现新版本 0.2.0（约 16.6 MB）」；缓存占用 573.8 MB（画面 556.0 /
+  内置渲染 1.3 / 旧版产物 16.6），点「清理缓存」后归 0
+- [x] 端到端升级（0.1.0 → 0.2.0，真的下载真的装）：
+  `C:\Program Files\OpenPPTView\OpenPPTView.exe` 13109248 → 13873152 字节，
+  安装日志写着「检测到已安装：原地升级到 C:\Program Files\OpenPPTView
+  （操作方式 auto）… 装好了」—— 老师当初的选择没有被抹掉
+- [x] 提权启动不影响出图：以管理员身份跑起来后仍是「画面来源：办公软件出的图
+  （已就绪 39/39 页）」
 - [x] 遮罩覆盖：采样值正好是 0.74 倍关系（`246×0.74=182`、`234×0.74=173`、
   `214×0.74=158`），整窗确实被压暗，幻灯片本来就是米色
+
+**验证中发现并修掉的缺陷（0.2.1）**：静默升级走的是 `run_silent`，它装完就
+退出，**不会把应用拉回来**（只有图形界面勾了「安装后运行」才会）。而更新界面
+明明写着「装好后会自动重新打开」—— 老师点一下更新，应用消失、装完什么都不回来，
+他只会以为坏了。已在 `run_silent` 的成功分支补上 `launch_app`。
+
+> 环境备注：这台机器上操作系统的鼠标/键盘注入被拒（`SendInput` 报
+> `0x80070005`），Computer Use 点不动任何窗口。所以界面验证是借 WebView2 的
+> `--remote-debugging-port` + CDP 的 `Runtime.evaluate` 点按钮完成的 ——
+> 走的仍是页面里那些真实的 handler，不是绕过界面直接调后端。
 
 # Task Dependencies
 

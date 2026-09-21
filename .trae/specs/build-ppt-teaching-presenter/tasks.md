@@ -1214,6 +1214,56 @@ Task 36 让画面来源换成了「整本矢量 PDF」，画得准了，但把�
 - [x] 实测确认过 Explorer 代启动确实降权：由它拉起的实例，普通权限的 `--quit`
   能叫停；而安装程序直接拉起的那个，只有提权的 `--quit` 能叫停
 
+### 五、复审跟进（0.2.3）
+
+复审提了两条。逐条核过：一条成立，一条不成立 —— 但那条里另有一处真隐患。
+
+**① `registered` / `registered_exe` 只看 HKCU —— 成立，已修**
+
+按机器装的时候，ProgID 是安装程序写在 **HKLM** 的；HKCU 那几条要等老师
+点过「注册到本应用」，或者应用自愈时才会有。于是「装好了、还没点过那个按钮」
+的机器上 `registered` 读出来是 false、`registered_exe` 直接返回 `None`，
+`points_here` 也就永远是 false —— 界面说「尚未注册」，而右键「打开方式」里
+明明已经有我们了。
+
+改法：两处都按 HKCR 的解析顺序查两档（**HKCU 优先，没有才看 HKLM**）。
+顺序不能反：按用户装过的那份留在 HKCU 的旧命令，正是「双击起来的是老版本」
+的成因，让 HKLM 里新的先说话就把它盖过去了。
+
+**② 「explorer 代启动参数顺序错了」—— 不成立，但顺手补了引号**
+
+复审认为 `ShellExecuteW(None, "open", "explorer.exe", <exe 路径>, …)`
+是把参数搞反了，应该直接启动 exe。实测两次都说明它能用：
+
+- `explorer.exe 'C:\Program Files\OpenPPTView\OpenPPTView.exe'`（PowerShell 会
+  把它作为一个参数传）→ 应用起来了，而且**普通权限的 `--quit` 能叫停它**，
+  说明它确实没提权；
+- 更极端的一次：把路径**拆成两个参数**
+  （`explorer.exe 'C:\Program' 'Files\OpenPPTView\OpenPPTView.exe'`）也没问题 ——
+  资源管理器会把剩下的参数拼回一个路径。
+
+所以「文件给 explorer、路径当参数」是刻意的降权手段，不是笔误；
+按复审给的写法（直接启动 exe）恰好是改回修复前的行为，会把
+「装完那份带管理员权限」原样带回来。
+
+不过它指的方向里有一处**真隐患**：`lpParameters` 是一整条命令行、
+不是已经分好词的参数表，而安装路径默认就带空格（`C:\Program Files\…`），
+不加引号是在依赖资源管理器的宽容拼接。已改成 `explorer.exe "<路径>"`。
+
+- [x] ① 定向验证：删掉 `HKCU\Software\Classes\OpenPPTView.pptx`（只留 HKLM 里
+  安装程序写的那条），重启应用后 `associations_status` 如实报
+  `{"ext":"pptx","registered":true,"pointsHere":true,"isDefault":true}`
+  —— `pointsHere` 为真本身就证明 `registered_exe` 确实回落到 HKLM 读到了命令。
+  同一状态下日志里**没有**「已按当前版本重新登记」，HKCU 那条也没被写回来
+- [x] ② 定向验证：拆参数喂 explorer 也能拉起应用（见上）；改成带引号后
+  重新装了一遍，安装日志里没有「请资源管理器代启动没成功」的兜底警告，
+  拉起来的实例仍是普通权限（普通权限的 `--quit` 能叫停它）
+
+> 附带说明（不改）：复审没提，但 `status()` 里读 `Classes\.{ext}` 默认值那处
+> 仍只看 HKCU。这是**刻意**的 —— 那一层的默认值由我们自己的
+> `register_all` 写在 HKCU，HKCU 缺失时真实默认程序本来也不是我们，
+> 报「尚未注册」是对的。
+
 # Task Dependencies
 
 - Task 2 依赖 Task 1

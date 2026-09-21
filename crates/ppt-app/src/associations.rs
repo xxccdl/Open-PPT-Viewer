@@ -248,18 +248,48 @@ fn command_exe(cmd: &str) -> Option<String> {
     }
 }
 
-/// 某个 ProgID 的打开命令里写的是哪个 exe。
+/// 我们的 ProgID 登记过没有（HKCU 与 HKLM 都算）。
+///
+/// 两档都要看：安装程序在 `Program Files` 下装的时候写的是 **HKLM**，
+/// 而只在老师点过「注册到本应用」之后 HKCU 才会有。只看 HKCU 会把
+/// 「按机器装好、还没点过那个按钮」的机器误判成「尚未注册」——
+/// 明明右键「打开方式」里已经有我们了。
 #[cfg(windows)]
-fn registered_exe(pid: &str) -> Option<PathBuf> {
-    use winreg::enums::HKEY_CURRENT_USER;
+fn prog_id_registered(pid: &str) -> bool {
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
     use winreg::RegKey;
 
-    let cmd: String = RegKey::predef(HKEY_CURRENT_USER)
-        .open_subkey(format!("Software\\Classes\\{pid}\\shell\\open\\command"))
-        .ok()?
-        .get_value("")
-        .ok()?;
-    command_exe(&cmd).map(PathBuf::from)
+    let rel = format!("Software\\Classes\\{pid}");
+    [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE]
+        .iter()
+        .any(|root| RegKey::predef(*root).open_subkey(&rel).is_ok())
+}
+
+/// 某个 ProgID 的打开命令里写的是哪个 exe。
+///
+/// 两档都查，顺序与 HKCR 一致：**HKCU 优先，没有才看 HKLM**。
+/// 这个顺序不能反：按用户装过的那份留在 HKCU 的旧命令，正是
+/// 「双击课件起来的是老版本」的成因（见模块开头那段），
+/// 让 HKLM 里那条新的先说话就把它盖过去了。
+#[cfg(windows)]
+fn registered_exe(pid: &str) -> Option<PathBuf> {
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+    use winreg::RegKey;
+
+    let rel = format!("Software\\Classes\\{pid}\\shell\\open\\command");
+    for root in [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE] {
+        let Some(cmd) = RegKey::predef(root)
+            .open_subkey(&rel)
+            .ok()
+            .and_then(|k| k.get_value::<String, _>("").ok())
+        else {
+            continue;
+        };
+        if let Some(path) = command_exe(&cmd) {
+            return Some(PathBuf::from(path));
+        }
+    }
+    None
 }
 
 /// 这条命令指着的是不是当前这一份程序。
@@ -293,9 +323,8 @@ pub fn status() -> Vec<AssocStatus> {
         .map(|spec| {
             let pid = prog_id(spec.ext);
 
-            let registered = hkcu
-                .open_subkey(format!("Software\\Classes\\{pid}"))
-                .is_ok();
+            // HKCU 与 HKLM 都算（安装程序按机器装时写的是 HKLM）
+            let registered = prog_id_registered(&pid);
 
             // 键在 ≠ 能叫起我们来：命令可能指着另一个副本（见模块开头那段）
             let points_here = registered

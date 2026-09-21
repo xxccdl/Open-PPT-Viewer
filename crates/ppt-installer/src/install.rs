@@ -850,14 +850,20 @@ pub fn launch_app(dir: &Path) {
     let file = wide(exe.as_os_str());
     let verb = wide_str("open");
 
-    // ① 请资源管理器代启动
+    // ① 请资源管理器代启动：`explorer.exe "<要打开的东西>"`
+    //
+    // 路径必须**带引号**。`lpParameters` 是一整条命令行，不是已经分好词的
+    // 参数表，而安装路径默认就带空格（`C:\Program Files\…`）。
+    // 实测资源管理器会把剩下的参数拼回一个路径，所以不加引号也能跑 ——
+    // 但那是它的宽容，不是约定，不该依赖。
     let explorer = wide_str("explorer.exe");
+    let quoted = wide_str(&format!("\"{}\"", exe.display()));
     let delegated = unsafe {
         ShellExecuteW(
             None,
             PCWSTR(verb.as_ptr()),
             PCWSTR(explorer.as_ptr()),
-            PCWSTR(file.as_ptr()),
+            PCWSTR(quoted.as_ptr()),
             None,
             SW_SHOWNORMAL,
         )

@@ -1264,6 +1264,17 @@ body.presenting #ink-layer.cursor-hidden:not(.show-cursor) {
   opacity: 0;
   transition: transform 260ms var(--ease), opacity 200ms var(--ease);
   pointer-events: none;
+  /* 手指要能把它拖走（见 app.js 的 `bindPresentBarDrag`）。
+   *
+   * 这一条不能省。`touch-action` 不是继承属性，但它和祖先链上的值**取交集**：
+   * 这条胶囊不在 #stage 里（它在 body 下、`position: fixed`），所以拿到的是
+   * body 的 `manipulation` —— 那一条允许浏览器接管平移手势。于是手指一按一拖，
+   * 浏览器认定「这人在滚页面」，立刻发 `pointercancel` 把我们的拖动掐断：
+   * 实测只走到第 2 个 `pointermove`（挪了 24px）就断了，而且收不到 `pointerup`。
+   * 鼠标没有「被浏览器接管」这回事，所以这个毛病只在触摸屏上出现。
+   *
+   * `none` 与 #stage、#ink-layer 的取值一致：放映时手势归脚本。 */
+  touch-action: none;
 }
 
 #present-bar.on {

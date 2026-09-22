@@ -1264,6 +1264,46 @@ Task 36 让画面来源换成了「整本矢量 PDF」，画得准了，但把�
 > `register_all` 写在 HKCU，HKCU 缺失时真实默认程序本来也不是我们，
 > 报「尚未注册」是对的。
 
+## Task 45: 触摸屏拖不动悬浮球 —— 已交付
+
+### 一、现象与根因
+
+放映时收起的那条胶囊（「悬浮球」）按住就能拖（见 `bindPresentBarDrag`）——
+鼠标可以，**触摸屏上不行**：手指一按一拖，它只挪十几像素就停住。
+
+- 根因是 `touch-action` 的**生效值**。它本身不是继承属性，但按规范会与
+  祖先链上的取值**取交集**；而这条胶囊不在 `#stage` 里（它在 body 下、
+  `position: fixed`），于是拿到的是 `body` 的 `manipulation` ——
+  那一条允许浏览器接管平移手势。
+- 手指拖动时浏览器认定「这人在滚页面」，立刻发 `pointercancel` 掐断指针序列：
+  我们的拖动只走到第 2 个 `pointermove`，而且**收不到 `pointerup`**。
+  鼠标不存在「被浏览器接管」这回事，所以这个毛病只在触摸屏上出现。
+- 实测（CDP 往页面注入真实触摸事件；这台开发机没有触摸屏，但注入走的是
+  浏览器同一条输入管线，手势识别与 `pointercancel` 都会真的发生）：
+  `down 1, move 2, cancel 1, up 0`，横向只挪了 24px。
+
+### 二、修法
+
+- [x] `#present-bar` 加 `touch-action: none`（与 `#stage`、`#ink-layer` 取值一致：
+  放映时手势归脚本）。光在元素自己身上写不够 —— 关键是这条属性与 `body`
+  那条取交集之后的结果。
+
+### 三、验证
+
+| 场景 | touch-action（生效） | pointer 事件 | 位移 | 结论 |
+| --- | --- | --- | --- | --- |
+| 修复前 | `auto`（∩ body 的 manipulation） | down 1, move 2, **cancel 1**, up 0 | 24px | 被浏览器掐断 |
+| 临时注入 none | `none` | down 1, move 8, cancel 0, up 1 | 127px | 拖得动 |
+| 0.2.4 安装包（触摸） | `none` | down 1, move 8, cancel 0, up 1 | 126px | 拖得动 |
+| 0.2.4 安装包（鼠标） | `none` | down 1, move 8, cancel 0, up 1 | 96px | 拖得动（无回归） |
+
+> 方法备注：这台机器上 Computer Use 的鼠标/键盘注入被系统拒绝，而机器本身
+> 没有触摸屏，所以触摸是用 WebView2 的 `--remote-debugging-port` +
+> CDP 的 `Emulation.setTouchEmulationEnabled` + `Input.dispatchTouchEvent`
+> 注入的；界面状态用 `Runtime.evaluate` 读（`presentBar` 的 rect、
+> 挂在胶囊上的 pointer 事件计数）。鼠标那一轮不能开触摸模拟，
+> 否则注入的鼠标会被当成手指。
+
 # Task Dependencies
 
 - Task 2 依赖 Task 1

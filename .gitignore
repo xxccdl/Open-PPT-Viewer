@@ -15,6 +15,10 @@
 # 调试用的临时目录
 /.tmp-deck/
 
+# 老师自己的标注与板书（课件的旁挂文件，形如 `课件.pptx.oppv-annot.json`）：
+# 属于使用者数据，不该跟着源码走
+*.oppv-annot.json
+
 # 编辑器与系统
 .vscode/
 .idea/

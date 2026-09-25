@@ -3136,7 +3136,7 @@ checksum = "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391"
 
 [[package]]
 name = "ppt-app"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "log",
  "ppt-convert",
@@ -3160,7 +3160,7 @@ dependencies = [
 
 [[package]]
 name = "ppt-convert"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "image",
  "log",
@@ -3170,7 +3170,7 @@ dependencies = [
 
 [[package]]
 name = "ppt-core"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "log",
  "memmap2",
@@ -3184,7 +3184,7 @@ dependencies = [
 
 [[package]]
 name = "ppt-format-pdf"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "hayro",
  "log",
@@ -3194,7 +3194,7 @@ dependencies = [
 
 [[package]]
 name = "ppt-format-pptx"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "log",
  "ppt-core",
@@ -3206,7 +3206,7 @@ dependencies = [
 
 [[package]]
 name = "ppt-installer"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "log",
  "ppt-core",
@@ -3218,7 +3218,7 @@ dependencies = [
 
 [[package]]
 name = "ppt-installer-ui"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "log",
  "ppt-core",
@@ -3229,7 +3229,7 @@ dependencies = [
 
 [[package]]
 name = "ppt-pipeline"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "log",
  "lru",
@@ -3244,7 +3244,7 @@ dependencies = [
 
 [[package]]
 name = "ppt-render"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "image",
  "log",
@@ -3260,7 +3260,7 @@ dependencies = [
 
 [[package]]
 name = "ppt-text"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "fontdb",
  "log",

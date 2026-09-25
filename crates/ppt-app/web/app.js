@@ -117,6 +117,7 @@ const el = {
   stage: $('stage'),
   slide: $('slide-layer'),
   mediaLayer: $('media-layer'),
+  board: $('board'),
   ink: $('ink-layer'),
   laser: $('laser'),
   thumbs: $('thumbs'),
@@ -129,7 +130,6 @@ const el = {
   toast: $('toast'),
   spinner: $('spinner'),
   prepare: $('prepare'),
-  overlay: $('overlay'),
   spotlight: $('spotlight'),
   timer: $('timer'),
   fileName: $('file-name'),
@@ -214,7 +214,9 @@ function layoutCanvases() {
   const cssW = state.info.widthPt * state.scale;
   const cssH = state.info.heightPt * state.scale;
 
-  for (const c of [el.slide, el.mediaLayer, el.ink]) {
+  // 黑板也在这一组里：它必须和标注层**完全重合**，
+  // 否则会出现「看得见的板子」和「写得上去的范围」对不上
+  for (const c of [el.slide, el.mediaLayer, el.board, el.ink]) {
     c.style.width = `${cssW}px`;
     c.style.height = `${cssH}px`;
     // 居中 + 平移全部交给同一个 transform（见 style.css）。
@@ -587,6 +589,39 @@ let activeStroke = null;
 /** 上一次绘制到的点索引（用于增量绘制）。 */
 let drawnUpTo = 0;
 
+/** 是否在黑板上。 */
+let boardOn = false;
+/** 黑板上翻到第几页（0 开始）。 */
+let boardPage = 0;
+/** 上板前的笔色（深色会看不清，下板要还回去）。 */
+let penColorBeforeBoard = '';
+
+/** 黑板最多几页。不封顶的话，按住「下一页」就会一直长下去。 */
+const BOARD_MAX_PAGES = 20;
+
+/**
+ * 黑板的笔迹记在哪一格。
+ *
+ * 标注是按「页」存的（`state.annotations[页码]`）。黑板不是课件的哪一页，
+ * 于是给它一串**字符串格子**（`board1`、`board2`…，板书也是多页的）：
+ * 撤销、清空、橡皮、重绘全都照旧按 `inkKey()` 取，不必给黑板另写一套
+ * 笔迹逻辑；保存课件时和其它标注一起落盘（见 `saveAnnotations`），
+ * 所以板书是**跟着课件走**的 —— 换个班上课打开同一份课件，板书还在。
+ */
+function boardSlot(n) {
+  return `board${n + 1}`;
+}
+
+/** 这个键是不是黑板的格子。 */
+function isBoardSlot(key) {
+  return /^board\d+$/.test(key);
+}
+
+/** 当前笔迹写在哪一格：平时是页码，上板时是板书的那一页。 */
+function inkKey() {
+  return boardOn ? boardSlot(boardPage) : state.page;
+}
+
 function strokesFor(page) {
   if (!state.annotations[page]) state.annotations[page] = [];
   return state.annotations[page];
@@ -596,7 +631,7 @@ function strokesFor(page) {
 function redrawInk() {
   inkCtx.setTransform(1, 0, 0, 1, 0, 0);
   inkCtx.clearRect(0, 0, el.ink.width, el.ink.height);
-  const list = strokesFor(state.page);
+  const list = strokesFor(inkKey());
   for (const s of list) drawStroke(inkCtx, s, 0);
   if (activeStroke) drawStroke(inkCtx, activeStroke, 0);
   drawnUpTo = activeStroke ? activeStroke.points.length : 0;
@@ -1262,16 +1297,17 @@ function finishStroke() {
   activeStroke = null;
   if (!stroke || stroke.isEmpty) return;
 
-  const list = strokesFor(state.page);
+  const list = strokesFor(inkKey());
   list.push(stroke);
 
   // 新操作使重做栈失效
-  const h = historyFor(state.page);
+  const h = historyFor(inkKey());
   h.redo.length = 0;
   h.undo.push(stroke);
 
   redrawInk();
   updateToolButtons();
+  scheduleAutoSave();
 }
 
 /* ---------------- 橡皮 ---------------- */
@@ -1279,7 +1315,7 @@ function finishStroke() {
 /** 逐笔擦除：删除命中点的笔画。 */
 function eraseAt(clientX, clientY) {
   const [px, py] = screenToPt(clientX, clientY);
-  const list = strokesFor(state.page);
+  const list = strokesFor(inkKey());
   // 手指比鼠标「粗」，判定半径放大，否则触屏上要擦好几次才中
   const threshold = Math.max(8, state.width * 4);
 
@@ -1287,9 +1323,10 @@ function eraseAt(clientX, clientY) {
     const hit = list[i];
     if (strokeHit(hit, px, py, threshold)) {
       list.splice(i, 1);
-      const h = historyFor(state.page);
+      const h = historyFor(inkKey());
       h.undo = h.undo.filter((s) => s !== hit);
       redrawInk();
+      scheduleAutoSave();
       return;
     }
   }
@@ -2044,6 +2081,41 @@ function drawLayer(l, s, p, k) {
 }
 
 /**
+ * 下板（回到课件）。
+ *
+ * 用在「明确要跳到课件的某一页」的入口上（缩略图、输页码、Home/End）：
+ * 老师说的是「去第 5 页」，那就该看见课件的第 5 页，而不是板书。
+ * 平时按翻页键**不会**走这里 —— 那是翻板书自己的页，见 `boardFlip`。
+ */
+function leaveBoard() {
+  if (boardOn) setBoard(false);
+}
+
+/**
+ * 在黑板上翻页：翻的是**板书自己**的页。
+ *
+ * 板书是多页的，翻到最后再按就新开一页 —— 相当于随手翻的草稿本。
+ * 这里**不**顺手退出黑板：老师连着按翻页，意思显然是「再给我一页写」，
+ * 不是「放我回课件」；要下板按黑板按钮或 Esc。
+ *
+ * 越界的两头都不动：第一页再往前没有东西，最后一页再往后受
+ * `BOARD_MAX_PAGES` 限制（不封顶的话按住不放能翻出上百页空板）。
+ */
+function boardFlip(step) {
+  const next = boardPage + step;
+  if (next < 0) return;
+  if (next >= BOARD_MAX_PAGES) {
+    toast(`板书最多 ${BOARD_MAX_PAGES} 页`);
+    return;
+  }
+  boardPage = next;
+  redrawInk();
+  updateToolButtons();
+  updateNavUi();
+  if (state.presenting) showPresentBar();
+}
+
+/**
  * 前进：先把本页作者设的动画播完，播完才翻页。
  *
  * 这就是「一页按作者设定的顺序逐条弹出」的落点 ——
@@ -2054,6 +2126,8 @@ function drawLayer(l, s, p, k) {
  */
 function goForward() {
   cancelAutoAdvance();
+  // 在黑板上「下一页」= 翻板书（不退出黑板）
+  if (boardOn) return boardFlip(1);
   if (state.presenting) {
     const next = nextClickStep();
     if (next) {
@@ -2068,6 +2142,7 @@ function goForward() {
 function goBack() {
   cancelAutoAdvance();
   clearTimeout(animTimer);
+  if (boardOn) return boardFlip(-1);
   if (state.presenting && state.played.length > 0) {
     state.played.pop();
     updateStepBadge();
@@ -2116,6 +2191,7 @@ function cancelAutoAdvance() {
 
 function goTo(page) {
   if (!state.info) return;
+  leaveBoard();
   const p = clamp(page, 0, state.info.pageCount - 1);
   if (p === state.page && state.hasContent) return;
   // 跳页（缩略图、输页码、Home/End）按「这一页讲完了」的样子显示
@@ -2145,7 +2221,11 @@ function updateNavUi() {
   const total = state.info.pageCount;
   el.pageInput.value = String(state.page + 1);
   el.pageTotal.textContent = `/ ${total}`;
-  el.presentPage.textContent = `${state.page + 1} / ${total}`;
+  // 在黑板上时这块牌子说的是「板书写到第几页」：按翻页键牌子却纹丝不动的话，
+  // 老师会以为没反应（课件页码那时候根本不是他关心的事）
+  el.presentPage.textContent = boardOn
+    ? `板书 ${boardPage + 1}`
+    : `${state.page + 1} / ${total}`;
 
   const atFirst = state.page === 0;
   const atLast = state.page >= total - 1;
@@ -2415,6 +2495,16 @@ async function openPath(path) {
     );
   }
   try {
+    // 换课件之前，先把上一份的标注/板书落盘。
+    //
+    // 自动保存是去抖的（停笔 3 秒才写），而老师完全可能写完最后一笔就
+    // 直接点开下一份课件 —— 不补这一下，那几笔就没了。
+    // 此刻后端手上还是**旧**那份课件，所以这次保存写在它自己旁边。
+    if (state.info && hasUnsavedAnnotations()) {
+      await saveAnnotations({ quiet: true });
+    }
+    clearTimeout(autoSaveTimer);
+
     // 出图档位按屏幕定，所以要在打开之前算出来一起传下去
     const viewportWidth = rasterWidthHint();
     const info = await invoke('open_document', { path, viewportWidth });
@@ -2422,6 +2512,10 @@ async function openPath(path) {
     state.page = 0;
     state.zoom = 1;
     state.hasContent = false;
+    // 换课件先把黑板收掉：不然新课件一打开就顶着一块空板子。
+    // 板书页码也归零 —— 新课件该从板书第一页开始
+    setBoard(false);
+    boardPage = 0;
     state.annotations = {};
     state.history = {};
 
@@ -2545,8 +2639,10 @@ async function loadAnnotations() {
     if (!raw) return;
     const data = JSON.parse(raw);
     const map = {};
-    for (const [page, strokes] of Object.entries(data.pages || {})) {
-      map[Number(page)] = strokes.map(deserializeStroke);
+    for (const [key, strokes] of Object.entries(data.pages || {})) {
+      // 页码是数字键；板书是 `board1`/`board2`…，键名原样留着 ——
+      // 「第几页板书」就是键名里的那个数（见 `boardSlot`）
+      map[isBoardSlot(key) ? key : Number(key)] = strokes.map(deserializeStroke);
     }
     state.annotations = map;
     redrawInk();
@@ -2567,6 +2663,8 @@ async function saveAnnotations(opts) {
   const pages = {};
   for (const [page, strokes] of Object.entries(state.annotations)) {
     if (strokes.length > 0) {
+      // 页码是数字键，板书是 `board1`/`board2`… 这样的字符串键，一起存 ——
+      // 板书跟着课件走：换个班上课打开同一份课件，板书还在
       pages[page] = strokes.map(serializeStroke);
     }
   }
@@ -2605,7 +2703,27 @@ function deserializeStroke(o) {
 }
 
 function hasUnsavedAnnotations() {
+  // 板书也算：它和标注存在同一份旁挂文件里
   return Object.values(state.annotations).some((list) => list.length > 0);
+}
+
+/** 自动保存的去抖时长：停笔这么久之后落盘。 */
+const AUTO_SAVE_DELAY_MS = 3000;
+let autoSaveTimer = 0;
+
+/**
+ * 改完标注 / 板书，停笔 3 秒自动落盘。
+ *
+ * 老师在上课，不能指望他记得按 Ctrl+S（板书更是随手写的）。
+ * 这里做去抖：连着写十几笔只会存一次。
+ *
+ * 存的时候必须 `quiet` —— 自动保存弹一句「标注已保存」会打断讲课，
+ * 而且每三秒弹一次能把人烦死。
+ */
+function scheduleAutoSave() {
+  if (!state.info) return;
+  clearTimeout(autoSaveTimer);
+  autoSaveTimer = setTimeout(() => saveAnnotations({ quiet: true }), AUTO_SAVE_DELAY_MS);
 }
 
 /* ---------------- 撤销 / 重做 ---------------- */
@@ -2616,28 +2734,32 @@ function historyFor(page) {
 }
 
 function undo() {
-  const h = historyFor(state.page);
-  const list = strokesFor(state.page);
+  const h = historyFor(inkKey());
+  const list = strokesFor(inkKey());
   if (list.length === 0) return;
   const s = list.pop();
   h.redo.push(s);
   redrawInk();
+  scheduleAutoSave();
 }
 
 function redo() {
-  const h = historyFor(state.page);
-  const list = strokesFor(state.page);
+  const h = historyFor(inkKey());
+  const list = strokesFor(inkKey());
   if (h.redo.length === 0) return;
   list.push(h.redo.pop());
   redrawInk();
+  scheduleAutoSave();
 }
 
 function clearPage() {
-  const list = strokesFor(state.page);
+  const key = inkKey();
+  const list = strokesFor(key);
   if (list.length === 0) return;
   list.length = 0;
-  state.history[state.page] = { undo: [], redo: [] };
+  state.history[key] = { undo: [], redo: [] };
   redrawInk();
+  scheduleAutoSave();
 }
 
 /* ---------------- 放映模式（对标 WPS 放映） ---------------- */
@@ -2763,7 +2885,7 @@ async function presentOnceInner(on) {
     state.tool = 'pen';
 
     // 清掉放映态的临时视觉
-    setBlack(false);
+    setBoard(false);
     setSpotlight(false);
     hideLinkHint();
     // 光标状态复位（空闲计时器要清掉，否则会在窗口模式下把光标藏起来）
@@ -3195,10 +3317,66 @@ function onLongPressEnd() {
   clearTimeout(longPressTimer);
 }
 
-function setBlack(on) {
-  el.overlay.classList.toggle('black', on);
-  el.overlay.classList.toggle('white', false);
+/**
+ * 上板 / 下板。
+ *
+ * # 为什么不是「黑屏」
+ *
+ * 原来这个位置是「黑屏」—— 把屏幕压黑，讲课中间想临时板书只能干看着一块黑。
+ * 黑板把这块屏变成**能写**的：点一下就能讲例题、画图、随手记一笔，
+ * 再点一下回到课件。
+ *
+ * # 板书会自己存下来
+ *
+ * 板上的字记在 `state.annotations` 的板书格里（`board1`、`board2`…，见
+ * `inkKey`），撤销 / 清空 / 橡皮照常可用；写完 3 秒自动落盘到课件旁的
+ * 旁挂文件里（见 `scheduleAutoSave`）—— 老师不用记得按保存，
+ * 换个班上课打开同一份课件，板书还在。
+ *
+ * # 上板顺手换个能看清的笔色
+ *
+ * 面板是深墨绿，老师要是正拿着黑色笔（调色板里第 7 个），上去就是「写了个寂寞」。
+ * 所以上板时把暗色悄悄换成白粉笔色，下板再还回去 —— 他自己选的色不该被永久改掉。
+ */
+function setBoard(on) {
+  if (boardOn === on) return;
+  // 没打开课件时不认这一下：黑板的尺寸来自课件（见 `layoutCanvases`），
+  // 这时候开出来的会是一块 0×0 的板子 —— 按了没反应比没有这个按钮更糟
+  if (on && !state.info) return;
+  boardOn = on;
+
+  el.board.classList.toggle('on', on);
+  el.stage.classList.toggle('board-on', on);
+
+  if (on) {
+    penColorBeforeBoard = state.color;
+    if (relativeLuminance(state.color) < 0.45) state.color = '#ffffff';
+    // 上板就是要写字：手里还握着「鼠标（翻页）」的话先换成笔
+    if (state.tool === 'pointer') state.tool = 'pen';
+  } else {
+    if (penColorBeforeBoard) state.color = penColorBeforeBoard;
+    penColorBeforeBoard = '';
+    // 下板**不**清板书：它会跟着课件存下来（见 `scheduleAutoSave`），
+    // 再上板接着写。要擦用「清空」，要翻页用翻页键。
+    // 这里也不主动存一次 —— 笔一停本来就存过了，不必多写一次文件。
+  }
+
+  redrawInk();
   updateToolButtons();
+  // 页码牌要跟着换说法（上板显示「板书 1」，下板回到课件页码）
+  updateNavUi();
+  if (state.presenting) showPresentBar();
+}
+
+/** 颜色相对亮度（0 = 黑，1 = 白）。用来判断笔色在深色板子上看不看得清。 */
+function relativeLuminance(hex) {
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex || '');
+  if (!m) return 1;
+  const n = parseInt(m[1], 16);
+  const r = (n >> 16) & 255;
+  const g = (n >> 8) & 255;
+  const b = n & 255;
+  return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
 }
 
 function setSpotlight(on) {
@@ -3301,15 +3479,14 @@ function updateToolButtons() {
   $('p-highlighter').classList.toggle('on', state.tool === 'highlighter');
   $('p-eraser').classList.toggle('on', state.tool === 'eraser');
   $('p-laser').classList.toggle('on', laserActive);
-  $('p-undo').disabled = strokesFor(state.page).length === 0;
-  $('p-clear').disabled = strokesFor(state.page).length === 0;
+  $('p-undo').disabled = strokesFor(inkKey()).length === 0;
+  $('p-clear').disabled = strokesFor(inkKey()).length === 0;
 
-  const blackOn = el.overlay.classList.contains('black');
   const spotOn = el.spotlight.classList.contains('on');
 
-  $('p-black').classList.toggle('on', blackOn);
+  $('p-board').classList.toggle('on', boardOn);
+  $('t-board').classList.toggle('on', boardOn);
   $('p-spot').classList.toggle('on', spotOn);
-  $('t-black').classList.toggle('on', blackOn);
   $('t-spot').classList.toggle('on', spotOn);
 
   // 所有颜色按钮（两处）的状态
@@ -3320,8 +3497,8 @@ function updateToolButtons() {
     b.classList.toggle('on', Number(b.dataset.width) === state.width);
   }
 
-  $('t-undo').disabled = strokesFor(state.page).length === 0;
-  $('t-redo').disabled = historyFor(state.page).redo.length === 0;
+  $('t-undo').disabled = strokesFor(inkKey()).length === 0;
+  $('t-redo').disabled = historyFor(inkKey()).redo.length === 0;
 
   el.ink.classList.toggle('pan-mode', state.tool === 'eraser');
   // 用画笔时显示十字光标（放映模式下平时是隐藏的）
@@ -3336,23 +3513,81 @@ function updateToolButtons() {
 
 /* ---------------- 快捷键 ---------------- */
 
+/**
+ * 按钮笔（翻页器）认哪些键。
+ *
+ * 这类笔在系统看来就是个键盘，而**不同牌子发的键不一样**，老师也不会去配。
+ * 下一页常见是 `PageDown` / `→` / `空格` / `回车`，「播放」键有的发 `回车`、
+ * 有的干脆发媒体键；上一页是 `PageUp` / `←`。这里**全都收下** ——
+ * 让老师插上就能用，比让他回去翻说明书重要得多。
+ */
+const NEXT_KEYS = [
+  'PageDown',
+  'ArrowRight',
+  'ArrowDown',
+  ' ',
+  'Enter',
+  'MediaTrackNext',
+  'MediaPlayPause',
+];
+const PREV_KEYS = ['PageUp', 'ArrowLeft', 'ArrowUp', 'MediaTrackPrevious'];
+
+/**
+ * 两次翻页之间的最小间隔（毫秒）。
+ *
+ * 便宜的笔按住不放时会连发几十个 keydown，不拦一下就一路翻到底；
+ * 老师有意快速点几下大约在 150ms 以上，所以这个值只拦「连发」。
+ */
+const NAV_REPEAT_MS = 130;
+let lastNavAt = 0;
+
+/** 这个键是不是翻页键（按钮笔/键盘都算）。 */
+function isNavKey(key) {
+  return NEXT_KEYS.includes(key) || PREV_KEYS.includes(key);
+}
+
+/**
+ * 按翻页键前进/后退。返回是否处理了这个键。
+ *
+ * （黑板由 `goForward/goBack` 里的 `leaveBoard` 负责收掉 ——
+ * 那条路同时也被工具条按钮、点击、滑动用着。）
+ */
+function navFromKey(key) {
+  const next = NEXT_KEYS.includes(key);
+  if (!next && !PREV_KEYS.includes(key)) return false;
+
+  const now = performance.now();
+  if (now - lastNavAt < NAV_REPEAT_MS) return true;
+  lastNavAt = now;
+
+  if (next) goForward();
+  else goBack();
+  return true;
+}
+
 function onKeyDown(e) {
   const inInput = e.target instanceof HTMLInputElement;
 
-  // 输入页码时只处理回车与 Esc
   if (inInput) {
+    // 页码框里回车 = 跳到那一页（这时不能当成「下一页」）
     if (e.key === 'Enter') {
       const n = parseInt(el.pageInput.value, 10);
       if (!Number.isNaN(n)) goTo(n - 1);
       el.pageInput.blur();
-    } else if (e.key === 'Escape') {
+      return;
+    }
+    if (e.key === 'Escape') {
       // 输入框里按 Esc 本来只是失焦。但放映时这一下也该能结束放映 ——
       // 触屏老师按 Esc 的意思就是「出去」，而这时候工具条可能正被收起，
       // Esc 往往是唯一的出口（曾经的 bug：只失焦、不退出）。
       el.pageInput.blur();
       if (state.presenting) setPresenting(false);
+      return;
     }
-    return;
+    // 别的键里，翻页键要**放行**：老师可能点过页码框、焦点还留在那儿，
+    // 这时候按按钮笔什么都不发生，他会以为笔坏了。
+    if (!isNavKey(e.key)) return;
+    el.pageInput.blur();
   }
 
   const ctrl = e.ctrlKey || e.metaKey;
@@ -3398,20 +3633,13 @@ function onKeyDown(e) {
     }
   }
 
+  // 翻页（按钮笔 + 键盘）统一走这里，见 `navFromKey`
+  if (navFromKey(e.key)) {
+    e.preventDefault();
+    return;
+  }
+
   switch (e.key) {
-    case ' ':
-    case 'PageDown':
-    case 'ArrowRight':
-    case 'ArrowDown':
-      e.preventDefault();
-      goForward();
-      break;
-    case 'PageUp':
-    case 'ArrowLeft':
-    case 'ArrowUp':
-      e.preventDefault();
-      goBack();
-      break;
     case 'Home':
       e.preventDefault();
       goTo(0);
@@ -3431,8 +3659,8 @@ function onKeyDown(e) {
       // 设置排在**最前**：它盖在所有东西上面，Esc 该先关它。
       if (!el.settings.classList.contains('hidden')) {
         closeSettings();
-      } else if (el.overlay.classList.contains('black') || el.overlay.classList.contains('white')) {
-        setBlack(false);
+      } else if (boardOn) {
+        setBoard(false);
       } else if (el.spotlight.classList.contains('on')) {
         setSpotlight(false);
       } else if (laserActive) {
@@ -3449,7 +3677,9 @@ function onKeyDown(e) {
       break;
     case 'b':
     case 'B':
-      setBlack(!el.overlay.classList.contains('black'));
+      // 按钮笔上那颗「黑屏」键大多就发 B：给它一块**能写**的黑板，
+      // 比让屏幕单纯变黑有用得多
+      setBoard(!boardOn);
       afterShortcut();
       break;
     case 's':
@@ -3743,8 +3973,8 @@ function bindPresentUi() {
     updateToolButtons();
   });
 
-  $('p-black').addEventListener('click', () => {
-    setBlack(!el.overlay.classList.contains('black'));
+  $('p-board').addEventListener('click', () => {
+    setBoard(!boardOn);
   });
   $('p-spot').addEventListener('click', () => {
     setSpotlight(!el.spotlight.classList.contains('on'));
@@ -3781,8 +4011,8 @@ function bindPresentUi() {
       case 'clear':
         clearPage();
         break;
-      case 'black':
-        setBlack(!el.overlay.classList.contains('black'));
+      case 'board':
+        setBoard(!boardOn);
         break;
       case 'laser':
         laserActive = !laserActive;
@@ -4003,7 +4233,7 @@ function bindUi() {
   $('t-undo').addEventListener('click', undo);
   $('t-redo').addEventListener('click', redo);
   $('t-clear').addEventListener('click', clearPage);
-  $('t-black').addEventListener('click', () => setBlack(!el.overlay.classList.contains('black')));
+  $('t-board').addEventListener('click', () => setBoard(!boardOn));
   $('t-spot').addEventListener('click', () => setSpotlight(!el.spotlight.classList.contains('on')));
 
   el.pageInput.addEventListener('focus', () => el.pageInput.select());

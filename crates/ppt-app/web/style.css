@@ -171,7 +171,8 @@ svg {
  * `getBoundingClientRect()`，它已经把变换算进去了。 */
 #slide-layer,
 #media-layer,
-#ink-layer {
+#ink-layer,
+#board {
   position: absolute;
   top: 50%;
   left: 50%;
@@ -183,6 +184,35 @@ svg {
 #slide-layer {
   z-index: 4;
   image-rendering: auto;
+  transition: opacity var(--normal) var(--ease);
+}
+
+/* 黑板：一块空屏，压在幻灯片之上、笔迹之下。
+ *
+ * 尺寸与标注层一模一样（`layoutCanvases` 一起摆放），所以「看得见的板子」
+ * 就是「写得上去的范围」—— 不会出现写到边上看不到落笔的地方。
+ * 投影上深墨绿比纯黑更像黑板，也不刺眼；四周压一圈内阴影当边框。 */
+#board {
+  z-index: 5;
+  opacity: 0;
+  pointer-events: none;
+  border-radius: 4px;
+  background: #101c17;
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.08),
+    inset 0 0 120px rgba(0, 0, 0, 0.55);
+  transition: opacity var(--normal) var(--ease);
+}
+
+#board.on {
+  opacity: 1;
+}
+
+/* 上了黑板就把课件让开：它还在下面，只是不显出来（这样退出黑板是瞬间的，
+   不用等重新渲染） */
+#stage.board-on #slide-layer,
+#stage.board-on #media-layer {
+  opacity: 0;
 }
 
 #ink-layer {
@@ -490,24 +520,6 @@ html.touch-mode #present-bar {
 }
 
 /* ---------- 放映模式覆盖层 ---------- */
-
-#overlay {
-  position: absolute;
-  inset: 0;
-  z-index: 30;
-  pointer-events: none;
-  opacity: 0;
-}
-
-#overlay.black {
-  background: #000;
-  opacity: 1;
-}
-
-#overlay.white {
-  background: #fff;
-  opacity: 1;
-}
 
 /* 聚光灯：用径向遮罩压暗四周 */
 #spotlight {
@@ -1321,11 +1333,13 @@ body.presenting #ink-layer.cursor-hidden:not(.show-cursor) {
   cursor: grabbing;
 }
 
-/* 收起态只留最常用的几个，其余藏起来 —— 老人不需要一眼看到全部功能 */
+/* 收起态只留最常用的几个，其余藏起来 —— 老人不需要一眼看到全部功能。
+ *
+ * 黑板留在收起态里：它是**开/关**式的，老师点它上板、就得能再点它下板。
+ * 藏起来会变成「上得去、下不来」，只能先展开工具条 —— 那正是老师最烦的。 */
 #present-bar.docked #p-highlighter,
 #present-bar.docked #p-undo,
 #present-bar.docked #p-clear,
-#present-bar.docked #p-black,
 #present-bar.docked #p-spot,
 #present-bar.docked #p-laser,
 #present-bar.docked .tb-sep,
@@ -1339,6 +1353,19 @@ body.presenting #ink-layer.cursor-hidden:not(.show-cursor) {
 }
 #present-bar.docked .dock-toggle svg {
   transform: rotate(180deg);
+}
+
+/* 深色条上的分隔线与色环要单独给颜色。
+ *
+ * `.tb-sep` 与 `.swatch` 默认用的是浅色主题的 `--border-strong`
+ * （`rgba(0,0,0,0.16)`）—— 画在 `#202023` 的放映条上等于隐形，
+ * 于是「翻页 / 工具 / 屏幕模式」这几组分不开，一眼看过去是一长溜按钮。 */
+#present-bar .tb-sep {
+  background: rgba(255, 255, 255, 0.18);
+}
+
+#present-bar .swatch {
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.28);
 }
 
 #present-bar .icon-btn {

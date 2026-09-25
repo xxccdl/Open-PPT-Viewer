@@ -70,7 +70,11 @@
         <g id="i-clear">
           <path d="M4 7h16M9 7V5h6v2M6 7l1 13h10l1-13" />
         </g>
-        <g id="i-black"><circle cx="12" cy="12" r="8.5" /></g>
+        <g id="i-board">
+          <rect x="3" y="4" width="18" height="13" rx="1.6" />
+          <path d="M6.6 13.2c1.5-4 3.1.7 4.7-2.3s3.1.7 4.7-2.4" />
+          <path d="M12 17v3M8.5 20h7" />
+        </g>
         <g id="i-play"><path d="M8 5.5v13l11-6.5z" /></g>
         <g id="i-spot">
           <circle cx="12" cy="10" r="4" />
@@ -169,9 +173,13 @@
         <!-- 视频/音频原位播放层：夹在幻灯片与标注层之间，
              拿笔时整体让位（见 style.css 的 .ink-active） -->
         <div id="media-layer"></div>
+        <!-- 黑板：一块空屏，盖住幻灯片，笔迹落在它上面（见 app.js 的 setBoard）。
+             尺寸与标注层完全一致 —— 由 `layoutCanvases` 一起摆放，
+             所以「看得见的板子」就是「写得上去的范围」。 -->
+        <div id="board"></div>
+
         <canvas id="ink-layer"></canvas>
 
-        <div id="overlay"></div>
         <div id="spotlight"></div>
         <canvas id="laser"></canvas>
         <div id="timer">00:00</div>
@@ -226,8 +234,8 @@
           </button>
 
           <div class="tb-sep"></div>
-          <button class="icon-btn" id="t-black" title="黑屏 (B)">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-black" /></svg>
+          <button class="icon-btn" id="t-board" title="黑板：空屏板书 (B)">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-board" /></svg>
           </button>
           <button class="icon-btn" id="t-spot" title="聚光灯 (S)">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-spot" /></svg>
@@ -282,8 +290,8 @@
 
       <div class="tb-sep"></div>
 
-      <button class="icon-btn" id="p-black" title="黑屏 (B)" data-label="黑屏">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-black" /></svg>
+      <button class="icon-btn" id="p-board" title="黑板：空屏板书 (B)" data-label="黑板">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-board" /></svg>
       </button>
       <button class="icon-btn" id="p-spot" title="聚光灯 (S)" data-label="聚光">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-spot" /></svg>
@@ -313,7 +321,7 @@
       <button class="ctx-item" data-act="eraser">橡皮<span class="key">E</span></button>
       <button class="ctx-item" data-act="clear">清空本页标注<span class="key">Del</span></button>
       <div class="ctx-sep"></div>
-      <button class="ctx-item" data-act="black">黑屏<span class="key">B</span></button>
+      <button class="ctx-item" data-act="board">黑板（空屏板书）<span class="key">B</span></button>
       <button class="ctx-item" data-act="laser">激光笔<span class="key">L</span></button>
       <div class="ctx-sep"></div>
       <button class="ctx-item" data-act="exit">结束放映<span class="key">Esc</span></button>
@@ -440,6 +448,10 @@
               <button class="mode-chip" data-mode="mouse">鼠标键盘</button>
             </div>
             <p class="assoc-hint mode-hint"></p>
+            <p class="assoc-hint">
+              按钮笔（翻页器）不用设置：翻页键、空格、回车、方向键都能翻页；
+              笔上那颗「黑屏」键打开的是黑板。
+            </p>
           </section>
 
           <!-- 出问题时怎么查 -->

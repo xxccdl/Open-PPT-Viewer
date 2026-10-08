@@ -2200,6 +2200,10 @@ function goTo(page) {
 
 function nextPage() {
   if (!state.info) return;
+  // 黑板开着时「翻页」翻的是板书。直达这里的还有窗口工具条的翻页按钮
+  // （`btn-next`）—— 统一在这一层收下，省得每个入口各判一遍。
+  // 放映时走的是 `goForward`，它在更前面就判掉了（必须早于「推进动画步」）。
+  if (boardOn) return boardFlip(1);
   const p = state.page + 1;
   if (p >= state.info.pageCount) return;
   // 放映时向下翻页要从「一步都没播」开始，否则动画就白设了；
@@ -2210,6 +2214,8 @@ function nextPage() {
 
 function prevPage() {
   if (!state.info) return;
+  // 同上；直达这里的还有放映时的右键（= 上一页）
+  if (boardOn) return boardFlip(-1);
   const p = state.page - 1;
   if (p < 0) return;
   // 回翻时这一页已经讲过了，直接给全部显示的样子
@@ -2227,10 +2233,19 @@ function updateNavUi() {
     ? `板书 ${boardPage + 1}`
     : `${state.page + 1} / ${total}`;
 
-  const atFirst = state.page === 0;
-  const atLast = state.page >= total - 1;
-  for (const id of ['btn-first', 'btn-prev']) $(id).disabled = atFirst;
-  for (const id of ['btn-next', 'btn-last']) $(id).disabled = atLast;
+  // 首页/末页说的永远是**课件**（按下去会下板、跳到课件那一页），所以按课件页算
+  $('btn-first').disabled = state.page === 0;
+  $('btn-last').disabled = state.page >= total - 1;
+
+  // 翻页按钮的边界要跟着「此刻在翻什么」走。
+  //
+  // 都按课件页算是不行的：课件停在第 1 页时「上一页」本来是灰的，可板书完全可能
+  // 已经有第 2 页要往回翻 —— 灰着就再也回不到板书的第 1 页。
+  // 反方向同理：课件停在最后一页时「下一页」灰着，板书开不出新页。
+  const atFirst = boardOn ? boardPage === 0 : state.page === 0;
+  const atLast = boardOn ? boardPage >= BOARD_MAX_PAGES - 1 : state.page >= total - 1;
+  $('btn-prev').disabled = atFirst;
+  $('btn-next').disabled = atLast;
 
   // 放映工具条上的翻页按钮同步禁用态
   $('p-prev').disabled = atFirst;

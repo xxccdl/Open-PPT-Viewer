@@ -1526,6 +1526,172 @@ repair/drivers.json
 > deny-only，`schtasks /Create` 直接 Access denied —— 只验证了 XML 结构与字段；
 > ② 真实 `sfc` / `chkdsk` 会改系统，没有在开发机上跑。
 
+## Task 49: 安装程序在 ARM 机型上卡在 2% 十分钟 —— 已修复
+
+### 现象
+
+ARM 机型（Windows on ARM，x64 要走模拟层）上点「安装」，进度条停在 **2%**
+不动，大约十分钟后才继续。
+
+### 根因：2% 那一步在「冷启动一个根本没在跑的应用」
+
+`install()` 的第一步就是 `p.step("正在关闭正在运行的 OpenPPTView…", 2.0)`，
+对应 `stop_running_app()`。它原来是**无条件**这么做的：
+
+```rust
+if !exe.exists() { return; }
+Command::new(&exe).arg("--quit").spawn();   // ← 不管有没有在跑都启一次
+for _ in 0..20 { sleep(250ms); if !process_running() { return } }
+```
+
+两条叠加在一起：
+
+1. **应用没在跑也照样启动它**。那句「请它退出」实际变成「把 14MB 的 Tauri
+   应用连 WebView2 一起冷启动一遍」。ARM 上 x64 要过模拟层，这次启动本身
+   就极慢；而安装器这时正阻塞在同一处。
+2. **等待写成固定 20 轮**，每轮都 `CreateToolhelp32Snapshot` 枚举全进程。
+   在模拟机型上单次枚举不便宜，20 次叠起来就是几分钟。
+
+### 修法
+
+- [x] **先查一次**：没有同名进程就直接返回 —— 新装、应用没开、升级完
+  已退出，这三种最常见的情况从此 0 开销（这是本修复的主因）。
+- [x] 真有进程时才用 `--quit` 请它退，而且**扔到后台线程去发**：
+  `CreateProcess` 会等映像加载完才返回，ARM 上同样不便宜，不能让安装器陪着等。
+- [x] 等待改成**时间预算**（4 秒），不再用「固定 20 次」；到点就
+  `TerminateProcess` 兜底，宁可丢一次自动存盘也不让安装停在 2%。
+- [x] `stop_running_app` 拆出 `stop_app_named(dir, name)`，进程名可注入，
+  这样回归测试能用独有进程名，不受开发机上真开着应用的影响。
+- [x] 新增回归测试 `stopping_a_not_running_app_returns_at_once`：
+  目录里放一个存在但从未运行的 exe，要求整步 < 2 秒（实测 0.02s）。
+
+### 验证
+
+- [x] `cargo test -p ppt-installer --no-default-features`：**4 passed**
+  （默认 feature 带 `requireAdministrator` 清单，测试二进制起不来，必须加这个参数）
+- [x] 该测试在旧代码下会跑满 5 秒以上（无条件 spawn + 20 轮枚举），
+  新代码 0.02 秒
+- [ ] ARM 实机复测：需要一台 ARM 设备装包看进度条（本机是 x64）
+
+## Task 50: 部署蓝屏报告接收服务 —— 已上线
+
+### 一、落在哪
+
+| 项 | 值 |
+| --- | --- |
+| 服务器 | `175.27.141.172`（Ubuntu 22.04，x86_64，账号 `ubuntu`） |
+| 代码 | `/opt/openpptview-crash/server.mjs`（root:root 644） |
+| 数据 | `/var/lib/openpptview-crash`（`oppv-crash` 系统用户，750） |
+| 服务 | systemd `openpptview-crash.service`（已 `enable`，`Restart=always`） |
+| 监听 | **只监听 `127.0.0.1:8787`**，公网不直连 |
+| 对外地址 | `https://xxccdl.cn/crash/api/v1/crash`（nginx 反代） |
+
+客户端设置页「上报服务器」填的就是上面那个 https 地址。
+
+### 二、nginx
+
+在 `xxccdl.cn` 的 443 server 块里加了：
+
+```nginx
+location /crash/ {
+    proxy_pass http://127.0.0.1:8787/;     # 末尾斜杠：去掉 /crash 前缀
+    proxy_request_buffering off;            # 直接流给 Node，省一次落盘
+    client_max_body_size 100m;              # 客户端单包上限 64MB
+    ...
+}
+```
+
+配置改前备份在 `/etc/nginx/sites-available/xxccdl.cn.oppv-bak`。
+`nginx -t` 通过后才 reload；不过就自动还原。
+
+### 三、顺手换掉了过期证书
+
+体检时发现 `xxccdl.cn` 原来的证书 **2026-10-16 就过期了**（已过期 8 天）——
+客户端（reqwest 严格校验证书）会直接上传失败，而且不会有任何界面提示。
+现场换成 Let's Encrypt：
+
+- `certbot --nginx -d xxccdl.cn`，有效期到 **2027-01-22**；
+- 自动续期已登记（certbot 自带的 systemd timer）；
+- `www.xxccdl.cn` 没有 A 记录，只签了主域名。
+
+改前配置另存为 `xxccdl.cn.pre-certbot`。
+
+### 四、验证
+
+- [x] `https://xxccdl.cn/crash/health` 从**本机 Windows** 访问 →
+  `{"ok":true,"service":"openpptview-crash"}`（不带 `-k`，证书链有效）
+- [x] 服务端自测上传：POST 一个 3 文件的小 zip → `{"ok":true,"id":"deploy-probe-0001","bytes":338}`，
+  `/var/lib/openpptview-crash` 下出现 `.zip` + `.json`
+- [x] **真客户端跑通**：本机 `ppt-app.exe --crash-report-demo`（endpoint 指向
+  `https://xxccdl.cn/crash/api/v1/crash`）→ 应用日志
+  `蓝屏报告已发送：demo-20261024-144904`；服务端 `GET /api/v1/crashes`
+  看到 5165 字节的包
+- [x] 来源 IP：反代后面 `socket.remoteAddress` 永远是 127.0.0.1，
+  改成读 `X-Forwarded-For` 首段后，列表里的 `remote` 是真实公网 IP
+  （`182.200.10.118`），机房才认得出是哪台机器蓝屏
+- [x] 测试数据已清空，`/var/lib/openpptview-crash` 现在是 0 个文件
+
+### 五、要知道的两件事
+
+1. **8787 不需要对公网开放**。服务只监听 `127.0.0.1`，安全组里那条 8787
+   规则可以撤掉 —— 对外只走 443 反代。
+2. **这个端点没有认证**。知道地址的人都能 POST（单包上限 96MB，nginx 再卡 100m）。
+   目前客户端只支持环境变量 `OPENPPTVIEW_CRASH_TOKEN` 带 Bearer token，
+   设置页里还没有对应输入框；要用 token 得先给设置页加一个字段。
+
+## Task 51: 0.3.0 打开后闪退 —— 已修复
+
+### 现象
+
+双击图标，窗口闪一下就没了（进程退出码 0）。0.2.6 正常。
+
+### 根因：诊断窗口写进了配置，正常启动也会加载它
+
+0.3.0 在 `tauri.conf.json` 的 `app.windows` 里加了一个 `crash` 窗口
+（`visible: false`）。以为「不可见就没影响」——**错了**：Tauri 照样给它建
+WebView 并加载 `crash.html`，而 `crash.js` 一加载就执行
+
+```js
+await invoke('crash_ready');
+```
+
+后端的 `begin()` 发现「没有待分析的报告」，走的是这一句：
+
+```rust
+let Some(report) = take_pending() else {
+    app.exit(0);   // ← 退出的是**整个应用**，不是这个窗口
+    return;
+};
+```
+
+于是每次正常启动都是：建窗口 → 诊断页跑起来 → `crash_ready` → 全进程退出。
+
+### 修法
+
+- [x] **诊断窗口不写进配置**，改由 `crash::show_window` 用
+  `WebviewWindowBuilder` 按需创建（外形参数不变）。正常启动根本不建它，
+  也就不会平白多一个 WebView2 实例。
+- [x] `begin()` 没有待分析报告时只**关掉诊断窗口**，不再 `app.exit(0)`；
+  `prepare()` 同理（改调 `close_window`，顺手把主窗口还回去）。
+- [x] 主窗口改成 `visible: false`，在 `setup` 末尾显式 `show`。
+  否则 `--crash-report` 开机那次会先弹主窗口再藏，桌面上一闪。
+
+### 验证
+
+- [x] debug 版启动后：进程存活、`MainWindowTitle = OpenPPTView`、
+  `MainWindowHandle = 529050`（非 0，窗口真的在）
+- [x] `--crash-report-demo` 仍完整走通：开始分析 → 「诊断窗口已收到右下角：
+  450×145 @ (1447, 852)」→ 演示跳过修复 → 报告存本地
+  —— 动态创建的窗口与缩角动画都没受影响
+
+### 顺带发现（未处理，记一笔）
+
+日志里有 `thread 'tokio-rt-worker' panicked: Cannot drop a runtime in a context
+where blocking is not allowed`，来自启动时的检查更新（`reqwest::blocking::Client`
+在 tokio worker 里析构）。**不致命**（工作线程 panic，进程继续跑、更新检查也成功了），
+但它会杀掉一个 tokio worker。后续可以把检查更新换成异步接口，或在独立线程里
+显式建 runtime。
+
 # Task Dependencies
 
 - Task 2 依赖 Task 1

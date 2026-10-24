@@ -944,6 +944,12 @@ fn emit(app: &AppHandle, phase: &str, message: &str) {
 
 /// 把主窗口藏起来、把诊断窗口叫出来。
 ///
+/// 诊断窗口**不写在 `tauri.conf.json` 里**，只在这里按需创建。
+/// 原因是它一旦写进配置，Tauri 每次启动都会把它的 WebView 一起建出来 ——
+/// 而 `crash.js` 一加载就会调 `crash_ready`，后端发现「没有待分析的报告」
+/// 便会退出整个应用：老师双击图标，看到的就是闪一下没了。
+/// 正常启动时不该有这个窗口，也不该为它多起一个 WebView2。
+///
 /// 只做「叫出来」这一件事：真正开始分析要等界面回 `crash_ready`
 /// （见 [`begin`]）。界面先挂好事件监听再说「可以了」，
 /// 否则分析进度会在没人听的时候发出去，窗口就永远停在「正在分析…」。
@@ -951,12 +957,37 @@ pub fn show_window(app: &AppHandle) {
     if let Some(main) = app.get_webview_window("main") {
         let _ = main.hide();
     }
-    let Some(win) = app.get_webview_window("crash") else {
-        log::warn!("找不到 crash 窗口（配置里漏了？）");
-        return;
+    let win = match app.get_webview_window("crash") {
+        Some(w) => w,
+        None => match build_window(app) {
+            Ok(w) => w,
+            Err(e) => {
+                log::warn!("建不出诊断窗口：{e}");
+                return;
+            }
+        },
     };
     let _ = win.show();
     let _ = win.set_focus();
+}
+
+/// 按设计好的外形创建诊断窗口（与 `crash.css` 的假设一致）。
+fn build_window(app: &AppHandle) -> tauri::Result<tauri::WebviewWindow> {
+    use tauri::{WebviewUrl, WebviewWindowBuilder};
+
+    let win = WebviewWindowBuilder::new(app, "crash", WebviewUrl::App("crash.html".into()))
+        .title("OpenPPTView 系统诊断")
+        .inner_size(620.0, 430.0)
+        .resizable(false)
+        .decorations(false)
+        .transparent(true)
+        .shadow(true)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .center()
+        .visible(false)
+        .build()?;
+    Ok(win)
 }
 
 /// 展示窗口，并设一个「界面没来叫我也得开始」的兜底。
@@ -966,7 +997,8 @@ pub fn show_window(app: &AppHandle) {
 /// 8 秒还等不到 `crash_ready` 就直接开始，最坏也只是看不到进度文字。
 pub fn prepare(app: AppHandle) {
     if !has_pending() {
-        app.exit(0);
+        // 没有要分析的东西：只把诊断窗口收掉，别动整个应用
+        close_window(&app);
         return;
     }
     show_window(&app);
@@ -1005,10 +1037,24 @@ pub fn begin(app: AppHandle) {
         return;
     }
     let Some(report) = take_pending() else {
-        app.exit(0);
+        // 正常启动时也可能走到这里（比如窗口被别的路径建了出来）：
+        // 没有报告就只关掉这个窗口。**绝不能 `app.exit(0)`** ——
+        // 那会让老师双击图标看到「闪一下就没了」。
+        log::info!("没有待分析的蓝屏报告，关掉诊断窗口");
+        close_window(&app);
         return;
     };
     std::thread::spawn(move || run(app, report));
+}
+
+/// 收掉诊断窗口，并把主窗口还回去（如果它还在的话）。
+fn close_window(app: &AppHandle) {
+    if let Some(win) = app.get_webview_window("crash") {
+        let _ = win.close();
+    }
+    if let Some(main) = app.get_webview_window("main") {
+        let _ = main.show();
+    }
 }
 
 fn run(app: AppHandle, report: Report) {

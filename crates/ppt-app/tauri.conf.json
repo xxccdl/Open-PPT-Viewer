@@ -22,23 +22,7 @@
         "transparent": false,
         "dragDropEnabled": true,
         "center": true,
-        "visible": true
-      },
-      {
-        "label": "crash",
-        "url": "crash.html",
-        "title": "OpenPPTView 系统诊断",
-        "width": 620,
-        "height": 430,
-        "resizable": false,
-        "decorations": false,
-        "transparent": true,
-        "shadow": true,
-        "alwaysOnTop": true,
-        "skipTaskbar": true,
-        "center": true,
-        "visible": false,
-        "focus": true
+        "visible": false
       }
     ],
     "security": {

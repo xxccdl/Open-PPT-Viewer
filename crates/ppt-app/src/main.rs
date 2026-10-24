@@ -2477,6 +2477,20 @@ fn main() {
             resident::setup_tray(app.handle())?;
             resident::spawn_idle_watchdog(app.handle().clone());
 
+            // 主窗口在配置里是 `visible: false`：正常启动到这里才显示它。
+            //
+            // 为什么不在配置里直接 `visible: true`：蓝屏诊断（`--crash-report`）
+            // 走的是同一个进程，窗口只要一显示就得再藏起来 ——
+            // 老师开机会看到桌面上一闪而过的白窗口。放到这里，
+            // 诊断那条路根本不会 show，正常启动也只晚几个毫秒。
+            {
+                use tauri::Manager;
+                if let Some(win) = app.get_webview_window("main") {
+                    let _ = win.show();
+                    let _ = win.set_focus();
+                }
+            }
+
             // 预热导出内核：`Converter::spawn` 只是起一条线程，
             // 真正贵的 `Application` 创建（约 2 秒）发生在后台 ——
             // 等老师第一次打开课件时它已经热好了，那 2 秒就白赚了。

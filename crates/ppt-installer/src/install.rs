@@ -890,30 +890,59 @@ pub fn uninstall(dir: &Path, p: &mut dyn Progress) -> Result<(), String> {
 /// 「点了卸载，程序还在，还能双击打开」，等于没卸；
 /// 升级则会在写主程序那一步直接失败（「装到一半报错」）。
 ///
-/// 顺序是「先好好说，再动手」：
-/// 1. 用 `--quit` 请它自己退。走的是应用里「先把标注存盘再退」那条路，
-///    老师写在课件上的笔迹不会白丢；
-/// 2. 等最多 5 秒；
-/// 3. 还不走就强制结束。留着一个改不掉的文件，比丢一次标注更糟。
+/// 顺序是「先看有没有在跑 → 好好说 → 动手」，每一步都有时间上限。
 fn stop_running_app(dir: &Path) {
-    let exe = dir.join(EXE_NAME);
+    stop_app_named(dir, EXE_NAME);
+}
+
+/// [`stop_running_app`] 的实现，进程名可换（自测用）。
+///
+/// # 为什么第一步要先查一遍
+///
+/// 以前这里是**无条件**用 `--quit` 启动一次程序，再等着它退出。
+/// 在没有进程运行时，那句「请它退出」实际变成了「把 14MB 的 Tauri 应用
+/// 连 WebView2 一起冷启动一遍」—— 在 ARM 机型上（x64 要过模拟层），
+/// 这一次启动能拖上几分钟，安装条就死死停在 2%。
+/// 应用本来就没开，这一步纯属多余，先查一次就能整段跳过。
+///
+/// # 为什么等待要放在后台线程里发起、并且有预算
+///
+/// `CreateProcess` 会等映像加载完才返回，在 ARM 模拟机型上同样不便宜。
+/// 所以「请求退出」扔到另一条线程去发；主线程只按时间预算轮询，
+/// 到点就强制结束 —— 宁可丢一次自动存盘，也不能让安装停在 2% 不动。
+fn stop_app_named(dir: &Path, name: &str) {
+    let exe = dir.join(name);
     if !exe.exists() {
         return;
     }
 
-    if let Err(e) = std::process::Command::new(&exe).arg("--quit").spawn() {
-        log::warn!("请应用退出时没能启动它（继续走强制流程）：{e}");
+    // ① 没在跑就到此为止。这一条是 ARM 卡 2% 的正解。
+    if !process_running(name) {
+        return;
     }
-    for _ in 0..20 {
-        std::thread::sleep(std::time::Duration::from_millis(250));
-        if !process_running(EXE_NAME) {
+
+    // ② 请它自己退（走应用的「先存标注再退」那条路）。
+    let request = exe.clone();
+    std::thread::spawn(move || {
+        if let Err(e) = std::process::Command::new(&request).arg("--quit").spawn() {
+            log::warn!("请应用退出时没能启动它（继续走强制流程）：{e}");
+        }
+    });
+
+    // ③ 等它退。预算 4 秒：正常退出（存标注 + 关窗口）通常 1 秒内；
+    //    留足余量，但绝不再用「固定 20 次」那种可能被单次枚举拖垮的写法。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(350));
+        if !process_running(name) {
             log::info!("应用已退出，可以删文件了");
             return;
         }
     }
-    log::warn!("应用没有在 5 秒内退出，强制结束");
-    kill_process(EXE_NAME);
-    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    log::warn!("应用没有在预算内退出，强制结束");
+    kill_process(name);
+    std::thread::sleep(std::time::Duration::from_millis(500));
 }
 
 /// 删安装目录里的文件（正在跑的 `uninstall.exe` 除外）。
@@ -1128,5 +1157,30 @@ mod tests {
         fs::write(&path, b"just a normal executable, nothing appended").unwrap();
         assert!(read_payload(&path).is_err());
         let _ = fs::remove_file(&path);
+    }
+
+    /// 没有进程在跑时，这一步必须**立刻**结束。
+    ///
+    /// 这是 ARM 机型「安装卡在 2% 十分钟」的回归测试：以前这里会无条件
+    /// 启动一次 `--quit`（= 冷启动整个 Tauri 应用），再等 20 轮。
+    /// 现在先查进程，没在跑就什么都不做。
+    #[test]
+    fn stopping_a_not_running_app_returns_at_once() {
+        let dir = std::env::temp_dir().join(format!("oppv-stop-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        // 名字必须是这个测试独有的：用真实进程名的话，
+        // 开发机上刚好开着应用就会变成「在跑」，测不出这件事
+        let name = "OpenPPTView-Selftest-Never-Running.exe";
+        fs::write(dir.join(name), b"MZ").unwrap();
+
+        let started = std::time::Instant::now();
+        stop_app_named(&dir, name);
+        let spent = started.elapsed();
+
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            spent < std::time::Duration::from_secs(2),
+            "没有进程在跑却等了 {spent:?}"
+        );
     }
 }

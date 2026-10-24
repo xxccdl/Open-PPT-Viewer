@@ -1,0 +1,356 @@
+/* 蓝屏诊断窗口的样式。
+ *
+ * 窗口是透明、无边框的（见 tauri.conf.json 的 crash 窗口），
+ * 所以圆角和外阴影都由 .card 自己画 —— 窗口本身看不见边。
+ *
+ * 两种尺寸共用同一套 DOM：
+ * - 大卡片 620×430：说明「在做什么」；
+ * - 缩到右下角后 360×116：只留一句「正在发送」。
+ * Rust 那边把窗口从大缩到小（见 crash.rs 的 shrink_to_corner），
+ * 这里靠 body[data-phase] 切换内容，两边同时发生。
+ */
+
+:root {
+  --accent: #5aa2ff;
+  --ok: #4ad07f;
+  --warn: #f0b45c;
+  --text: #f2f2f5;
+  --dim: rgba(255, 255, 255, 0.48);
+  --faint: rgba(255, 255, 255, 0.32);
+  --ease: cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body {
+  height: 100%;
+  overflow: hidden;
+  background: transparent;
+}
+
+body {
+  font-family: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei",
+    sans-serif;
+  color: var(--text);
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: default;
+}
+
+.card {
+  position: absolute;
+  inset: 6px;
+  overflow: hidden;
+  border-radius: 18px;
+  border: 1px solid rgba(255, 255, 255, 0.075);
+  background:
+    radial-gradient(120% 90% at 16% -10%, rgba(78, 140, 255, 0.18), transparent 62%),
+    linear-gradient(165deg, #24242a 0%, #1a1a1f 56%, #151518 100%);
+  box-shadow:
+    0 24px 70px rgba(0, 0, 0, 0.55),
+    inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  transition:
+    border-radius 300ms var(--ease),
+    box-shadow 300ms var(--ease);
+}
+
+/* 右上角一条极淡的高光，避免整块卡片发死 */
+.card::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 42%;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.16));
+  pointer-events: none;
+}
+
+/* ---------- 品牌行 ---------- */
+
+.brand {
+  position: absolute;
+  top: 22px;
+  left: 26px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  color: var(--faint);
+  transition: opacity 200ms var(--ease);
+}
+
+.brand-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 10px rgba(90, 162, 255, 0.85);
+}
+
+/* ---------- 舞台 ---------- */
+
+.stage {
+  position: absolute;
+  inset: 0;
+}
+
+.analyzing,
+.compact {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  transition:
+    opacity 220ms var(--ease),
+    transform 320ms var(--ease);
+}
+
+/* ---------- 第一段：正在分析 ---------- */
+
+.analyzing {
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 0 56px;
+  text-align: center;
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.analyzing h1 {
+  font-size: 26px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: var(--text);
+}
+
+/* 「请稍候」的流光：一条比字宽得多的亮带扫过，
+ * 用 background-clip:text 只让它在字里发亮。
+ * 速度放慢（2.8s）—— 快了就像加载动画，反而显得廉价。 */
+.shimmer {
+  margin-top: 10px;
+  font-size: 13px;
+  letter-spacing: 0.28em;
+  text-indent: 0.28em; /* 补掉末字多出的字距，视觉上才居中 */
+  background: linear-gradient(
+    100deg,
+    rgba(255, 255, 255, 0.28) 18%,
+    #ffffff 42%,
+    rgba(255, 255, 255, 0.85) 52%,
+    rgba(255, 255, 255, 0.28) 76%
+  );
+  background-size: 240% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: shimmer 2.8s linear infinite;
+}
+
+@keyframes shimmer {
+  from {
+    background-position: 150% 0;
+  }
+  to {
+    background-position: -50% 0;
+  }
+}
+
+.track {
+  width: 232px;
+  height: 2px;
+  margin-top: 30px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.09);
+  overflow: hidden;
+}
+
+.track-fill {
+  width: 42%;
+  height: 100%;
+  border-radius: 2px;
+  background: linear-gradient(
+    90deg,
+    rgba(90, 162, 255, 0),
+    var(--accent) 50%,
+    rgba(90, 162, 255, 0)
+  );
+  animation: sweep 1.9s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+@keyframes sweep {
+  from {
+    transform: translateX(-110%);
+  }
+  to {
+    transform: translateX(340%);
+  }
+}
+
+.fineprint {
+  max-width: 360px;
+  margin-top: 22px;
+  font-size: 11px;
+  line-height: 1.7;
+  color: var(--faint);
+}
+
+/* ---------- 第二段：角落小条 ---------- */
+
+.compact {
+  align-items: center;
+  gap: 12px;
+  padding: 14px 18px;
+  opacity: 0;
+  transform: translateY(4px);
+  pointer-events: none;
+}
+
+.compact-body {
+  min-width: 0;
+  flex: 1;
+}
+
+.compact-title {
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.4;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.compact-detail {
+  margin-top: 3px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.compact-detail:empty {
+  display: none;
+}
+
+.mini-track {
+  height: 2px;
+  margin-top: 9px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.mini-fill {
+  width: 38%;
+  height: 100%;
+  border-radius: 2px;
+  background: var(--accent);
+  opacity: 0.85;
+  animation: sweep 1.9s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+.spinner {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.16);
+  border-top-color: var(--accent);
+  animation: spin 900ms linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.check {
+  display: none;
+  flex: none;
+  color: var(--ok);
+}
+
+/* ---------- 阶段切换 ---------- */
+
+/* 只要不是「正在分析」，就是小条形态 */
+body[data-phase="repairing"] .analyzing,
+body[data-phase="sending"] .analyzing,
+body[data-phase="sent"] .analyzing,
+body[data-phase="local"] .analyzing,
+body[data-phase="failed"] .analyzing {
+  opacity: 0;
+  transform: translateY(-6px);
+}
+
+body[data-phase="repairing"] .compact,
+body[data-phase="sending"] .compact,
+body[data-phase="sent"] .compact,
+body[data-phase="local"] .compact,
+body[data-phase="failed"] .compact {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/* 小形态时收起品牌行、换小一号的圆角 */
+body[data-phase="repairing"] .brand,
+body[data-phase="sending"] .brand,
+body[data-phase="sent"] .brand,
+body[data-phase="local"] .brand,
+body[data-phase="failed"] .brand {
+  opacity: 0;
+}
+
+body[data-phase="repairing"] .card,
+body[data-phase="sending"] .card,
+body[data-phase="sent"] .card,
+body[data-phase="local"] .card,
+body[data-phase="failed"] .card {
+  border-radius: 14px;
+  box-shadow:
+    0 14px 34px rgba(0, 0, 0, 0.42),
+    inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+
+/* 结果：换成勾，收起进度条 */
+body[data-phase="sent"] .spinner,
+body[data-phase="local"] .spinner,
+body[data-phase="failed"] .spinner {
+  display: none;
+}
+
+body[data-phase="sent"] .check,
+body[data-phase="local"] .check {
+  display: block;
+}
+
+body[data-phase="sent"] .mini-track,
+body[data-phase="local"] .mini-track,
+body[data-phase="failed"] .mini-track {
+  display: none;
+}
+
+body[data-phase="failed"] .compact-title {
+  color: var(--warn);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .shimmer,
+  .track-fill,
+  .mini-fill,
+  .spinner {
+    animation: none;
+  }
+  .analyzing,
+  .compact {
+    transition: opacity 120ms linear;
+  }
+}

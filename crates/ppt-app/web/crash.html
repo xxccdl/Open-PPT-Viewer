@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+    <title>OpenPPTView 系统诊断</title>
+    <link rel="stylesheet" href="crash.css" />
+  </head>
+  <body data-phase="analyzing">
+    <!-- 整块卡片铺满窗口；窗口本身是透明、无边框的，圆角与外阴影都由这里画 -->
+    <div class="card">
+      <div class="brand">
+        <span class="brand-dot"></span>
+        OpenPPTView · 系统诊断
+      </div>
+
+      <div class="stage">
+        <!-- 第一段：大卡片，讲清楚在做什么 -->
+        <section class="analyzing">
+          <h1>正在分析…</h1>
+          <p class="shimmer">请稍候</p>
+          <div class="track"><div class="track-fill"></div></div>
+          <p class="fineprint">
+            正在读取系统记录的蓝屏信息与内核转储，不会打开或修改你的课件。
+          </p>
+        </section>
+
+        <!-- 第二段：缩到右下角后的小条，不挡路 -->
+        <section class="compact">
+          <div class="spinner" aria-hidden="true"></div>
+          <svg class="check" width="18" height="18" viewBox="0 0 24 24" fill="none"
+               stroke="currentColor" stroke-width="2.2" stroke-linecap="round"
+               stroke-linejoin="round" aria-hidden="true">
+            <path d="M4.5 12.5l5 5 10-11" />
+          </svg>
+          <div class="compact-body">
+            <p class="compact-title">请稍后，正在将错误发送至服务器…</p>
+            <p class="compact-detail" id="detail"></p>
+            <div class="mini-track"><div class="mini-fill"></div></div>
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <script src="crash.js"></script>
+  </body>
+</html>

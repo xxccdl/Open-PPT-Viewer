@@ -45,6 +45,21 @@ pub const PREF_KEY: &str = "Software\\OpenPPTView";
 /// 卸载信息的注册表项。
 pub const UNINST_KEY: &str =
     "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\OpenPPTView";
+/// 开机启动项（旧版）：登录时跑一次蓝屏诊断。
+///
+/// 0.3.0 起改由计划任务负责（见 [`TASK_NAME`]），因为「自动尝试修复」
+/// 要用管理员权限，而 `Run` 项只能拿到启动者本来的权限。
+/// 这两个常量只留着**清掉旧版本留下的值**。
+pub const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+pub const RUN_VALUE: &str = "OpenPPTViewCrashReport";
+
+/// 登录时做一次蓝屏诊断（并在需要时自动修复）的计划任务名。
+///
+/// 用计划任务而不是 `Run` 项，是因为修复要跑 `sfc` / `DISM` / `chkdsk`，
+/// 它们都要求管理员权限；计划任务带最高权限令牌，老师不必每次点 UAC。
+/// 触发条件写成「任意用户登录」，主控走 `Users` 组：机房一台机器可能
+/// 有好几个账号，不该只有安装时那个账号能诊断。
+pub const TASK_NAME: &str = "OpenPPTViewCrashReport";
 
 /// 进度回调：返回 `false` 表示用户按了取消。
 pub trait Progress {
@@ -179,6 +194,12 @@ pub fn install(
     //
     // 不做这一步，老师升级完双击课件起来的还是那个旧副本 —— 详见函数注释。
     settle_legacy_user_install(&opts.dir, &exe);
+
+    // 5.6 登录时检查蓝屏的计划任务（带最高权限，修复命令要靠它）。
+    // 登记不上不影响主程序使用，只是「自动修复」会因为没有管理员权限而跳过。
+    if let Err(e) = install_crash_task(&exe) {
+        log::warn!("蓝屏自检的计划任务没能登记（自动修复会被跳过）：{e}");
+    }
 
     // 6. 运行环境（WebView2）：新系统上一般已经有了，没有才装
     if !p.step("正在检查运行环境…", 78.0) {
@@ -396,6 +417,12 @@ fn write_registry(dir: &Path, exe: &Path, opts: &Options) -> Result<(), String> 
     let _ = pref.set_value("DesktopShortcut", &(u32::from(opts.desktop_shortcut)));
     let _ = pref.set_value("InstallLocation", &dir_s);
 
+    // 老版本在这里写过一条 `Run` 项。现在改由计划任务负责（见 TASK_NAME），
+    // 留着它会导致登录时被拉起两次 —— 先删掉。
+    if let Ok(run) = root.open_subkey_with_flags(RUN_KEY, winreg::enums::KEY_WRITE) {
+        let _ = run.delete_value(RUN_VALUE);
+    }
+
     // 文件关联：注册一个属于本应用的 ProgID，并把它挂到 .pptx / .ppsx 的候选里。
     // 不去抢 UserChoice（Windows 不允许程序自己改默认打开方式），
     // 但「打开方式 → 更多应用」里会出现 OpenPPTView。
@@ -441,6 +468,11 @@ fn remove_registry(scope: Scope) {
     });
     let _ = root.delete_subkey_all(UNINST_KEY);
     let _ = root.delete_subkey_all(PREF_KEY);
+    // 登录启动项也要撤掉：留着的话卸载之后每次登录都会去拉起一个
+    // 已经不存在的 exe（Windows 只会记一条失败，老师看不到原因）
+    if let Ok(run) = root.open_subkey_with_flags(RUN_KEY, winreg::enums::KEY_WRITE) {
+        let _ = run.delete_value(RUN_VALUE);
+    }
     if let Ok(classes) =
         root.open_subkey_with_flags("Software\\Classes", winreg::enums::KEY_WRITE)
     {
@@ -527,12 +559,16 @@ fn settle_legacy_user_install(target: &Path, exe: &Path) {
 /// 打开方式」生效的地方（HKCR 里 HKCU 优先），删掉会让老师双击课件
 /// 毫无反应。它们要留下，只是改指到新位置（见 [`repoint_user_association`]）。
 fn remove_user_scope_records() {
-    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_WRITE};
     use winreg::RegKey;
 
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let _ = hkcu.delete_subkey_all(UNINST_KEY);
     let _ = hkcu.delete_subkey_all(PREF_KEY);
+    // 旧副本登记的那条登录启动项：指向的是马上要被删掉的 exe
+    if let Ok(run) = hkcu.open_subkey_with_flags(RUN_KEY, KEY_WRITE) {
+        let _ = run.delete_value(RUN_VALUE);
+    }
 }
 
 /// 把 HKCU 里**已经存在**的 ProgID 改指到这次装的位置。
@@ -568,6 +604,161 @@ fn repoint_user_association(exe: &Path) {
     if touched {
         log::info!("HKCU 下的文件关联已改指到 {}", exe.display());
     }
+}
+
+// ---------------------------------------------------------------------------
+// 计划任务：登录时做蓝屏诊断（带最高权限）
+// ---------------------------------------------------------------------------
+
+/// 登记「登录时检查蓝屏并尝试修复」的计划任务。
+///
+/// # 为什么不是 `Run` 项
+///
+/// `Run` 项只能拿到登录者本来的权限；修复要跑 `sfc` / `DISM` / `chkdsk`，
+/// 没有管理员会全部失败。计划任务可以声明「以最高权限运行」，
+/// 于是老师什么都不用点 —— 这正是教室机器要的。
+///
+/// 先按 `Users` 组登记（任意账号登录都触发），失败再退回「只给当前账号」。
+/// 退一步的那份在机房多账号环境里只会对安装时的账号生效，但至少是能用的。
+fn install_crash_task(exe: &Path) -> Result<(), String> {
+    let command = format!("\"{}\"", escape_xml(&exe.to_string_lossy()));
+    match register_task(&task_xml(&command, Principal::Users)) {
+        Ok(()) => Ok(()),
+        Err(first) => {
+            log::warn!("按 Users 组登记计划任务失败，改试当前账号：{first}");
+            register_task(&task_xml(&command, Principal::CurrentUser))
+        }
+    }
+}
+
+/// 卸载时删掉计划任务。
+fn remove_crash_task() {
+    let out = std::process::Command::new("schtasks.exe")
+        .args(["/Delete", "/TN", TASK_NAME, "/F"])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => log::info!("已删除计划任务 {TASK_NAME}"),
+        _ => log::info!("计划任务 {TASK_NAME} 本来就不在（或删不掉）"),
+    }
+}
+
+enum Principal {
+    /// `Users` 组：任意账号登录都触发。
+    Users,
+    /// 兜底：只有安装时的那个账号。
+    CurrentUser,
+}
+
+fn task_xml(command: &str, principal: Principal) -> String {
+    let principal = match principal {
+        Principal::Users => {
+            "<GroupId>S-1-5-32-545</GroupId><LogonType>InteractiveToken</LogonType>".to_string()
+        }
+        Principal::CurrentUser => {
+            let user = std::env::var("USERNAME").unwrap_or_else(|_| "user".into());
+            let domain = std::env::var("USERDOMAIN").or_else(|_| std::env::var("COMPUTERNAME")).unwrap_or_default();
+            let who = if domain.is_empty() {
+                user
+            } else {
+                format!("{domain}\\{user}")
+            };
+            format!(
+                "<UserId>{}</UserId><LogonType>InteractiveToken</LogonType>",
+                escape_xml(&who)
+            )
+        }
+    };
+
+    // 延迟 12 秒：登录那几秒系统还在忙，别跟老师的桌面抢资源。
+    // `ExecutionTimeLimit` 给 6 小时：`sfc` 在慢盘上确实能跑很久，
+    // 不能让它被计划任务默认的 72 小时限制以外的东西打断。
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>登录时检查上一次是否蓝屏；有记录就分析、尝试修复并上报。</Description>
+    <URI>\{task}</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <Delay>PT12S</Delay>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      {principal}
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>false</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT6H</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{command}</Command>
+      <Arguments>--crash-report</Arguments>
+    </Exec>
+  </Actions>
+</Task>"#,
+        task = TASK_NAME,
+        principal = principal,
+        command = command
+    )
+}
+
+fn register_task(xml: &str) -> Result<(), String> {
+    // `schtasks /XML` 只认 UTF-16LE（带 BOM）的文件
+    let mut bytes = vec![0xFF, 0xFE];
+    for unit in xml.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    let path = std::env::temp_dir().join(format!("{TASK_NAME}-{}.xml", std::process::id()));
+    fs::write(&path, &bytes).map_err(|e| format!("写任务定义失败：{e}"))?;
+
+    let out = std::process::Command::new("schtasks.exe")
+        .args(["/Create", "/TN", TASK_NAME, "/XML"])
+        .arg(&path)
+        .arg("/F")
+        .output()
+        .map_err(|e| format!("无法调用 schtasks：{e}"));
+    let _ = fs::remove_file(&path);
+    let out = out?;
+
+    if out.status.success() {
+        log::info!("已登记计划任务 {TASK_NAME}");
+        Ok(())
+    } else {
+        Err(format!(
+            "schtasks 返回 {}：{}",
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
+
+/// 计划任务的 XML 里，路径中的 `&`、`<` 会被当成标记。
+fn escape_xml(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 // ---------------------------------------------------------------------------
@@ -666,6 +857,9 @@ pub fn uninstall(dir: &Path, p: &mut dyn Progress) -> Result<(), String> {
         return Err("已取消".into());
     }
     remove_registry(Scope::for_dir(dir));
+    // 计划任务是机器级的，不删的话卸载之后每次登录还会去拉起一个
+    // 已经不存在的 exe（老师看不到任何提示，只会觉得「装了个怪东西」）
+    remove_crash_task();
 
     if !p.step("正在关闭 OpenPPTView…", 48.0) {
         return Err("已取消".into());

@@ -24,6 +24,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod associations;
+mod crash;
+mod crash_repair;
 mod install_pref;
 mod resident;
 mod update;
@@ -1685,7 +1687,9 @@ fn _assert_serde_imports<T: for<'de> Deserialize<'de>>() {}
 /* ---------------- 设置：缓存与日志 ---------------- */
 
 /// 应用数据目录（`%LOCALAPPDATA%\OpenPPTView`）。
-fn data_dir() -> PathBuf {
+///
+/// `pub(crate)`：蓝屏诊断的本地留档也住在它下面（见 [`crash::root_dir`]）。
+pub(crate) fn data_dir() -> PathBuf {
     std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
@@ -1841,6 +1845,56 @@ fn open_log_dir() -> Result<(), String> {
     let dir = log_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("无法创建日志目录：{e}"))?;
     shell_execute(&dir.to_string_lossy(), None)
+}
+
+/* ---------------- 蓝屏诊断 ---------------- */
+
+/// 设置页「蓝屏诊断」那一块的状态。
+#[tauri::command]
+fn crash_settings() -> crash::View {
+    crash::view()
+}
+
+/// 改蓝屏诊断的设置。
+///
+/// 关掉只是写一个开关（登录时仍会被拉起来一次，但**立刻退出**）——
+/// 不去删安装程序登记的计划任务，因为那是机器级的，普通老师没有权限改。
+/// 这样「关掉」在任何账号下都真的生效，也不会出现「关了半天又自己开了」。
+#[tauri::command]
+fn set_crash_settings(
+    enabled: bool,
+    repair: bool,
+    endpoint: String,
+) -> Result<crash::View, String> {
+    let endpoint = endpoint.trim().to_string();
+    if !endpoint.is_empty()
+        && !(endpoint.starts_with("https://") || endpoint.starts_with("http://"))
+    {
+        return Err("上报地址要以 http:// 或 https:// 开头".into());
+    }
+    crash::save_settings(&crash::Settings {
+        enabled,
+        repair,
+        endpoint,
+    })?;
+    Ok(crash::view())
+}
+
+/// 打开蓝屏报告的留档目录（老师/管理员可以直接看到采集了什么）。
+#[tauri::command]
+fn open_crash_dir() -> Result<(), String> {
+    let dir = crash::root_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("无法创建目录：{e}"))?;
+    shell_execute(&dir.to_string_lossy(), None)
+}
+
+/// 诊断界面说「监听挂好了，开始吧」。
+///
+/// 分析必须等这一句：反过来（后端先发进度）的话，WebView 还没注册监听，
+/// 那几条进度就丢了，界面会一直停在「正在分析…」。
+#[tauri::command]
+fn crash_ready(app: tauri::AppHandle) {
+    crash::begin(app);
 }
 
 /* ---------------- 检查更新与一键升级 ---------------- */
@@ -2349,6 +2403,30 @@ fn main() {
     // 日志：开发时输出到 stderr，便于 `cargo tauri dev` 观察
     env_logger_init();
 
+    // 蓝屏诊断：登录时由安装程序登记的那条 `Run` 项拉起来（`--crash-report`）。
+    //
+    // 关键在「没有蓝屏记录就当场退出」：这一步发生在 Tauri 之前，
+    // 所以不会建 WebView2、不会预热导出内核、不会出现任何窗口。
+    // 老师每次开机都要经过这里，它必须轻到察觉不出来。
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(mode) = crash::requested(&args) {
+        if !crash::enabled() {
+            log::info!("蓝屏诊断已在设置里关闭，直接退出");
+            return;
+        }
+        // 先看有没有新的蓝屏：有就马上准备界面（老师开机就能看见）。
+        // 没有才去补送旧报告 —— 那一步可能因为网络慢等上几秒，
+        // 不能让它挡在「有没有东西要显示」之前。
+        match crash::detect(mode) {
+            Some(report) => crash::stash(report),
+            None => {
+                crash::flush_outbox();
+                log::info!("自上次检查以来没有蓝屏记录，退出");
+                return;
+            }
+        }
+    }
+
     // `AppState` 全部字段都有合理的默认值（空文档、空缓存、未预热的转换器）
     let state = AppState::default();
 
@@ -2372,6 +2450,15 @@ fn main() {
             if std::env::args().skip(1).any(|a| a == "--quit") {
                 log::info!("收到 --quit 且无其它实例，直接退出");
                 app.handle().exit(0);
+                return Ok(());
+            }
+
+            // 蓝屏诊断模式：只要那个小窗口。
+            //
+            // 不建托盘、不预热导出内核、不碰文件关联 —— 老师这次开机
+            // 不是来备课的，多做的每一件事都是在拖慢他。
+            if crash::has_pending() {
+                crash::prepare(app.handle().clone());
                 return Ok(());
             }
 
@@ -2445,6 +2532,10 @@ fn main() {
             cache_usage,
             clear_cache,
             open_log_dir,
+            crash_settings,
+            set_crash_settings,
+            open_crash_dir,
+            crash_ready,
             check_update,
             start_update,
             quit_app,

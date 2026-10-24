@@ -1413,6 +1413,119 @@ Task 36 让画面来源换成了「整本矢量 PDF」，画得准了，但把�
 > 本轮按用户要求「直接发布」，**未在本机装包实跑** —— 修复依据是代码审查与
 > `node --check`，上面那份脚本留待随时执行。
 
+## Task 48: 蓝屏后自动分析 + 自动尝试修复（Node.js 后端）—— 已交付
+
+老师的原话是「Windows 系统蓝屏自动尝试修复」——先按「分析 + 上报」做了一版，
+澄清之后补上真正的修复动作。界面（大卡片 → 缩角小条）与探测逻辑沿用，
+把后端从「分析 → 上传」改成「分析 → 修复 → 上报」。
+
+### 一、整条链路
+
+```
+登录（计划任务，12s 延迟，最高权限）
+  └─ 没有蓝屏记录 → 当场退出（不建 WebView2，主窗口也不出现）
+  └─ 有记录 → 建 crash 窗口：「正在分析…」+ 流光「请稍候」
+        └─ 采集现场（事件日志 / 系统信息 / 日志尾部 / 内核转储）
+        └─ 1.5s 后缩到右下角（360×116，ease-out，26 帧）
+             └─ 修复：sfc → DISM ScanHealth（必要时 RestoreHealth）→ chkdsk /scan → 驱动体检
+             └─ 「请稍后，正在将错误发送至服务器…」（最少亮 1.2 秒）
+             └─ POST 整个 zip（元数据在请求头）→ 成功即删本地包
+                  └─ 传不出去就留在 outbox，下次开机静默补送
+```
+
+### 二、修复动作（`crates/ppt-app/src/crash_repair.rs`）
+
+| 步骤 | 命令 | 时长上限 | 说明 |
+| --- | --- | --- | --- |
+| 系统文件 | `sfc /scannow` | 45 分钟 | 用组件存储的正本替换被改坏的文件 |
+| 组件存储检查 | `DISM /Online /Cleanup-Image /ScanHealth` | 20 分钟 | 只看，不动 |
+| 组件存储修复 | `DISM /Online /Cleanup-Image /RestoreHealth` | 30 分钟 | **仅当扫描说「有可修复项」**，离线机房上乱跑等于白等 |
+| 磁盘 | `chkdsk <系统盘> /scan` | 25 分钟 | 只读；发现坏扇区只报告，不卸载卷、不修数据 |
+| 驱动体检 | `Get-CimInstance Win32_PnPEntity` + `Disable-PnpDevice` | 45 / 30 秒 | 只停用 Windows 已判为「无法启动」的**非关键**设备，一次最多 2 个 |
+
+刻意不做的：改引导配置、重装驱动、删用户数据、自动重启、碰磁盘/显示/键鼠/USB 控制器。
+
+驱动体检的停用范围（三条同时满足才动）：
+- 错误码 ∈ {10, 18, 28, 31, 37, 43}（Windows 判它起不来 / 驱动报错）；
+- 设备类不在关键名单（`System`/`DiskDrive`/`HDC`/`Keyboard`/`Mouse`/`Display`/`USB`/`Processor`…）；
+- 厂商不是 Microsoft、且有对应驱动服务（没有服务的多半是固件或虚拟设备，停用没意义）。
+
+报告里会写回恢复命令（`Enable-PnpDevice -InstanceId '…'`），出问题能一键还原。
+
+### 三、权限：改用计划任务（不再写 `Run` 项）
+
+`sfc` / `DISM` / `chkdsk` 都要管理员。`Run` 项只能拿到登录者原本的权限，
+于是改成**登录时触发的计划任务**（`OpenPPTViewCrashReport`）：
+
+- `RunLevel = HighestAvailable`：老师什么都不用点，没有 UAC 弹窗；
+- 主体先按 `Users` 组（`S-1-5-32-545`）登记 —— 机房一台机器多个账号都该诊断；
+  登记失败退回「当前账号」，至少能用；
+- 触发延迟 `PT12S`（登录那几秒别抢桌面资源），执行上限 `PT6H`（sfc 在慢盘上很久）；
+- 卸载时 `schtasks /Delete /F` 一并删掉 —— 留着会让卸载后每次登录去拉起一个
+  已经不存在的 exe。
+
+运行时还会用 `IsUserAnAdmin`（看**本进程令牌**，不是「账号在不在管理员组」）
+再确认一次；拿不到管理员就如实跳过，报告里写「未执行修复：需要管理员权限」，
+分析照常进行。
+
+### 四、演示模式与「本地联调」开关
+
+`--crash-report-demo` 默认**只走流程、不真改机器**。要联调修复链路本身
+（比如在没有血包的机器上验证编码/超时），用 `OPENPPTVIEW_CRASH_FORCE_REPAIR=1`
+显式打开 —— 和 `_DISABLE` / `_ENDPOINT` / `_TOKEN` 一样，是给自己留的开关。
+
+### 五、日志编码：不能按 UTF-8 硬解
+
+`sfc` / `chkdsk` 的中文输出走**控制台 OEM 代码页**（中文机器是 936），
+`DISM` 有时直接吐 UTF-16LE。两种都得认，否则报告里全是问号：
+
+- BOM `FF FE` 或「奇数位大量 0」→ 按 UTF-16LE；
+- 其余走 `MultiByteToWideChar(GetOEMCP(), …)`。
+
+### 六、上报：一个 zip + 请求头
+
+沿用原协议（`POST /api/v1/crash`，`Content-Type: application/zip`，
+`X-Crash-Id / X-App-Version / X-Bugcheck / X-Occurred-At / X-Report-Mode`）。
+包内新增：
+
+```
+summary.json          ← 顶层合并了 repair 字段（服务器只读这一个）
+repair/summary.json   ← admin / steps[] / drivers / verdict
+repair/sfc.log        ← 完整输出（摘要只挑一句，原文留档）
+repair/dism-scan.log
+repair/chkdsk.log
+repair/drivers.json
+```
+
+后端 `server/crash/server.mjs`（零依赖 Node）：流式落盘、96MB 上限、
+`.part` 原子改名、`safeId` 防路径穿越、可选 `Bearer` token。
+
+### 七、验证
+
+- [x] `cargo test -p ppt-app`：**25 passed**，其中 6 条是本轮新增
+  （健康/损坏的 DISM 输出判别、结论行挑选、OEM 936 解码、UTF-16 解码）
+- [x] 中文 OEM 解码用真的 `cmd.exe /c echo 已修复损坏的文件` 验证 ——
+  解出来是「已修复损坏的文件」，不是问号
+- [x] 计划任务 XML 用 `XmlDocument` 解析：`Delay=PT12S`、
+  `RunLevel=HighestAvailable`、`GroupId=S-1-5-32-545`、
+  `Arguments=--crash-report`、`ExecutionTimeLimit=PT6H`、`IgnoreNew` 全部到位
+- [x] 端到端（演示包 + 本机 Node 服务）四段界面全部拍到：
+  `analyzing`（大卡片 620×430，流光「请稍候」）→ `repairing`（小条，日志
+  「诊断窗口已收到右下角：450×145 @ (1447, 852)」，125% DPI 下即逻辑 360×116）
+  → `sending`（「请稍后，正在将错误发送至服务器…」完整不截断）→ `sent`（绿勾）
+- [x] 服务器真的收到包并解开：`summary.json` 顶层带 `repair`，
+  `repair/summary.json` 独立存在，`system.txt` 里 Windows 版本/CPU/BIOS/
+  主板/内存/显卡齐全
+- [x] 权限门：`OPENPPTVIEW_CRASH_FORCE_REPAIR=1` + 普通权限跑 → 日志
+  `修复阶段结束："未执行修复：需要管理员权限"`，一条修复命令都没执行
+- [x] 安装包 `packaging\out\OpenPPTView-Setup.exe` 共 16.99 MB
+  （安装器 1.59 + 主程序 13.64 + 运行环境 1.76）
+
+> 未在本机验证的两点（受环境限制，非代码问题）：
+> ① 计划任务的**实际登记**要管理员权限，当前 shell 的 Administrators 是
+> deny-only，`schtasks /Create` 直接 Access denied —— 只验证了 XML 结构与字段；
+> ② 真实 `sfc` / `chkdsk` 会改系统，没有在开发机上跑。
+
 # Task Dependencies
 
 - Task 2 依赖 Task 1

@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "crash",
+  "description": "蓝屏诊断窗口：只需要事件订阅与最基础的核心能力",
+  "windows": ["crash"],
+  "permissions": ["core:default"]
+}

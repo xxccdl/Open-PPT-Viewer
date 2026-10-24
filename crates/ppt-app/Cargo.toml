@@ -42,6 +42,15 @@ reqwest = { version = "0.13", default-features = false, features = [
 # 校验升级包的 SHA-256：github 的发布信息里带 digest，
 # 对得上才敢让一个要求管理员权限的安装程序跑起来
 sha2 = "0.11.0"
+# 蓝屏报告打成 zip 再上传（转储动辄几十 MB，总不能一次 POST 好几个文件）。
+# 与 `ppt-format-pptx` 的测试用同一套 feature，不额外拉新依赖
+zip = { version = "8.6.0", default-features = false, features = [
+    "deflate",
+    "deflate-flate2",
+    "deflate-flate2-zlib-rs",
+] }
+# 解析 `wevtutil` 的 XML 输出：文本输出的错误码随系统语言变，字段名不变
+quick-xml = "0.42"
 
 # 默认打开方式自动注册：只需读写 HKCU，纯 Rust 实现，无需管理员权限
 [target.'cfg(windows)'.dependencies]
@@ -54,4 +63,8 @@ windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
+    # 蓝屏报告里要写「这台机器多少内存」：`GlobalMemoryStatusEx`
+    "Win32_System_SystemInformation",
+    # 修复日志解码：`sfc` / `chkdsk` 的输出是 OEM 代码页（中文机器上是 936）
+    "Win32_Globalization",
 ] }

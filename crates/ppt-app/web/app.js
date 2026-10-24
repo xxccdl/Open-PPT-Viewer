@@ -155,6 +155,12 @@ const el = {
   updateBarFill: $('update-bar-fill'),
   setCacheTotal: $('set-cache-total'),
   setCacheDetail: $('set-cache-detail'),
+  setCrashEndpoint: $('set-crash-endpoint'),
+  setCrashHint: $('set-crash-hint'),
+  setCrashInput: $('set-crash-endpoint-input'),
+  setCrashRepair: $('set-crash-repair'),
+  btnCrashToggle: $('btn-crash-toggle'),
+  btnCrashRepairToggle: $('btn-crash-repair-toggle'),
   btnDoUpdate: $('btn-do-update'),
 };
 
@@ -4056,6 +4062,7 @@ function bindPresentUi() {
 function openSettings() {
   el.settings.classList.remove('hidden');
   refreshCacheUsage();
+  refreshCrash();
   // 打开就查一次：点进来多半就是想看有没有新版
   refreshUpdate();
 }
@@ -4096,6 +4103,93 @@ async function clearCache(btn) {
     toast('缓存已清理');
   } catch (e) {
     toast(`清理失败：${e}`, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/* ---------- 蓝屏诊断 ---------- */
+
+/**
+ * 读一次蓝屏诊断的状态。
+ *
+ * 这里显示的三件事都是老师真正会问的：开没开、发到哪、有没有没送出去的。
+ * 「本地留了几份」尤其要说 —— 那是「配了地址但传不出去」的唯一痕迹。
+ */
+async function refreshCrash() {
+  try {
+    const st = await invoke('crash_settings');
+    el.setCrashEndpoint.textContent = st.endpoint || '未配置';
+    el.setCrashInput.value = st.endpoint || '';
+    el.btnCrashToggle.textContent = st.enabled ? '关闭' : '开启';
+    el.btnCrashToggle.classList.toggle('strong', st.enabled);
+
+    // 修复开关：没有管理员权限时照样能开，只是下次运行会被跳过
+    el.setCrashRepair.textContent = st.repair
+      ? st.admin
+        ? '已开启（以管理员权限运行）'
+        : '已开启（当前不是管理员，运行时只分析）'
+      : '未开启';
+    el.btnCrashRepairToggle.textContent = st.repair ? '关闭' : '开启';
+    el.btnCrashRepairToggle.classList.toggle('strong', st.repair);
+
+    const parts = [st.enabled ? '已开启（登录时检查）' : '已关闭'];
+    if (st.pending) parts.push(`本地还有 ${st.pending} 份未发出的报告`);
+    el.setCrashHint.textContent = `${parts.join('　·　')}。`;
+  } catch (e) {
+    el.setCrashHint.textContent = `读不到设置：${e}`;
+  }
+}
+
+async function toggleCrash(btn) {
+  btn.disabled = true;
+  try {
+    const cur = await invoke('crash_settings');
+    await invoke('set_crash_settings', {
+      enabled: !cur.enabled,
+      repair: cur.repair,
+      endpoint: cur.endpoint,
+    });
+    await refreshCrash();
+    toast(cur.enabled ? '蓝屏诊断已关闭' : '蓝屏诊断已开启');
+  } catch (e) {
+    toast(`改不了：${e}`, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function toggleCrashRepair(btn) {
+  btn.disabled = true;
+  try {
+    const cur = await invoke('crash_settings');
+    await invoke('set_crash_settings', {
+      enabled: cur.enabled,
+      repair: !cur.repair,
+      endpoint: cur.endpoint,
+    });
+    await refreshCrash();
+    toast(cur.repair ? '自动修复已关闭' : '自动修复已开启');
+  } catch (e) {
+    toast(`改不了：${e}`, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function saveCrashEndpoint(btn) {
+  btn.disabled = true;
+  try {
+    const cur = await invoke('crash_settings');
+    await invoke('set_crash_settings', {
+      enabled: cur.enabled,
+      repair: cur.repair,
+      endpoint: el.setCrashInput.value.trim(),
+    });
+    await refreshCrash();
+    toast('上报地址已保存');
+  } catch (e) {
+    toast(`保存失败：${e}`, true);
   } finally {
     btn.disabled = false;
   }
@@ -4272,6 +4366,28 @@ function bindUi() {
       await invoke('open_log_dir');
     } catch (e) {
       toast(`打不开日志文件夹：${e}`, true);
+    }
+  });
+
+  // 蓝屏诊断
+  el.btnCrashToggle.addEventListener('click', () => toggleCrash(el.btnCrashToggle));
+  el.btnCrashRepairToggle.addEventListener('click', () =>
+    toggleCrashRepair(el.btnCrashRepairToggle)
+  );
+  $('btn-save-crash-endpoint').addEventListener('click', (e) =>
+    saveCrashEndpoint(e.currentTarget)
+  );
+  el.setCrashInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      saveCrashEndpoint($('btn-save-crash-endpoint'));
+    }
+  });
+  $('btn-open-crash').addEventListener('click', async () => {
+    try {
+      await invoke('open_crash_dir');
+    } catch (e) {
+      toast(`打不开报告文件夹：${e}`, true);
     }
   });
 

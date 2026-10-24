@@ -467,6 +467,48 @@
               反馈问题时把它一并发来最有用。
             </p>
           </section>
+
+          <!-- 蓝屏诊断 -->
+          <section class="set-sec">
+            <div class="set-sec-head">
+              <span class="set-sec-title">蓝屏诊断</span>
+              <div class="assoc-actions">
+                <button class="link-btn" id="btn-crash-toggle">关闭</button>
+                <button class="link-btn" id="btn-open-crash">打开报告文件夹</button>
+              </div>
+            </div>
+            <div class="set-row">
+              <span class="set-label">自动尝试修复</span>
+              <span class="set-value" id="set-crash-repair">未开启</span>
+              <button class="link-btn" id="btn-crash-repair-toggle">开启</button>
+            </div>
+            <div class="set-row">
+              <span class="set-label">上报服务器</span>
+              <span class="set-value" id="set-crash-endpoint">未配置</span>
+            </div>
+            <div class="set-inline">
+              <input
+                class="set-input"
+                id="set-crash-endpoint-input"
+                type="text"
+                spellcheck="false"
+                autocomplete="off"
+                placeholder="https://你的服务器/api/v1/crash"
+              />
+              <button class="link-btn" id="btn-save-crash-endpoint">保存</button>
+            </div>
+            <p class="assoc-hint" id="set-crash-hint">正在读取…</p>
+            <p class="assoc-hint">
+              蓝屏后，下次开机自动分析并尝试修复：运行 Windows 自带的系统文件检查、
+              组件存储检查与磁盘只读扫描，停用 Windows 已判定无法启动的非关键设备；
+              然后把蓝屏信息、内核转储、修复日志一起打包发送到上面这个地址。
+              不含课件内容；地址留空则只在本地留档、不发送。
+            </p>
+            <p class="assoc-hint">
+              修复需要管理员权限，安装时已经登记好「登录时以最高权限运行」的计划任务；
+              以普通账号运行时只分析、不修复。
+            </p>
+          </section>
         </div>
       </div>
     </div>

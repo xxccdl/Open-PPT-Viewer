@@ -19,6 +19,12 @@
 # 属于使用者数据，不该跟着源码走
 *.oppv-annot.json
 
+# 蓝屏报告接收服务收到的包（机房部署时才会产生，体积可能很大）
+/server/crash/data/
+
+# 分享/预览工具的中间产物（自动化生成的 zip，不是源码）
+/.trae-html-share-packages/
+
 # 编辑器与系统
 .vscode/
 .idea/

@@ -186,6 +186,19 @@ pub fn on_second_instance(app: &AppHandle, argv: &[String]) {
         return;
     }
 
+    // 蓝屏诊断：登录时拉起的那一份被单实例挡下了，转给正在运行的这一份做。
+    //
+    // 不能走下面的 `show_main_window`：老师不是要打开课件，
+    // 而且没有新的蓝屏记录时应该什么都不发生。
+    if argv
+        .iter()
+        .skip(1)
+        .any(|a| a == crate::crash::FLAG || a == crate::crash::DEMO_FLAG)
+    {
+        crate::crash::raise_if_new(app);
+        return;
+    }
+
     show_main_window(app);
 
     let Some(file) = file_arg(argv) else { return };

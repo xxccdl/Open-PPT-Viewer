@@ -1035,15 +1035,21 @@ fn run(app: AppHandle, report: Report) {
     //
     // 缩角放在**修复之前**：修复（尤其 sfc）可能跑十几分钟，
     // 大卡片挡在教室屏幕中间是不能接受的；缩到角上就不碍事了。
-    emit(
-        &app,
-        "repairing",
-        if settings.repair {
-            "正在准备修复…"
-        } else {
-            "正在准备上传…"
-        },
-    );
+    //
+    // 修复关掉时直接进「正在发送」：这时候不该让界面写「正在尝试修复」——
+    // 老师在设置里明明关了，看到修复字样只会以为关了个寂寞。
+    if settings.repair {
+        emit(&app, "repairing", "正在准备修复…");
+    } else {
+        emit(&app, "sending", "");
+    }
+    // 「正在发送」是什么时候亮起来的：修复关掉时是现在（打包+上传都在这个状态下），
+    // 修复开着时是修完之后（下面那处 emit）。
+    let mut sending_at = if settings.repair {
+        None
+    } else {
+        Some(std::time::Instant::now())
+    };
     shrink_to_corner(&app);
 
     let dir = match rx.recv_timeout(Duration::from_secs(120)) {
@@ -1071,15 +1077,15 @@ fn run(app: AppHandle, report: Report) {
         let outcome =
             crate::crash_repair::run(&dir, report.demo, &mut |msg| emit(&a, "repairing", msg));
         log::info!("修复阶段结束：{}", outcome["verdict"]);
-    } else {
-        emit(&app, "repairing", "自动修复已在设置里关闭，只做上报");
-        std::thread::sleep(Duration::from_millis(700));
     }
 
     emit(&app, "sending", "");
     // 上传成功时「正在发送」可能只闪几十毫秒（局域网服务器）——
     // 那就等于老师根本没看见这句话。给它留一段最短可读时间。
-    let sending_at = std::time::Instant::now();
+    if sending_at.is_none() {
+        sending_at = Some(std::time::Instant::now());
+    }
+    let sending_at = sending_at.unwrap();
 
     let receipt = match finish(&report, &dir) {
         Ok(r) => r,

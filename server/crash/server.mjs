@@ -55,6 +55,21 @@ function safeId(raw) {
   return id;
 }
 
+/**
+ * 请求来自哪台机器。
+ *
+ * 前面挂了 nginx 反代时，`socket.remoteAddress` 永远是 127.0.0.1 ——
+ * 所有报告的来源都变成同一个本机地址，机房排查时就不知道是哪台机器蓝屏的。
+ * 所以取 `X-Forwarded-For` 的第一段（最靠近客户端的那一跳）。
+ */
+function clientIp(req) {
+  const fwd = String(req.headers['x-forwarded-for'] || '')
+    .split(',')[0]
+    .trim();
+  if (fwd) return fwd;
+  return String(req.socket.remoteAddress || '').replace(/^::ffff:/, '');
+}
+
 function authorized(req) {
   if (!TOKEN) return true;
   const h = req.headers['authorization'] || '';
@@ -129,7 +144,7 @@ async function handleUpload(req, res) {
     bugcheck: String(req.headers['x-bugcheck'] || ''),
     occurredAt: String(req.headers['x-occurred-at'] || ''),
     mode: String(req.headers['x-report-mode'] || 'real'),
-    remote: req.socket.remoteAddress || '',
+    remote: clientIp(req),
   };
   await fs.writeFile(metaPath, JSON.stringify(meta, null, 2), 'utf8');
 

@@ -225,32 +225,32 @@ Function OppvMainPage
   !insertmacro OppvKeepButtonsHidden
 
   ; 安装位置
-  ${NSD_CreateLabel} 0 0 100% 14u "$(oppvPathLabel)"
+  ${NSD_CreateLabel} 0 0 100% 13u "$(oppvPathLabel)"
   Pop $0
   SetCtlColors $0 "1D1D1F" transparent
   !insertmacro OppvSetFont $0 11 700
 
-  ${NSD_CreateText} 0 18u -64u 15u "$INSTDIR"
+  ${NSD_CreateText} 0 14u -64u 14u "$INSTDIR"
   Pop $OppvPathCtl
   SetCtlColors $OppvPathCtl "1D1D1F" "FFFFFF"
   !insertmacro OppvSetFont $OppvPathCtl 10 400
 
-  ${NSD_CreateButton} -60u 18u 60u 15u "$(oppvBrowse)"
+  ${NSD_CreateButton} -60u 14u 60u 14u "$(oppvBrowse)"
   Pop $OppvBrowseCtl
   !insertmacro OppvSetFont $OppvBrowseCtl 10 400
   ${NSD_OnClick} $OppvBrowseCtl OppvBrowseClicked
 
   ; 平时怎么操作电脑：三选一，一行放完
-  ${NSD_CreateLabel} 0 42u 100% 14u "$(oppvModeLabel)"
+  ${NSD_CreateLabel} 0 31u 100% 13u "$(oppvModeLabel)"
   Pop $0
   SetCtlColors $0 "1D1D1F" transparent
   !insertmacro OppvSetFont $0 11 700
 
-  ${NSD_CreateRadioButton} 0 60u 33% 12u "$(oppvModeAuto)"
+  ${NSD_CreateRadioButton} 0 46u 33% 11u "$(oppvModeAuto)"
   Pop $OppvModeAutoCtl
-  ${NSD_CreateRadioButton} 33% 60u 33% 12u "$(oppvModeTouch)"
+  ${NSD_CreateRadioButton} 33% 46u 33% 11u "$(oppvModeTouch)"
   Pop $OppvModeTouchCtl
-  ${NSD_CreateRadioButton} 66% 60u -1u 12u "$(oppvModeMouse)"
+  ${NSD_CreateRadioButton} 66% 46u -1u 11u "$(oppvModeMouse)"
   Pop $OppvModeMouseCtl
   ${NSD_Check} $OppvModeAutoCtl
   !insertmacro OppvSetFont $OppvModeAutoCtl 10 400
@@ -258,23 +258,25 @@ Function OppvMainPage
   !insertmacro OppvSetFont $OppvModeMouseCtl 10 400
 
   ; 一条浅灰细线：把「装到哪」和「怎么用」分成两段
-  ${NSD_CreateLabel} 0 78u 100% 1u ""
+  ${NSD_CreateLabel} 0 60u 100% 1u ""
   Pop $0
   SetCtlColors $0 "" "E3E4EA"
 
-  ${NSD_CreateCheckbox} 0 86u 100% 14u "$(oppvDesktop)"
+  ${NSD_CreateCheckbox} 0 67u 100% 13u "$(oppvDesktop)"
   Pop $OppvDesktopCtl
   ${NSD_Check} $OppvDesktopCtl
   !insertmacro OppvSetFont $OppvDesktopCtl 10 400
 
   ; 说明文字压暗一档：它是注解，不该和选项抢注意力
-  ${NSD_CreateLabel} 0 106u 100% 22u "$(oppvHint)"
+  ${NSD_CreateLabel} 0 83u 100% 22u "$(oppvHint)"
   Pop $OppvHintCtl
   SetCtlColors $OppvHintCtl "6E6E73" transparent
   !insertmacro OppvSetFont $OppvHintCtl 9 400
 
-  ; 主角：开始安装。占满整行、34u 高、14pt 加粗
-  ${NSD_CreateButton} 0 132u 100% 34u "$(oppvInstallNow)"
+  ; 主角：开始安装。占满整行、31u 高、14pt 加粗。
+  ; 页面可用高度只有 140u（MUI 内页固定），底部按钮必须落在 138u 以内，
+  ; 否则高 DPI 下会被向导底栏切掉。
+  ${NSD_CreateButton} 0 107u 100% 31u "$(oppvInstallNow)"
   Pop $OppvMainBtn
   !insertmacro OppvSetFont $OppvMainBtn 14 700
   SendMessage $OppvMainBtn ${BM_SETSTYLE} ${BS_DEFPUSHBUTTON} 1
@@ -390,27 +392,28 @@ Function OppvDonePage
     Abort
   ${EndIf}
 
-  ${NSD_CreateLabel} 0 0 100% 18u "$(oppvDoneBody)"
+  ${NSD_CreateLabel} 0 0 100% 16u "$(oppvDoneBody)"
   Pop $0
   SetCtlColors $0 "1D1D1F" transparent
   !insertmacro OppvSetFont $0 13 700
 
-  ${NSD_CreateLabel} 0 26u 100% 32u "$(oppvDoneHow)"
+  ${NSD_CreateLabel} 0 20u 100% 28u "$(oppvDoneHow)"
   Pop $0
   SetCtlColors $0 "1D1D1F" transparent
   !insertmacro OppvSetFont $0 11 400
 
-  ${NSD_CreateLabel} 0 64u 100% 30u "$(oppvDoneNote)"
+  ${NSD_CreateLabel} 0 51u 100% 26u "$(oppvDoneNote)"
   Pop $0
   SetCtlColors $0 "6E6E73" transparent
   !insertmacro OppvSetFont $0 9 400
 
-  ${NSD_CreateCheckbox} 0 100u 100% 14u "$(oppvDoneOpen)"
+  ${NSD_CreateCheckbox} 0 80u 100% 13u "$(oppvDoneOpen)"
   Pop $OppvDoneOpenCtl
   ${NSD_Check} $OppvDoneOpenCtl
   !insertmacro OppvSetFont $OppvDoneOpenCtl 11 400
 
-  ${NSD_CreateButton} 0 132u 100% 34u "$(oppvDoneButton)"
+  ; 同主页面：底部按钮必须落在 138u 以内，避免被向导底栏切掉
+  ${NSD_CreateButton} 0 107u 100% 31u "$(oppvDoneButton)"
   Pop $OppvDoneBtn
   !insertmacro OppvSetFont $OppvDoneBtn 14 700
   SendMessage $OppvDoneBtn ${BM_SETSTYLE} ${BS_DEFPUSHBUTTON} 1

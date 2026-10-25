@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <title>蓝屏档案 · OpenPPTView</title>
+    <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="./style.css?v=20261025b" />
+  </head>
+  <body>
+    <!-- 启动态：查询会话的那一两百毫秒 -->
+    <div id="boot" class="boot">
+      <div class="boot-mark" aria-hidden="true"></div>
+      <p>正在打开档案…</p>
+    </div>
+
+    <!-- 登录 / 注册 -->
+    <div id="auth" class="auth hidden">
+      <div class="auth-art">
+        <div class="auth-brand">
+          <svg viewBox="0 0 32 32" class="brand-mark" aria-hidden="true">
+            <rect x="3" y="5" width="26" height="18" rx="3" />
+            <path d="M12 27h8M16 23v4" />
+            <path d="M7 14l4-4 3 3 4-5 3 4 4-3" />
+          </svg>
+          <div class="brand-text">
+            <strong>蓝屏档案</strong>
+            <span>CRASH ARCHIVE</span>
+          </div>
+        </div>
+        <p class="auth-quote">
+          教室里那台机器<br />
+          为什么会蓝屏 ——<br />
+          <em>这里看得到。</em>
+        </p>
+        <ul class="auth-points">
+          <li>每一次蓝屏的错误码、现场与修复结果</li>
+          <li>应用日志里的异常行，自动挑出来</li>
+          <li>按机器、版本、错误码归类，一眼看出是哪批机器</li>
+        </ul>
+        <div class="auth-foot">OpenPPTView · 课件讲演器</div>
+      </div>
+
+      <div class="auth-panel">
+        <form id="auth-form" class="auth-card" autocomplete="on">
+          <h1 id="auth-title">登录后台</h1>
+          <p id="auth-hint" class="auth-hint">输入账号继续。</p>
+
+          <label class="field">
+            <span>用户名</span>
+            <input id="auth-user" name="username" autocomplete="username" required minlength="2" />
+          </label>
+          <label class="field">
+            <span>密码</span>
+            <input
+              id="auth-pass"
+              name="password"
+              type="password"
+              autocomplete="current-password"
+              required
+              minlength="8"
+            />
+          </label>
+          <p id="auth-error" class="auth-error" role="alert"></p>
+
+          <button id="auth-submit" class="btn btn-primary btn-block" type="submit">登录</button>
+          <button id="auth-switch" class="link-btn" type="button">还没有账号？创建一个</button>
+        </form>
+      </div>
+    </div>
+
+    <!-- 主界面 -->
+    <div id="app" class="shell hidden">
+      <aside class="rail">
+        <div class="rail-brand">
+          <svg viewBox="0 0 32 32" class="brand-mark" aria-hidden="true">
+            <rect x="3" y="5" width="26" height="18" rx="3" />
+            <path d="M12 27h8M16 23v4" />
+            <path d="M7 14l4-4 3 3 4-5 3 4 4-3" />
+          </svg>
+          <div class="brand-text">
+            <strong>蓝屏档案</strong>
+            <span>CRASH ARCHIVE</span>
+          </div>
+        </div>
+
+        <nav class="rail-nav" id="nav">
+          <a href="#/overview" data-view="overview">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19V9M10 19V5M16 19v-7M22 19H2" /></svg>
+            概览
+          </a>
+          <a href="#/crashes" data-view="crashes">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <rect x="3.5" y="4.5" width="17" height="15" rx="2" />
+              <path d="M3.5 9.5h17M8 14h8" />
+            </svg>
+            报告
+            <span class="nav-badge" id="nav-pending" hidden></span>
+          </a>
+          <a href="#/users" data-view="users" id="nav-users" hidden>
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <circle cx="9" cy="8" r="3.2" />
+              <path d="M3.5 19c.6-3.2 2.8-5 5.5-5s4.9 1.8 5.5 5" />
+              <path d="M16 11.2a3 3 0 1 0-1.2-5.7M17.5 19c-.2-1.6-.7-2.9-1.5-3.9 2.3.1 4 1.8 4.5 3.9z" />
+            </svg>
+            成员
+          </a>
+          <a href="#/account" data-view="account">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <circle cx="12" cy="12" r="3" />
+              <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1A1.7 1.7 0 0 0 4.6 9a1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z" />
+            </svg>
+            账号
+          </a>
+        </nav>
+
+        <div class="rail-foot">
+          <span id="rail-version">OpenPPTView</span>
+          <span id="rail-user">—</span>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div class="crumb">
+            <span id="crumb-root">档案</span>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6" /></svg>
+            <strong id="crumb-page">概览</strong>
+          </div>
+          <div class="topbar-actions">
+            <button class="icon-btn" id="btn-refresh" title="刷新" aria-label="刷新">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M20 12a8 8 0 1 1-2.3-5.6" />
+                <path d="M20 4v5h-5" />
+              </svg>
+            </button>
+            <span class="who" id="who">—</span>
+  </div>
+        </header>
+
+        <div id="view" class="view"></div>
+      </main>
+    </div>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+    <script type="module" src="./app.js?v=20261025b"></script>
+  </body>
+</html>

@@ -107,6 +107,11 @@ pub struct Settings {
     /// 上报地址。空 = 用 [`DEFAULT_ENDPOINT`]。
     #[serde(default = "default_endpoint")]
     pub endpoint: String,
+    /// 实验性：引导类蓝屏后，准备一次 openFixOS 离线修复（见 `crate::fixos`）。
+    ///
+    /// 默认关闭：它要改 Windows 恢复环境的指向、还要重启，属于「宁可不开」的那类开关。
+    #[serde(default)]
+    pub boot_fix: bool,
 }
 
 fn default_true() -> bool {
@@ -136,6 +141,7 @@ impl Default for Settings {
             enabled: true,
             repair: true,
             endpoint: default_endpoint(),
+            boot_fix: false,
         }
     }
 }
@@ -244,6 +250,12 @@ pub struct Report {
     pub has_dump: bool,
     /// 演示模式产生的：服务器一眼能认出来，别当真问题去查。
     pub demo: bool,
+    /// 这次蓝屏的指纹（`bsod:<时刻>:<错误码>` 或 `dump:<文件名>`）。
+    ///
+    /// 上报成功后才写进 `state.json` 的 `seen`，用来保证「一次蓝屏只报一次」，
+    /// 也保证**检查跑早了（事件日志还没落盘）不会把这次蓝屏永久跳过**。
+    #[serde(default)]
+    pub fingerprint: String,
 }
 
 /// 转储文件路径（只在本次进程里用，不写进报告）。
@@ -254,15 +266,38 @@ struct DumpFile {
     modified: u64,
 }
 
+impl DumpFile {
+    fn file_name(&self) -> Option<String> {
+        self.path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* 探测                                                                */
 /* ------------------------------------------------------------------ */
 
+/// 每次检查回看这么久。
+///
+/// 以前是「从上次检查那一刻往后看」，看起来更省事，实际有个坑：
+/// 开机时事件日志可能还没落盘（Windows 写 1001 事件要几秒），那一轮检查
+/// 什么都没看到，却把游标推到了此刻 —— 这次蓝屏就**永远**漏掉了。
+/// 改成固定回看一段窗口，再靠 `seen` 去重：查早了没关系，下一次还会看到。
+const LOOKBACK: u64 = 7 * 24 * 3600;
+
+/// `seen` 最多记多少条指纹（只用于去重，不必无限长）。
+const MAX_SEEN: usize = 64;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Marker {
-    /// 上次检查到的时刻（Unix 秒）。只看这之后发生的事。
+    /// 上次检查的时刻（Unix 秒）。只用于设置页展示，不再作为「看到这里为止」的依据。
+    #[serde(default)]
     last_check: u64,
+    /// 已经上报过的蓝屏指纹。老版本没有这个字段，默认空即可。
+    #[serde(default)]
+    seen: Vec<String>,
 }
 
 fn read_marker() -> Option<Marker> {
@@ -271,19 +306,104 @@ fn read_marker() -> Option<Marker> {
         .and_then(|t| serde_json::from_str::<Marker>(&t).ok())
 }
 
-/// 记下「已经查到这一刻」，下次不再重复报同一次蓝屏。
-///
-/// 只在**包已经生成之后**才推进：万一分析中途进程没了，
-/// 下次开机还能把这次蓝屏重新捡起来。
-fn write_marker(now: u64) {
+/// 记下「刚刚查过」，并保留已上报指纹。
+fn touch_marker(now: u64, seen: &[String]) {
     let _ = std::fs::create_dir_all(root_dir());
-    let m = Marker { last_check: now };
+    let m = Marker {
+        last_check: now,
+        seen: seen.to_vec(),
+    };
     if let Ok(t) = serde_json::to_string(&m) {
         let _ = std::fs::write(state_path(), t);
     }
 }
 
-/// 看看自上次检查以来有没有蓝屏。
+/// 这份报告已经完整生成（包已落地）—— 把它的指纹记下来，以后不再重复报。
+///
+/// 只在**包已经生成之后**才记：万一分析中途进程没了，下次开机还能重新捡起来。
+fn mark_seen(report: &Report) {
+    if report.demo {
+        return;
+    }
+    let mut marker = read_marker().unwrap_or_default();
+    if !report.fingerprint.is_empty() && !marker.seen.contains(&report.fingerprint) {
+        marker.seen.push(report.fingerprint.clone());
+        while marker.seen.len() > MAX_SEEN {
+            marker.seen.remove(0);
+        }
+    }
+    touch_marker(now_epoch(), &marker.seen);
+}
+
+fn event_key(e: &BugCheckEvent) -> String {
+    format!("bsod:{}:{}", e.epoch, e.code)
+}
+
+fn dump_key(d: &DumpFile) -> String {
+    let name = d
+        .file_name()
+        .unwrap_or_else(|| format!("{}.dmp", d.modified));
+    format!("dump:{name}")
+}
+
+/// 一条待处理的蓝屏（事件或转储推出来的）。
+#[derive(Debug, Clone)]
+struct PendingBsod {
+    epoch: u64,
+    bugcheck: String,
+    fingerprint: String,
+    has_dump: bool,
+}
+
+/// 从「事件 + 转储」里挑出最近一次**还没上报过**的蓝屏。
+///
+/// 刻意只看最近的一条：老师需要知道的是「刚才那次为什么蓝屏」，
+/// 不是把过去一周的历史一次补齐。若改成逐条回填，升级后的机器会
+/// 每启动一次就补报一条旧记录，服务器上反而更乱。
+///
+/// 抽成纯函数是为了能直接测：真实的事件日志在开发机上不一定有蓝屏记录，
+/// 而这段挑选逻辑恰恰是「第二次蓝屏没反应」的根源所在。
+fn pick_bsod(
+    events: &[BugCheckEvent],
+    dumps: &[DumpFile],
+    seen: &[String],
+    since: u64,
+) -> Option<PendingBsod> {
+    // 1) 事件日志里最近的一条（它带错误码，信息最全）
+    let newest = events
+        .iter()
+        .filter(|e| e.epoch >= since && e.epoch > 0)
+        .max_by_key(|e| e.epoch);
+
+    if let Some(e) = newest {
+        if seen.iter().any(|s| s == &event_key(e)) {
+            return None;
+        }
+        return Some(PendingBsod {
+            epoch: e.epoch,
+            bugcheck: e.code.clone(),
+            fingerprint: event_key(e),
+            has_dump: dumps.iter().any(|d| d.modified >= since),
+        });
+    }
+
+    // 2) 没有可用事件：退而看最近的一份转储（事件日志被清过、或读不到事件时）
+    let newest_dump = dumps
+        .iter()
+        .filter(|d| d.modified >= since)
+        .max_by_key(|d| d.modified);
+
+    newest_dump
+        .filter(|d| !seen.iter().any(|s| s == &dump_key(d)))
+        .map(|d| PendingBsod {
+            epoch: d.modified,
+            bugcheck: "未知（未读到蓝屏事件）".to_string(),
+            fingerprint: dump_key(d),
+            has_dump: true,
+        })
+}
+
+/// 看看最近有没有还没处理过的蓝屏。
 ///
 /// 两条证据互相补位：事件日志是「系统自己说它蓝屏了」（通常最准），
 /// 转储文件是「现场确实留下了东西」。有的机器事件日志被清理工具
@@ -299,42 +419,39 @@ pub fn detect(mode: Mode) -> Option<Report> {
             occurred_at: iso_utc(now),
             has_dump: false,
             demo: true,
+            fingerprint: format!("demo:{now}"),
         });
     }
 
-    // 第一次跑：只回看最近 24 小时，别把几个月前的旧账翻出来
-    let since = read_marker()
-        .map(|m| m.last_check)
-        .filter(|v| *v > 0)
-        .unwrap_or_else(|| now.saturating_sub(24 * 3600));
+    let marker = read_marker().unwrap_or_default();
+    // 第一次跑只回看 24 小时：别把装机镜子里几个月前的旧账翻出来。
+    // 之后每次都看最近 7 天 —— 反正靠 `seen` 去重，看宽一点才不会漏。
+    let window = if marker.last_check == 0 {
+        24 * 3600
+    } else {
+        LOOKBACK
+    };
+    let since = now.saturating_sub(window);
 
     let events = bugcheck_events().unwrap_or_default();
-    let hit = events
-        .iter()
-        .filter(|e| e.epoch >= since)
-        .max_by_key(|e| e.epoch);
-
     let dumps = recent_dumps(since);
-    if hit.is_none() && dumps.is_empty() {
-        // 没有新东西：把游标推到此刻，下次只看更新的
-        write_marker(now);
-        return None;
-    }
 
-    let (bugcheck, occurred_at) = match hit {
-        Some(e) => (e.code.clone(), e.time.clone()),
-        None => (
-            "未知（未读到蓝屏事件）".to_string(),
-            iso_utc(dumps.first().map(|d| d.modified).unwrap_or(now)),
-        ),
+    let Some(hit) = pick_bsod(&events, &dumps, &marker.seen, since) else {
+        // 没有新东西：只更新「上次检查时刻」，不动 seen
+        touch_marker(now, &marker.seen);
+        return None;
     };
 
+    // 报告 id 用**蓝屏发生时刻**，不是「现在」：
+    // 同一场蓝屏无论被检查几次（比如上次分析到一半断电），都落在同一个 id 上，
+    // 服务器上不会出现两条看起来一模一样的记录。
     Some(Report {
-        id: stamp(now),
-        bugcheck,
-        occurred_at,
-        has_dump: !dumps.is_empty(),
+        id: stamp(hit.epoch),
+        bugcheck: hit.bugcheck,
+        occurred_at: iso_utc(hit.epoch),
+        has_dump: hit.has_dump,
         demo: false,
+        fingerprint: hit.fingerprint,
     })
 }
 
@@ -600,7 +717,10 @@ pub fn collect(report: &Report) -> Result<PathBuf, String> {
         }
     }
 
-    // 4. 内核转储：只带最近几个，总量封顶。
+    // 4. 上次 openFixOS 的修复结果（如果有）：一并带走，服务器上能看到「修了什么」
+    crate::fixos::take_result_into(&dir);
+
+    // 5. 内核转储：只带最近几个，总量封顶。
     //    说明一下为什么敢传：这是内核内存镜像，可能含少量用户态残留；
     //    设置页写明了「会上传内存转储」，关掉开关就什么都不传。
     let dumps = recent_dumps(0);
@@ -698,10 +818,8 @@ pub fn finish(report: &Report, dir: &Path) -> Result<Receipt, String> {
     let bytes = std::fs::metadata(&zip_path).map(|m| m.len()).unwrap_or(0);
 
     // 包裹已经落地，这一页可以翻过去了。
-    // 演示模式不推进游标 —— 否则真蓝屏的记录会被一次演示测试「吃掉」
-    if !report.demo {
-        write_marker(now_epoch());
-    }
+    // 演示模式不记指纹 —— 否则真蓝屏的记录会被一次演示测试「吃掉」
+    mark_seen(report);
 
     // 上传时要靠它填请求头，所以一起放在 outbox 里
     let sidecar = outbox.join(format!("{}.json", report.id));
@@ -797,6 +915,73 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> s
     Ok(())
 }
 
+/// 主板/整机的序列号与 UUID —— 只在注册表没有的时候才去问 SMBIOS。
+///
+/// 为什么不用注册表了事：`HKLM\HARDWARE\DESCRIPTION\System\BIOS` 在老机器上
+/// 往往没有 `BaseBoardSerialNumber`（这台 HP 就没有），而机房里「哪台机器」
+/// 恰恰要靠序列号 / UUID 认。走一次 `Get-CimInstance` 大约 1 秒，
+/// 只在采集报告时发生，可以接受。
+#[derive(Debug, Default)]
+struct Smbios {
+    /// 主板序列号。
+    board: String,
+    /// 整机序列号（BIOS 里的那个）。
+    serial: String,
+    /// 硬件 UUID：重装系统也不变，是「同一台机器」最可靠的标识。
+    uuid: String,
+}
+
+fn smbios_info() -> Smbios {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let script = "$ErrorActionPreference='SilentlyContinue'; \
+        $b=(Get-CimInstance Win32_BaseBoard).SerialNumber; \
+        $s=(Get-CimInstance Win32_BIOS).SerialNumber; \
+        $u=(Get-CimInstance Win32_ComputerSystemProduct).UUID; \
+        [pscustomobject]@{board=$b;serial=$s;uuid=$u} | ConvertTo-Json -Compress";
+
+    let out = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    let Ok(out) = out else {
+        return Smbios::default();
+    };
+    if !out.status.success() {
+        return Smbios::default();
+    }
+
+    let text = String::from_utf8_lossy(&out.stdout);
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text.trim()) else {
+        return Smbios::default();
+    };
+    let pick = |key: &str| -> String {
+        let raw = v.get(key).and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+        if is_placeholder(&raw) {
+            String::new()
+        } else {
+            raw
+        }
+    };
+    Smbios {
+        board: pick("board"),
+        serial: pick("serial"),
+        uuid: pick("uuid"),
+    }
+}
+
+/// SMBIOS 没填时常见的一串占位值，按「没有」处理。
+fn is_placeholder(v: &str) -> bool {
+    let t = v.trim().to_ascii_uppercase();
+    t.is_empty()
+        || t == "NONE"
+        || t == "DEFAULT STRING"
+        || t == "TO BE FILLED BY O.E.M."
+        || t == "SYSTEM SERIAL NUMBER"
+        || t.chars().all(|c| c == '0' || c == '-' || c == 'F')
+}
+
 /// 系统版本、补丁、CPU、内存、显卡。
 ///
 /// 都从注册表/系统 API 读，不跑 `systeminfo`：那个命令要好几秒，
@@ -861,6 +1046,70 @@ fn system_info() -> Vec<(String, String)> {
         }
     }
 
+    // 序列号：注册表有就用注册表的，没有就问一次 SMBIOS
+    // （这台 HP 的注册表里就没有，直接读会少两条最有用的信息）
+    const BIOS_KEY: &str = "HARDWARE\\DESCRIPTION\\System\\BIOS";
+    let registry_board = reg_string("HKLM", BIOS_KEY, "BaseBoardSerialNumber")
+        .filter(|v| !is_placeholder(v))
+        .unwrap_or_default();
+    let registry_sys = reg_string("HKLM", BIOS_KEY, "SystemSerialNumber")
+        .filter(|v| !is_placeholder(v))
+        .unwrap_or_default();
+
+    let smbios = if registry_board.is_empty() || registry_sys.is_empty() {
+        smbios_info()
+    } else {
+        // 两个都有，就不必再花一秒去问 WMI
+        Smbios::default()
+    };
+
+    let board_serial = if registry_board.is_empty() {
+        smbios.board.clone()
+    } else {
+        registry_board
+    };
+    let system_serial = if registry_sys.is_empty() {
+        smbios.serial.clone()
+    } else {
+        registry_sys
+    };
+    if !board_serial.is_empty() {
+        out.push(("主板序列号".into(), board_serial.clone()));
+    }
+    if !system_serial.is_empty() {
+        out.push(("系统序列号".into(), system_serial.clone()));
+    }
+    if !smbios.uuid.is_empty() {
+        out.push(("硬件 UUID".into(), smbios.uuid.clone()));
+    }
+
+    // 计算机名：机房里靠它跟座位对上号，比 IP 稳定
+    if let Ok(name) = std::env::var("COMPUTERNAME") {
+        let name = name.trim().to_string();
+        if !name.is_empty() {
+            out.push(("计算机名".into(), name));
+        }
+    }
+
+    // 机器码（HWID）：把「这台机器是谁」压成一个短串。
+    //
+    // 靠 IP 认不准（DHCP 会换），靠长序列号又在界面上念不出来。
+    // 输入取「装系统后不变」的 MachineGuid、硬件 UUID、主板/整机序列号 ——
+    // 重装系统会变（MachineGuid 换了），换主板也会变，
+    // 但足够回答「是不是同一台机器在反复崩」。
+    let hwid = machine_id(&[
+        reg_string(
+            "HKLM",
+            "SOFTWARE\\Microsoft\\Cryptography",
+            "MachineGuid",
+        ),
+        Some(smbios.uuid.clone()),
+        Some(board_serial),
+        Some(system_serial),
+        std::env::var("COMPUTERNAME").ok(),
+    ]);
+    out.push(("机器码".into(), hwid));
+
     if let Some(mb) = total_ram_mb() {
         out.push(("内存".into(), format!("{mb} MB")));
     }
@@ -875,6 +1124,34 @@ fn system_info() -> Vec<(String, String)> {
         out.push(("显卡".into(), gpus.join(" / ")));
     }
     out
+}
+
+/// 几个能标识这台机器的字符串 → 一个固定长度的机器码。
+///
+/// 用 SHA-256 的前 16 位十六进制，按 `XXXX-XXXX-XXXX-XXXX` 分组：
+/// 老师看得懂、抄得下来，也不会长到在界面上换行。
+/// 输入全部缺失时如实说「读不到」，不编一个假码 —— 假码会让两台机器撞在一起。
+fn machine_id(parts: &[Option<String>]) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    let mut used = 0;
+    for part in parts.iter().flatten() {
+        let v = part.trim().to_lowercase();
+        if v.is_empty() {
+            continue;
+        }
+        hasher.update(v.as_bytes());
+        hasher.update(b"|");
+        used += 1;
+    }
+    if used == 0 {
+        return "未知（读不到硬件标识）".into();
+    }
+
+    let digest = hasher.finalize();
+    let hex: String = digest.iter().take(8).map(|b| format!("{b:02X}")).collect();
+    format!("{}-{}-{}-{}", &hex[0..4], &hex[4..8], &hex[8..12], &hex[12..16])
 }
 
 fn reg_string(root: &str, path: &str, value: &str) -> Option<String> {
@@ -1397,6 +1674,32 @@ pub fn spawn_outbox_flush() {
     });
 }
 
+/// 应用正常启动时，顺手补查一次有没有没处理过的蓝屏。
+///
+/// # 为什么还要这一道
+///
+/// 「登录时跑一次」依赖 Windows 把计划任务叫起来：任务被组策略禁用、
+/// 快速启动没真正走登录、清理软件把任务删了、或者那一次进程被安全软件拦了 ——
+/// 任何一种都会让老师看到「蓝屏了，重启后什么也没发生」。
+/// 而**老师每天都会打开这个应用**，所以这里再兜一道：
+/// 查到就静默分析（不弹窗、不退出应用），至少报告能送到服务器、能修的顺手修掉。
+pub fn spawn_startup_check(app: AppHandle) {
+    if !enabled() || has_pending() {
+        return;
+    }
+    std::thread::spawn(move || {
+        if STARTED.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let Some(report) = detect(Mode::Real) else {
+            STARTED.store(false, Ordering::SeqCst);
+            return;
+        };
+        log::info!("应用启动时发现待处理的蓝屏：{}", report.id);
+        run(app, report, false);
+    });
+}
+
 /// 上次没送出去的包，这次开机再试一遍。
 ///
 /// 成功就删掉；失败就留着 —— 但**不弹界面**，老师是来上课的，
@@ -1570,7 +1873,7 @@ pub fn begin(app: AppHandle) {
         close_window(&app);
         return;
     };
-    std::thread::spawn(move || run(app, report));
+    std::thread::spawn(move || run(app, report, true));
 }
 
 /// 收掉诊断窗口，并把主窗口还回去（如果它还在的话）。
@@ -1583,7 +1886,14 @@ fn close_window(app: &AppHandle) {
     }
 }
 
-fn run(app: AppHandle, report: Report) {
+/// 跑完一次分析（采集 → 修复 → 打包 → 上报）。
+///
+/// `ui`：有没有那个缩在角上的诊断窗口。
+///
+/// 登录自检那条路有窗口（老师开机时看得见它在做什么）；而「应用正常启动时
+/// 顺手补查一次」没有窗口 —— 那时老师可能正站在讲台上放课件，
+/// 弹一块「正在分析」出来是灾难。两种情况下做的事完全一样，只是有没有画面。
+fn run(app: AppHandle, report: Report, ui: bool) {
     log::info!(
         "开始分析蓝屏报告 {}（{}，演示={}）",
         report.id,
@@ -1591,7 +1901,9 @@ fn run(app: AppHandle, report: Report) {
         report.demo
     );
     let settings = load_settings();
-    emit(&app, "analyzing", "");
+    if ui {
+        emit(&app, "analyzing", "");
+    }
 
     // 采集放到另一条线程：界面要在这段时间里先亮着「正在分析…」，
     // 然后在 1.5 秒后缩到角上 —— 打包大转储可能要好几秒，不能卡住动画。
@@ -1601,7 +1913,9 @@ fn run(app: AppHandle, report: Report) {
         let _ = tx.send(collect(&for_worker));
     });
 
-    std::thread::sleep(INTRO_HOLD);
+    if ui {
+        std::thread::sleep(INTRO_HOLD);
+    }
 
     // 「启动分析后，页面自动退出，优雅缩小到系统右下角」
     //
@@ -1610,10 +1924,12 @@ fn run(app: AppHandle, report: Report) {
     //
     // 修复关掉时直接进「正在发送」：这时候不该让界面写「正在尝试修复」——
     // 老师在设置里明明关了，看到修复字样只会以为关了个寂寞。
-    if settings.repair {
-        emit(&app, "repairing", "正在准备修复…");
-    } else {
-        emit(&app, "sending", "");
+    if ui {
+        if settings.repair {
+            emit(&app, "repairing", "正在准备修复…");
+        } else {
+            emit(&app, "sending", "");
+        }
     }
     // 「正在发送」是什么时候亮起来的：修复关掉时是现在（打包+上传都在这个状态下），
     // 修复开着时是修完之后（下面那处 emit）。
@@ -1622,7 +1938,9 @@ fn run(app: AppHandle, report: Report) {
     } else {
         Some(std::time::Instant::now())
     };
-    shrink_to_corner(&app);
+    if ui {
+        shrink_to_corner(&app);
+    }
 
     // 采集失败也继续往下走：先落一个最小报告，修复照跑、上传照发。
     // 「这台机器蓝屏了但我们没采到现场」本身就是要告诉服务器的事。
@@ -1640,7 +1958,11 @@ fn run(app: AppHandle, report: Report) {
 
     // 修复。演示模式在 repair 内部直接跳过 —— 一次演示测试
     // 不该去动一台老师的机器。
-    if settings.repair {
+    //
+    // 只在那条「开机自检」的界面流程里修：静默补查（应用正常启动时）时老师
+    // 很可能正在上课，`sfc` 这类命令要占满磁盘和 CPU 十几分钟。
+    // 静默那一轮只负责「把现场送出去」，修复留给下次开机。
+    if settings.repair && ui {
         let a = app.clone();
         let skip = std::sync::Arc::new(crate::crash_repair::SkipControl::new());
         if let Ok(mut slot) = SKIP.lock() {
@@ -1669,7 +1991,9 @@ fn run(app: AppHandle, report: Report) {
         let _ = app.emit("crash-skip-closed", ());
     }
 
-    emit(&app, "sending", "");
+    if ui {
+        emit(&app, "sending", "");
+    }
     // 上传成功时「正在发送」可能只闪几十毫秒（局域网服务器）——
     // 那就等于老师根本没看见这句话。给它留一段最短可读时间。
     if sending_at.is_none() {
@@ -1688,9 +2012,11 @@ fn run(app: AppHandle, report: Report) {
                 Ok(r) => r,
                 Err(e2) => {
                     log::warn!("最小包也没打成（只能留本地）：{e2}");
-                    emit(&app, "failed", &format!("报告没能打包：{e2}"));
-                    std::thread::sleep(OUTRO_HOLD + Duration::from_millis(1200));
-                    app.exit(0);
+                    if ui {
+                        emit(&app, "failed", &format!("报告没能打包：{e2}"));
+                        std::thread::sleep(OUTRO_HOLD + Duration::from_millis(1200));
+                    }
+                    end_run(&app, ui);
                     return;
                 }
             }
@@ -1700,20 +2026,54 @@ fn run(app: AppHandle, report: Report) {
     match upload(&receipt, &report) {
         Ok(()) => {
             log::info!("蓝屏报告已发送：{}", receipt.id);
-            hold_phase(sending_at, 1200);
-            emit(&app, "sent", "");
+            if ui {
+                hold_phase(sending_at, 1200);
+                emit(&app, "sent", "");
+            }
             let _ = std::fs::remove_file(&receipt.zip);
             let _ = std::fs::remove_file(receipt.zip.with_extension("json"));
-            std::thread::sleep(OUTRO_HOLD);
+            if ui {
+                std::thread::sleep(OUTRO_HOLD);
+            }
         }
         Err(e) => {
             log::warn!("蓝屏报告发送失败（留在本地，下次开机再试）：{e}");
-            emit(&app, "failed", &e);
-            std::thread::sleep(OUTRO_HOLD + Duration::from_millis(1500));
+            if ui {
+                emit(&app, "failed", &e);
+                std::thread::sleep(OUTRO_HOLD + Duration::from_millis(1500));
+            }
         }
     }
 
-    app.exit(0);
+    // 引导类蓝屏：武装一次 openFixOS（实验性，默认关）。
+    //
+    // 镜像在开关打开时就装好了，这里正常只是一次 `reagentc /boottore`（毫秒级）。
+    // **不再要求 ui**：静默补查那条路也要武装 —— 那正是计划任务被安全软件拦掉、
+    // 只剩最后一道兜底的时候；漏掉它，老师就会看到「蓝屏了，重启后什么也没发生」。
+    // 放在上报之后，万一准备失败，服务器上至少已经有这次蓝屏的记录。
+    if settings.boot_fix && !report.demo && crate::fixos::is_boot_threat(&report.bugcheck) {
+        match crate::fixos::arm_boot(&report.bugcheck) {
+            Ok(()) => {
+                log::info!("openFixOS 已武装：下次重启进入离线修复");
+                if ui {
+                    emit(&app, "repairing", "已武装 openFixOS：下次重启自动修复引导");
+                }
+            }
+            Err(e) => log::warn!("openFixOS 武装失败（不影响本次上报）：{e}"),
+        }
+    }
+
+    end_run(&app, ui);
+}
+
+/// 一次分析结束：有窗口的那条路直接退出进程（老师开机时不需要别的东西），
+/// 静默那条路把「正在分析」的闸门放下 —— 老师还在用这个应用，不能退。
+fn end_run(app: &AppHandle, ui: bool) {
+    if ui {
+        app.exit(0);
+    } else {
+        STARTED.store(false, Ordering::SeqCst);
+    }
 }
 
 /// 「正在发送」至少亮这么久，免得局域网服务器上它一闪而过。
@@ -1788,6 +2148,8 @@ pub struct View {
     /// 蓝屏后自动尝试修复。
     pub repair: bool,
     pub endpoint: String,
+    /// 实验性：引导类蓝屏后准备一次 openFixOS 离线修复。
+    pub boot_fix: bool,
     pub dir: String,
     /// 还没送出去的包有几个。
     pub pending: usize,
@@ -1809,6 +2171,7 @@ pub fn view() -> View {
         enabled: s.enabled,
         repair: s.repair,
         endpoint: s.endpoint,
+        boot_fix: s.boot_fix,
         dir: root_dir().to_string_lossy().to_string(),
         pending,
         admin: crate::crash_repair::is_admin(),
@@ -1965,5 +2328,148 @@ mod tests {
             serde_json::from_str(r#"{"enabled":false,"endpoint":""}"#).expect("应当能解析");
         assert!(!s.enabled, "关闭状态必须保留");
         assert!(s.repair, "缺字段按默认为开");
+    }
+
+    /* ---------------- 蓝屏挑选 ---------------- */
+
+    fn event(epoch: u64, code: &str) -> BugCheckEvent {
+        BugCheckEvent {
+            time: iso_utc(epoch),
+            epoch,
+            code: code.to_string(),
+            provider: "Microsoft-Windows-WER-SystemErrorReporting".into(),
+            params: Vec::new(),
+        }
+    }
+
+    fn dump(modified: u64, name: &str) -> DumpFile {
+        DumpFile {
+            path: PathBuf::from(format!("C:\\Windows\\Minidump\\{name}")),
+            size: 1024,
+            modified,
+        }
+    }
+
+    /// 老 `state.json` 只有 `lastCheck`，不能因为它少了 `seen` 就整份读不出来
+    /// ——那会让升级后的第一轮检查丢掉全部历史，把旧蓝屏再报一遍。
+    #[test]
+    fn old_state_file_without_seen_still_parses() {
+        let m: Marker = serde_json::from_str(r#"{"lastCheck":1790000000}"#).expect("应当能解析");
+        assert_eq!(m.last_check, 1_790_000_000);
+        assert!(m.seen.is_empty());
+    }
+
+    /// 第二次、第三次蓝屏照样要能挑出来 —— 这是「蓝屏过一次之后就再也没反应」
+    /// 的直接回归：以前只看「上次检查时刻」，游标一超前，后面全被跳过。
+    #[test]
+    fn later_bsods_are_still_picked_after_the_first_is_reported() {
+        let first = 1_790_000_000;
+        let second = first + 3600;
+        let events = vec![event(second, "0x000000ef"), event(first, "0x000000d1")];
+        let seen = vec![event_key(&events[1])];
+
+        let picked = pick_bsod(&events, &[], &seen, first - 60).expect("第二次蓝屏应当被挑到");
+        assert_eq!(picked.epoch, second);
+        assert_eq!(picked.bugcheck, "0x000000ef");
+    }
+
+    /// 开机时事件日志还没落盘：那一轮什么都没看到，**不能**因此把这次蓝屏永久跳过。
+    #[test]
+    fn a_check_that_ran_too_early_does_not_hide_the_event() {
+        let bsod = 1_790_000_000;
+        let events = vec![event(bsod, "0x0000007e")];
+        // 检查跑在蓝屏之后 5 秒，但事件记录属于窗口内、且没报过
+        let picked = pick_bsod(&events, &[], &[], bsod - 10).expect("应当被挑到");
+        assert_eq!(picked.epoch, bsod);
+        assert_eq!(picked.fingerprint, format!("bsod:{bsod}:0x0000007e"));
+    }
+
+    /// 事件日志被清空时，靠转储兜底；报过一次之后不再重复。
+    #[test]
+    fn dump_is_used_when_the_event_log_is_empty() {
+        let bsod = 1_790_000_000;
+        let dumps = vec![dump(bsod, "102526-6437-01.dmp")];
+
+        let picked = pick_bsod(&[], &dumps, &[], bsod - 60).expect("应当用转储兜底");
+        assert_eq!(picked.fingerprint, "dump:102526-6437-01.dmp");
+        assert!(picked.has_dump);
+
+        let seen = vec![picked.fingerprint.clone()];
+        assert!(
+            pick_bsod(&[], &dumps, &seen, bsod - 60).is_none(),
+            "同一份转储不该再报一次"
+        );
+    }
+
+    /// 太老的记录（超出回看窗口）不翻旧账。
+    #[test]
+    fn ancient_events_are_ignored() {
+        let old = 1_790_000_000;
+        let events = vec![event(old, "0x000000ef")];
+        assert!(pick_bsod(&events, &[], &[], old + 30 * 24 * 3600).is_none());
+    }
+
+    /// 只处理最近一次：升级后不要把过去一周的旧蓝屏一条一条补报上来。
+    #[test]
+    fn only_the_latest_crash_is_reported() {
+        let t = 1_790_000_000;
+        let events = vec![event(t + 7200, "0x000000ef"), event(t, "0x000000d1")];
+
+        let picked = pick_bsod(&events, &[], &[], t - 60).expect("应当挑最近一次");
+        assert_eq!(picked.epoch, t + 7200, "不该先报更早的那一次");
+
+        let seen = vec![picked.fingerprint.clone()];
+        assert!(
+            pick_bsod(&events, &[], &seen, t - 60).is_none(),
+            "最近这次报过之后，不该再翻出旧的那次"
+        );
+    }
+
+    /// 转储同理：报过最新的一份就收手。
+    #[test]
+    fn older_dumps_do_not_trickle_out_on_every_launch() {
+        let t = 1_790_000_000;
+        let dumps = vec![dump(t, "102426-8203-01.dmp"), dump(t + 100, "102526-6437-01.dmp")];
+
+        let picked = pick_bsod(&[], &dumps, &[], t - 60).expect("应当挑最新的一份");
+        assert_eq!(picked.fingerprint, "dump:102526-6437-01.dmp");
+
+        let seen = vec![picked.fingerprint.clone()];
+        assert!(pick_bsod(&[], &dumps, &seen, t - 60).is_none());
+    }
+
+    /// SMBIOS 没填时常见的一串占位值，按「没有」处理。
+    #[test]
+    fn smbios_placeholders_are_treated_as_empty() {
+        for v in ["", "  ", "To be filled by O.E.M.", "Default string", "None"] {
+            assert!(is_placeholder(v), "{v:?} 应当算没有");
+        }
+        for v in ["PRPZR058JIK0AC", "16A4D54C-FEF0-4CA7-ACDA-DC7C8F0B65D6"] {
+            assert!(!is_placeholder(v), "{v:?} 应当保留");
+        }
+    }
+
+    /// 机器码：同样输入必得同样结果，形状固定，读不到就如实说读不到。
+    #[test]
+    fn machine_id_is_stable_and_readable() {
+        let a = machine_id(&[
+            Some("AAAA-BBBB".into()),
+            Some("SYS123".into()),
+            None,
+            Some("CLASS-PC".into()),
+        ]);
+        let b = machine_id(&[
+            Some("aaaa-bbbb".into()),
+            Some("sys123".into()),
+            None,
+            Some("class-pc".into()),
+        ]);
+        assert_eq!(a, b, "大小写不该影响同一台机器的码");
+        assert_eq!(a.len(), 19, "形如 XXXX-XXXX-XXXX-XXXX：{a}");
+        assert_eq!(a.matches('-').count(), 3);
+
+        let diff = machine_id(&[Some("AAAA-BBBB".into()), Some("SYS999".into())]);
+        assert_ne!(a, diff, "换硬件应当换码");
+        assert_eq!(machine_id(&[None, Some("  ".into())]), "未知（读不到硬件标识）");
     }
 }

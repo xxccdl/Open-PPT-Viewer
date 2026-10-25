@@ -147,6 +147,7 @@ const el = {
   /* 设置 */
   settings: $('settings'),
   settingsDot: $('settings-dot'),
+  settingsDotWelcome: $('settings-dot-welcome'),
   setVersion: $('set-version'),
   setUpdateHint: $('set-update-hint'),
   setNotes: $('set-notes'),
@@ -163,6 +164,12 @@ const el = {
   btnCrashSelfTest: $('btn-crash-self-test'),
   btnCrashToggle: $('btn-crash-toggle'),
   btnCrashRepairToggle: $('btn-crash-repair-toggle'),
+  btnFixosToggle: $('btn-fixos-toggle'),
+  btnFixosArm: $('btn-fixos-arm'),
+  btnFixosCancel: $('btn-fixos-cancel'),
+  setFixosWinre: $('set-fixos-winre'),
+  setFixosArmed: $('set-fixos-armed'),
+  setFixosHint: $('set-fixos-hint'),
   btnDoUpdate: $('btn-do-update'),
 };
 
@@ -4065,6 +4072,7 @@ function openSettings() {
   el.settings.classList.remove('hidden');
   refreshCacheUsage();
   refreshCrash();
+  refreshFixos();
   // 打开就查一次：点进来多半就是想看有没有新版
   refreshUpdate();
 }
@@ -4164,6 +4172,7 @@ async function toggleCrash(btn) {
       enabled: !cur.enabled,
       repair: cur.repair,
       endpoint: cur.endpoint,
+      bootFix: cur.bootFix,
     });
     await refreshCrash();
     toast(cur.enabled ? '蓝屏诊断已关闭' : '蓝屏诊断已开启');
@@ -4182,6 +4191,7 @@ async function toggleCrashRepair(btn) {
       enabled: cur.enabled,
       repair: !cur.repair,
       endpoint: cur.endpoint,
+      bootFix: cur.bootFix,
     });
     await refreshCrash();
     toast(cur.repair ? '自动修复已关闭' : '自动修复已开启');
@@ -4200,11 +4210,150 @@ async function saveCrashEndpoint(btn) {
       enabled: cur.enabled,
       repair: cur.repair,
       endpoint: el.setCrashInput.value.trim(),
+      bootFix: cur.bootFix,
     });
     await refreshCrash();
     toast('上报地址已保存');
   } catch (e) {
     toast(`保存失败：${e}`, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/* ---------------- openFixOS（实验性） ---------------- */
+
+/** 把一次 `fixos_status` 的结果画到设置页。 */
+function paintFixos(st) {
+  el.btnFixosToggle.textContent = st.enabled ? '关闭' : '开启';
+  el.btnFixosToggle.classList.toggle('strong', st.enabled);
+  el.setFixosWinre.textContent = st.winre;
+  if (!st.installed) {
+    el.setFixosArmed.textContent = '未安装（点「立即准备」装一次）';
+  } else if (st.bootPending) {
+    el.setFixosArmed.textContent = `已武装（${fmtMoment(st.installedAt)}）：下次重启进 openFixOS`;
+  } else {
+    el.setFixosArmed.textContent = `已待命（${fmtMoment(st.installedAt)}）：蓝屏/起不来时自动修复`;
+  }
+  const bits = [st.detail];
+  if (st.result?.summary) bits.push(`上次修复：${st.result.summary}`);
+  el.setFixosHint.textContent = bits.join('　·　');
+  // 后台准备期间按钮不能点：重复点会再复制一份镜像
+  el.btnFixosArm.disabled = !!st.busy;
+  el.btnFixosToggle.disabled = !!st.busy;
+  el.btnFixosCancel.disabled = !!st.busy || !st.installed;
+}
+
+async function refreshFixos() {
+  try {
+    paintFixos(await invoke('fixos_status'));
+  } catch (e) {
+    el.setFixosHint.textContent = `读不到 openFixOS 状态：${e}`;
+  }
+}
+
+/**
+ * 盯住后台任务。
+ *
+ * 安装/武装都是后台线程在跑（复制几百 MB 镜像 + 挂载/卸载），命令立刻返回，
+ * 这里每 800ms 问一次进度，直到 `busy` 变回 false，再把结果告诉老师。
+ */
+async function watchFixos(kind = 'arm') {
+  const started = Date.now();
+  for (;;) {
+    await new Promise((r) => setTimeout(r, 800));
+    let st;
+    try {
+      st = await invoke('fixos_status');
+    } catch (e) {
+      el.setFixosHint.textContent = `读不到 openFixOS 状态：${e}`;
+      return;
+    }
+    paintFixos(st);
+    if (!st.busy) {
+      if (st.error) toast(`准备失败：${st.error}`, true);
+      else if (kind === 'install') toast('已装好并待命：蓝屏或系统起不来时会自动修复');
+      else toast('已武装：下次重启进入 openFixOS');
+      return;
+    }
+    // 一两分钟没动静就提醒一下，别让老师以为又卡住了
+    if (Date.now() - started > 180000) {
+      el.setFixosHint.textContent = `${st.detail}（时间有点久，可以继续等，或关掉设置页）`;
+    }
+  }
+}
+
+/** ISO 时间 → 本地「几月几号 几点」。 */
+function fmtMoment(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getMonth() + 1}/${d.getDate()} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+async function toggleFixos(btn) {
+  btn.disabled = true;
+  try {
+    const cur = await invoke('crash_settings');
+    const on = !cur.bootFix;
+    await invoke('set_crash_settings', {
+      enabled: cur.enabled,
+      repair: cur.repair,
+      endpoint: cur.endpoint,
+      bootFix: on,
+    });
+    if (on) {
+      // 开启就先装好待命：病毒把引导弄坏时 Windows 起不来，那会儿再装已经来不及了
+      el.setFixosHint.textContent = '正在装进恢复环境待命（几分钟，只需一次）…';
+      paintFixos(await invoke('fixos_install'));
+      await watchFixos('install');
+    } else {
+      // 关闭就把恢复环境换回原镜像，别让我们的脚本一直占着恢复入口
+      await invoke('fixos_cancel');
+      toast('openFixOS 已关闭，恢复环境已还原');
+    }
+    await refreshFixos();
+  } catch (e) {
+    toast(`改不了：${e}`, true);
+    await refreshFixos();
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function armFixos(btn) {
+  if (
+    !confirm(
+      '现在就武装一次 openFixOS？\n\n下次重启会进入 Windows 恢复环境跑离线修复（chkdsk / sfc / DISM / bootrec），' +
+        '修完自己重启回 Windows。恢复环境里用的是副本，原来那份有完整备份，随时可以撤销。'
+    )
+  ) {
+    return;
+  }
+  btn.disabled = true;
+  el.setFixosHint.textContent = '正在准备：复制恢复镜像要一两分钟，别关窗口…';
+  try {
+    // 命令立刻返回，真正的活在后台线程里；这里接着轮询进度
+    paintFixos(await invoke('fixos_prepare_now'));
+  } catch (e) {
+    toast(`准备失败：${e}`, true);
+    btn.disabled = false;
+    await refreshFixos();
+    return;
+  }
+  await watchFixos();
+  await refreshFixos();
+}
+
+async function cancelFixos(btn) {
+  btn.disabled = true;
+  try {
+    await invoke('fixos_cancel');
+    toast('已撤销：恢复环境已指回原镜像');
+    await refreshFixos();
+  } catch (e) {
+    toast(`撤销失败：${e}`, true);
   } finally {
     btn.disabled = false;
   }
@@ -4247,9 +4396,10 @@ async function refreshUpdate() {
   }
 }
 
-/** 工具栏上那个小圆点：有新版才亮。 */
+/** 工具栏上那个小圆点：有新版才亮。欢迎页那枚入口同步亮。 */
 function markUpdateDot(on) {
   el.settingsDot.hidden = !on;
+  el.settingsDotWelcome.hidden = !on;
 }
 
 async function doUpdate(btn) {
@@ -4362,11 +4512,13 @@ function bindUi() {
 
   el.pageInput.addEventListener('focus', () => el.pageInput.select());
 
-  // 设置：工具栏入口、关闭、点遮罩空白处关闭
-  $('btn-settings').addEventListener('click', () => {
+  // 设置：工具栏入口、欢迎页入口、关闭、点遮罩空白处关闭
+  const toggleSettings = () => {
     if (el.settings.classList.contains('hidden')) openSettings();
     else closeSettings();
-  });
+  };
+  $('btn-settings').addEventListener('click', toggleSettings);
+  $('btn-settings-welcome').addEventListener('click', toggleSettings);
   $('btn-settings-close').addEventListener('click', closeSettings);
   el.settings.addEventListener('click', (e) => {
     // 只有点在遮罩本身（不是卡片上）才关
@@ -4402,6 +4554,11 @@ function bindUi() {
   el.btnCrashRepairToggle.addEventListener('click', () =>
     toggleCrashRepair(el.btnCrashRepairToggle)
   );
+
+  // openFixOS（实验性）
+  $('btn-fixos-toggle').addEventListener('click', () => toggleFixos($('btn-fixos-toggle')));
+  $('btn-fixos-arm').addEventListener('click', () => armFixos($('btn-fixos-arm')));
+  $('btn-fixos-cancel').addEventListener('click', () => cancelFixos($('btn-fixos-cancel')));
   $('btn-save-crash-endpoint').addEventListener('click', (e) =>
     saveCrashEndpoint(e.currentTarget)
   );

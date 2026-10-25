@@ -1870,6 +1870,181 @@ if endpoint.is_empty() {
   `上一次的蓝屏报告已补送：probe-flush-0001`，outbox 清空
 - [x] 服务端测试数据已清空（`count: 0`）
 
+## Task 55: 蓝屏过一次之后就不再自动检查/修复 —— 已修复（0.3.4）
+
+### 现象
+
+第一场蓝屏处理过之后，后面再蓝屏、重启进系统，**什么都不发生**。
+
+现场数据能对上：服务器上那份报告里一次带了**两个** minidump
+（`102426-8203-01.dmp`、`102526-6437-01.dmp`）——说明第一次蓝屏那次检查
+根本没被触发，第二次才把两场的现场一起收走。
+
+### 根因：用「游标」表示「看到这里为止」
+
+`state.json` 里只有一个 `lastCheck`，检测时按 `epoch >= lastCheck` 过滤：
+
+1. 开机时事件日志（WER 1001）可能还没落盘，`Minidump` 目录也可能还没可读；
+2. 这一轮「什么都没看到」，却照样把 `lastCheck` 推到了此刻；
+3. 之后每次检查都从那之后开始看 —— **这场蓝屏就被永久跳过了**。
+
+再加上检查只挂在「登录计划任务」这一条路上：任务被组策略禁用、快速启动、
+清理软件删任务，任何一种都会让老师看到「蓝屏了，重启后毫无反应」。
+
+### 改法
+
+- [x] 用**指纹去重**取代游标：`state.json` 增加 `seen: []`，记
+  `bsod:<发生时刻>:<错误码>` / `dump:<文件名>`。每次固定回看 7 天
+  （`LOOKBACK`），靠 `seen` 保证「一次蓝屏只处理一次」——
+  查早了没关系，下一轮还会看到。老 `state.json` 只有 `lastCheck`，
+  `#[serde(default)]` 照样能读。
+- [x] 指纹只在**包已经落地之后**才写入（`mark_seen`），分析中途断电会重来，
+  不会丢。
+- [x] 报告 id 改用**蓝屏发生时刻**（`stamp(hit.epoch)`），不是「现在」：
+  同一次蓝屏无论检查几遍都落在同一个 id 上，服务器不会出现两条一样的记录。
+- [x] `detect()` 的挑选逻辑抽成纯函数 `pick_bsod(events, dumps, seen, since)`，
+  可以直接测。
+- [x] **应用正常启动也补查一次**（`spawn_startup_check`）：查到就静默
+  采集 + 上报，不弹窗、不退出应用。不在这条路上跑 `sfc`——
+  老师可能正在上课，修复留给下次开机（有窗口那条路）。
+- [x] `run(app, report, ui)` 增加 `ui` 参数：没窗口时不发进度事件、
+  不缩角、不等动画、**不退出应用**，结束后把 `STARTED` 放下来。
+
+### 新增记录：主板与 HWID
+
+- [x] `system_info()` 增加：`主板序列号`、`系统序列号`、`硬件 UUID`、
+  `计算机名`、`机器码`。
+- [x] 序列号先读注册表（`HKLM\HARDWARE\DESCRIPTION\System\BIOS`），
+  读不到再问一次 SMBIOS（`Get-CimInstance Win32_BaseBoard / Win32_BIOS /
+  Win32_ComputerSystemProduct`，约 1 秒，只在采集时发生）。这台 HP 的注册表
+  里就没有两个序列号，只读注册表会少掉最有用的两条。
+- [x] `To be filled by O.E.M.` / `Default string` / 全 0 全 F 这类占位值
+  按「没有」处理，不写进报告。
+- [x] `机器码` = SHA-256(`MachineGuid` + 硬件 UUID + 主板序列号 +
+  系统序列号 + 计算机名) 前 8 字节，按 `XXXX-XXXX-XXXX-XXXX` 分组。
+  重装系统/换硬件会变，但足够回答「是不是同一台机器在反复崩」；
+  输入全缺失时写「未知（读不到硬件标识）」，不编假码。
+- [x] 两台机器都缺硬件信息时不会撞成同一个码（直接说读不到）。
+
+### 验证
+
+- [x] `cargo test -p ppt-app`：**38 passed**，新增 7 条：
+  - `later_bsods_are_still_picked_after_the_first_is_reported`
+  - `a_check_that_ran_too_early_does_not_hide_the_event`
+  - `dump_is_used_when_the_event_log_is_empty`
+  - `ancient_events_are_ignored`
+  - `only_the_latest_crash_is_reported` / `older_dumps_do_not_trickle_out_on_every_launch`
+  - `old_state_file_without_seen_still_parses`
+  - `smbios_placeholders_are_treated_as_empty` / `machine_id_is_stable_and_readable`
+- [x] 真机跑 `--crash-report-demo`：服务端 `system` 里能看到
+  `主板厂商: HP`、`主板型号: 8B5C`、`计算机名: XX`、`机器码: 7FAD-71C4-88E7-135F`
+
+## Task 56: 没打开课件时设置按钮点不到 —— 已修复（0.3.4）
+
+### 现象
+
+刚启动、还没打开任何课件时，窗口里找不到「设置」：换不了操作方式、
+查不了更新、也进不去蓝屏自检。
+
+### 根因：欢迎页把顶栏盖住了
+
+`#welcome` 是 `position:absolute; inset:0; z-index:40` 的全窗遮罩，
+而顶栏 `#topbar` 的 `z-index` 是 20 —— 设置齿轮虽然在顶栏里，
+却被欢迎页整块盖住，看得见的是遮罩，点到的是遮罩。
+
+### 改法
+
+- [x] 欢迎页右上角加一枚同样的齿轮（`#btn-settings-welcome`），
+  和顶栏那个共用同一个 `toggleSettings()`；打开课件后欢迎页隐藏，
+  入口自然跟着消失，不会出现两个齿轮。
+- [x] 「有新版」的小圆点两处同步亮（`markUpdateDot`）。
+- [x] 不改 `#welcome` 的层级：那层遮罩同时挡住了缩略图栏与页码控件，
+  拿掉它会露出一排没意义的禁用按钮；在欢迎页自己身上补一个入口更干净。
+
+## Task 57: openFixOS —— 引导损坏时的离线修复（实验性，0.3.5）
+
+### 目标
+
+引导扇区/系统文件被破坏、Windows 已经起不来时，「在 Windows 里跑 sfc」
+这件事本身就不成立。这一版给出一条**能回退的**离线修复路径：
+
+1. **开关一打开就装好**（常驻待命）——这一步必须在机器还好的时候做：
+   病毒把引导弄坏、系统根本起不来时，已经没有任何机会再「准备」；
+2. 原镜像先原样复制一份留作「干净的底」，再复制一份用来改（塞自动修复脚本）；
+3. 按 `reagentc /disable` → `/setreimage` → `/enable` 把改造版装进恢复分区；
+4. 检测到**引导类蓝屏**（0x7B / 0xED / 0x24 / 0xEF / 0x109 / 0xC0000218 …）时，
+   只补一个 `/boottore`（毫秒级）指定**下次启动**进它；
+5. openFixOS 里先给 20 秒倒计时（可按 N 跳过），然后自动跑：
+   `chkdsk /f` → `sfc /offbootdir` → `DISM /RestoreHealth`
+   → `bootrec /fixmbr /fixboot /rebuildbcd`，结果写回 `C:\OpenPPTView\fixos\`；
+6. 脚本最后一定 `wpeutil reboot` 回到 Windows；
+7. 只有「关闭开关 / 点撤销」才把恢复环境换回原镜像；正常启动**不再**自动卸甲；
+8. 修复结果留在本地，随下一份蓝屏报告一起上报。
+
+### 边界（刻意做窄）
+
+- [x] 开关 `bootFix` **默认关闭**（实验性），只在设置页手动打开；
+- [x] 只在管理员权限下装机；普通账号运行只分析、不碰引导；
+- [x] **不碰 MBR/VBR**：只改 Windows 自己的恢复环境配置（`reagentc`），
+      原镜像另有完整备份，`/disable` 暂存的那份也是官方留的退路；
+- [x] 任何一步失败都会（`/disable` → 指回干净的底 → `/enable`）还原，
+      不留「半截状态」；撤销失败会保留镜像与标记，不会硬删；
+- [x] 常驻会接管恢复环境入口：脚本进场先 20 秒倒计时，按 N 跳过直接回 Windows；
+- [x] 不自研引导程序/内核：那不是功能，是一个操作系统项目，且写错就是真变砖；
+- [x] 恢复环境里不尝试连 WiFi（要机型相关驱动），结果只落本地、下次补发；
+- [ ] **遗留**：卸载应用时还没有把恢复环境换回原镜像（需在 NSIS 卸载钩子里调
+      `reagentc /setreimage` + `/enable`），现在只能靠用户手动「撤销」。
+
+### 实现
+
+- [x] 新模块 `crates/ppt-app/src/fixos.rs`：状态、准备、撤销、结果读取，
+      以及写进镜像的 `winpeshl.ini` 与 `openfixos.cmd`；
+- [x] `crash::Settings` 增加 `bootFix`（`#[serde(default)]`，老配置不受影响）；
+- [x] 拆成两步：`fixos::install()`（装好待命，开关打开时调）与
+      `fixos::arm_boot()`（装好 + `/boottore`，蓝屏后/手动武装时调）；
+- [x] `crash::run()` 在**上报之后**、遇到引导类错误码且开关打开时 `arm_boot`，
+      **不再要求 `ui`** —— 静默补查那条路也要武装；
+- [x] `fixos::after_normal_boot()` **不再卸甲**，只清 `boottore.json` 与记录结果；
+- [x] 设置页开关联动：打开就后台 `install`，关闭就 `cancel`（换回原镜像）；
+- [x] `collect()` 把 `C:\OpenPPTView\fixos\result.json|log` 并入报告包；
+- [x] 设置页新增「openFixOS 离线修复（实验性）」：开关、恢复环境状态、
+      待命状态、立即准备、撤销；
+- [x] 命令：`fixos_status` / `fixos_install` / `fixos_prepare_now` / `fixos_cancel`。
+- [x] 修「点立即准备 → 窗口未响应」：Tauri 的同步命令跑在主线程，而准备要
+      复制几百 MB 镜像再 `dism /Mount-Image`，一分钟往上 → 命令改为后台线程
+      （`install_background` / `arm_boot_background`，立刻返回），状态里带
+      `busy` / `step` / `error`，前端每 800ms 轮询 `fixos_status` 显示进度；
+      `fixos_status` / `fixos_cancel` 也改成 `async` 命令，`reagentc` 子进程
+      不再落到主线程上。
+- [x] 修「武装得太晚」：原来在蓝屏上报之后才准备，系统起不来时根本没机会 →
+      改为开关打开即装好待命，蓝屏后只剩 `/boottore`；正常启动不再卸甲。
+- [x] 修「准备失败：REAGENTC.EXE: Windows RE 已经启用」：`/setreimage` 在恢复
+      环境已启用时会被拒，改成 `/disable` → `/setreimage /path <副本目录>` →
+      `/enable` → `/boottore`；`/path` 也改为直接指向 `winre.wim` 所在目录；
+      还原同样是「停 → 指回干净的底 → 启用」，并清掉 `System32\Recovery`
+      里暂存的我方镜像（否则以后 Windows 自己 `/enable` 会把它装回去）。
+- [x] `reagentc /info` 解析同时认中英文（「Windows 恢复环境 (WinRE) 位置」/
+      「Windows RE location」），并排除「恢复映像位置」那一行；复制镜像后核对
+      字节数，半截镜像直接删掉报错（免得撤销时换回一个坏镜像）。
+
+### 验证
+
+- [x] `cargo test -p ppt-app`：**44 passed**，新增 6 条：
+  - `boot_related_codes_are_recognised`（7B/ED/EF/109/C0000218 命中；
+    0x116/0x9F/0xD1 不命中）
+  - `openfixos_script_always_reboots`（脚本必须以 `wpeutil reboot` 收尾）
+  - `openfixos_script_can_be_skipped`（常驻接管入口，必须留 20 秒跳过出口）
+  - `boot_result_parses_what_the_script_writes`
+  - `reagentc_info_is_read_in_both_languages`（中英文 `/info` 都能取到位置）
+  - `a_disabled_recovery_environment_is_not_mistaken_for_enabled`
+- [x] `cargo check` 通过；设置页在真机上能看到新分区（下方截图）
+- [x] CDP 点「立即准备」：同步返回 2ms、界面继续响应，提示条显示
+      「上次准备失败：需要管理员权限」（开发机以普通权限运行，不会真去改引导）；
+      以管理员跑的真实链路（复制镜像期间轮询出进度）仍需下面那台机器验证。
+- [ ] **需要一台备用机/虚拟机验证**：`reagentc /setreimage` 指向副本、
+      恢复环境里脚本执行、`wpeutil reboot` 回到 Windows。
+      —— 这一步在开发机上做等于拿用户的工作系统冒险，没有执行。
+
 # Task Dependencies
 
 - Task 2 依赖 Task 1

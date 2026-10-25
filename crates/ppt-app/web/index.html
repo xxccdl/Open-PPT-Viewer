@@ -330,6 +330,15 @@
     <div id="present-fade"></div>
 
     <div id="welcome">
+      <!-- 设置入口（欢迎页专用）。
+           欢迎页是铺满整窗的遮罩（z-index 高于顶栏），没打开课件时
+           顶栏那个齿轮被它整个盖住，点不到 —— 这里放一枚一样的入口。
+           打开课件后欢迎页隐藏，入口自然跟着消失，不会有第二个齿轮。 -->
+      <button class="icon-btn welcome-settings" id="btn-settings-welcome" title="设置">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-gear" /></svg>
+        <span class="dot" id="settings-dot-welcome" hidden></span>
+      </button>
+
       <h1>OpenPPTView</h1>
       <p>为讲课场景打造的课件放映器<br />把 .pptx / .pdf 拖到窗口任意位置即可打开</p>
       <button class="primary-btn" id="btn-welcome-open">
@@ -516,6 +525,38 @@
             <p class="assoc-hint">
               修复需要管理员权限，安装时已经登记好「登录时以最高权限运行」的计划任务；
               以普通账号运行时只分析、不修复。
+            </p>
+          </section>
+
+          <!-- openFixOS：蓝屏/引导损坏后的离线修复（实验性） -->
+          <section class="set-sec">
+            <div class="set-sec-head">
+              <span class="set-sec-title">openFixOS 离线修复（实验性）</span>
+              <div class="assoc-actions">
+                <button class="link-btn" id="btn-fixos-toggle">关闭</button>
+                <button class="link-btn" id="btn-fixos-arm">立即准备</button>
+                <button class="link-btn" id="btn-fixos-cancel">撤销</button>
+              </div>
+            </div>
+            <div class="set-row">
+              <span class="set-label">恢复环境</span>
+              <span class="set-value" id="set-fixos-winre">正在读取…</span>
+            </div>
+            <div class="set-row">
+              <span class="set-label">待命状态</span>
+              <span class="set-value" id="set-fixos-armed">—</span>
+            </div>
+            <p class="assoc-hint" id="set-fixos-hint">正在读取…</p>
+            <p class="assoc-hint">
+              开启后会先把 openFixOS 装进恢复环境待命（几分钟，只装一次）：遇到引导类蓝屏
+              （0x7B 读不到系统盘、0xED 系统卷挂不上、0x109 内核被改 …）或系统直接起不来时，
+              下次启动会自动进入 openFixOS，依次跑 chkdsk / sfc / DISM / bootrec，修完自己重启回 Windows。
+              因为「起不来」时已经没机会再装，所以必须提前装好 —— 这也是它要常驻的原因。
+            </p>
+            <p class="assoc-hint">
+              它用的是恢复镜像的一份副本，原来那份留了完整备份，点「撤销」就换回去；
+              待命期间进恢复环境（例如「高级启动」）会先看到一个 20 秒倒计时，按 N 可跳过并直接重启。
+              修复结果写在 C:\OpenPPTView\fixos\，随下一份蓝屏报告一起发出去。
             </p>
           </section>
         </div>

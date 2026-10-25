@@ -26,6 +26,7 @@
 mod associations;
 mod crash;
 mod crash_repair;
+mod fixos;
 mod install_pref;
 mod resident;
 mod update;
@@ -1865,6 +1866,7 @@ fn set_crash_settings(
     enabled: bool,
     repair: bool,
     endpoint: String,
+    boot_fix: bool,
 ) -> Result<crash::View, String> {
     let endpoint = endpoint.trim().to_string();
     if !endpoint.is_empty()
@@ -1876,6 +1878,7 @@ fn set_crash_settings(
         enabled,
         repair,
         endpoint,
+        boot_fix,
     })?;
     Ok(crash::view())
 }
@@ -1893,6 +1896,43 @@ fn crash_self_test() -> crash::SelfTest {
 #[tauri::command]
 fn crash_skip_step() -> bool {
     crash::skip_current_step()
+}
+
+/* ---------------- openFixOS（实验性） ---------------- */
+
+/// 设置页「openFixOS」那一块：开关、恢复环境可用性、有没有挂上、上次结果。
+///
+/// 用 `async` 让它跑在线程池里：`reagentc` 是子进程，放在主线程上会顿一下。
+#[tauri::command]
+async fn fixos_status() -> fixos::Status {
+    fixos::status()
+}
+
+/// 手动武装一次：装好 + 下次重启进 openFixOS。
+///
+/// 复制/挂载恢复镜像是分钟级的活，必须扔到后台线程，否则窗口会「未响应」；
+/// 前端拿返回的状态后自己轮询 `fixos_status` 看进度。
+#[tauri::command]
+fn fixos_prepare_now() -> Result<fixos::Status, String> {
+    fixos::arm_boot_background("设置页手动准备")?;
+    Ok(fixos::status())
+}
+
+/// 装好待命（开关打开时调）：把 openFixOS 装进恢复环境，**不**触发重启。
+///
+/// 这一步是「提前准备」的关键：病毒把引导弄坏时 Windows 起不来，
+/// 蓝屏之后已经没机会装了，必须在机器还好的时候先装好。
+#[tauri::command]
+fn fixos_install() -> Result<fixos::Status, String> {
+    fixos::install_background("设置页开启开关")?;
+    Ok(fixos::status())
+}
+
+/// 撤销：把恢复环境指回原来的镜像（顺带删掉几百 MB 的副本，也得离主线程）。
+#[tauri::command]
+async fn fixos_cancel() -> Result<fixos::Status, String> {
+    fixos::cancel()?;
+    Ok(fixos::status())
 }
 
 /// 打开蓝屏报告的留档目录（老师/管理员可以直接看到采集了什么）。
@@ -2510,6 +2550,14 @@ fn main() {
             // 上次没发出去的蓝屏报告，应用一起来就补送（只在确有待发件时联网）
             crash::spawn_outbox_flush();
 
+            // 上次挂过 openFixOS 修复：既然已经正常进系统，就把恢复环境指回原镜像，
+            // 并把修复结果留在本地（设置页能看，随下一份报告一起发出去）
+            fixos::after_normal_boot();
+
+            // 登录自检有可能没被 Windows 拉起来（任务被禁用、快速启动、清理软件）。
+            // 老师每天都会打开应用，那就顺手补查一次：查到就静默分析并上报。
+            crash::spawn_startup_check(app.handle().clone());
+
             // 主窗口在配置里是 `visible: false`：正常启动到这里才显示它。
             //
             // 为什么不在配置里直接 `visible: true`：蓝屏诊断（`--crash-report`）
@@ -2585,6 +2633,10 @@ fn main() {
             crash_skip_step,
             open_crash_dir,
             crash_ready,
+            fixos_status,
+            fixos_prepare_now,
+            fixos_install,
+            fixos_cancel,
             check_update,
             start_update,
             quit_app,

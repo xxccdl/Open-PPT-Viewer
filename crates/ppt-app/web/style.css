@@ -590,6 +590,13 @@ html.touch-mode #present-bar {
   pointer-events: none;
 }
 
+/* 欢迎页右上角的设置入口：顶栏被遮罩盖住时，这里是唯一够得着的入口 */
+#welcome .welcome-settings {
+  position: absolute;
+  top: 12px;
+  right: 14px;
+}
+
 #welcome h1 {
   font-size: 22px;
   font-weight: 600;

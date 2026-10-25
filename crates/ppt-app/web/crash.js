@@ -87,8 +87,11 @@ function render(phase, message) {
   if (skipBtn) {
     skipBtn.addEventListener('click', async () => {
       // 先自己收起来：连点两下不该发两次请求
-      skipBtn.disabled = true;
       setSkip(false);
+      skipBtn.disabled = true;
+      // 按钮一按就没了，界面必须马上给一句话 ——
+      // 否则「点了跳过」和「点了没反应」看起来一模一样。
+      if (detailEl) detailEl.textContent = '正在结束这一环节，接着跑下一项…';
       try {
         const accepted = await invoke('crash_skip_step');
         if (!accepted) {

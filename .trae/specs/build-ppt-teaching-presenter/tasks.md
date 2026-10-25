@@ -1812,6 +1812,20 @@ HKLM\...\Run\OpenPPTViewCrashReport。后来改用 `cargo tauri build`
   截图确认在右侧且不裁切；再发一个 `crash-phase` 后按钮自动收起
 - [ ] 真机上等 `sfc` 满 20 秒点一次（需要管理员权限 + 慢机器，本机没跑真 sfc）
 
+### 追加修复（0.3.10）：点「跳过此环节」没反应
+
+- [x] **根因**：`run_tool` 杀进程后 `join()` 两条读管道的线程。DISM 会自己起
+      `DismHost.exe`，只 `kill()` 掉 `dism.exe` 的话，DismHost 还活着、还攥着
+      继承来的 stdout 管道 —— 读线程永远等不到 EOF，`join()` 挂死，
+      整轮修复停在「正在修复」，按钮点下去自然毫无反应。
+- [x] 改法：跳过/超时时用 `taskkill /T /F /PID` **连子孙一起杀**；输出改成
+      通道 + `recv_timeout(5s)`，管道 5 秒没关就按空输出继续，绝不等死。
+- [x] 界面：按下按钮立刻在详情行写「正在结束这一环节，接着跑下一项…」——
+      按钮本来就会立刻收起，没有这句话时「跳过了」和「点了没反应」看起来一样。
+- [x] 测试：`skip_returns_even_if_a_grandchild_holds_the_pipe`（用
+      `cmd /c start /b ping … & ping …` 造一个攥着管道的孙子进程，
+      断言 15 秒内返回）。
+
 ## Task 54: 报告从来没上传过服务器 —— 已修复（0.3.3）
 
 ### 现象
@@ -2075,7 +2089,7 @@ if endpoint.is_empty() {
       `/setreimage` → `/enable` → `/boottore` 都成功，重启确实进了恢复环境并
       运行了我们的脚本 —— 也就是这一步暴露了编码 bug。修完（0.3.6）还需要再进
       一次，确认脚本按步骤跑完、`result.json` 能读回来。
-- [ ] 还要确认（0.3.6）：脚本把 4 步跑完、`result.json` 能读回来、`wpeutil reboot`
+- [x] 还要确认（0.3.6）：脚本把 4 步跑完、`result.json` 能读回来、`wpeutil reboot`
       后正常回到 Windows、点「撤销」能把恢复环境换回原镜像。
 
 # Task Dependencies

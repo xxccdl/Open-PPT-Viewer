@@ -356,6 +356,26 @@ fn write_summary(path: &Path, value: &serde_json::Value) {
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
 
+/// 杀掉命令之后，最多等多久让输出管道收尾。
+///
+/// 正常结束时管道立刻关闭，这里是毫秒级；只有在「杀了主进程但还有孙子进程
+/// 攥着继承来的管道」时才会等到超时 —— 那种情况也绝不能无限等下去。
+const OUTPUT_GRACE: Duration = Duration::from_secs(5);
+
+/// 杀掉一条命令以及它起的子孙进程。
+///
+/// DISM 会自己起 `DismHost.exe`：只杀 `dism.exe` 的话，DismHost 还活着、
+/// 还攥着我们的 stdout 管道，读线程永远等不到 EOF，界面就卡在「正在修复」。
+fn kill_tree(pid: u32) {
+    use std::os::windows::process::CommandExt;
+    let _ = Command::new("taskkill")
+        .args(["/T", "/F", "/PID", &pid.to_string()])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 fn run_step(
     rdir: &Path,
     key: &str,
@@ -458,11 +478,20 @@ fn run_tool(program: &Path, args: &[String], timeout: Duration, skip: &SkipContr
         }
     };
 
-    // stdout / stderr 各用一条线程读到尾：不读的话管道写满，子进程就卡住了
-    let out = child.stdout.take();
-    let err = child.stderr.take();
-    let h1 = std::thread::spawn(move || drain(out));
-    let h2 = std::thread::spawn(move || drain(err));
+    // stdout / stderr 各用一条线程读到尾：不读的话管道写满，子进程就卡住了。
+    // 结果用通道送回来，而不是 `join()` —— 见下面「等输出」那段的注释。
+    let (tx_out, rx_out) = std::sync::mpsc::channel::<Vec<u8>>();
+    let (tx_err, rx_err) = std::sync::mpsc::channel::<Vec<u8>>();
+    if let Some(out) = child.stdout.take() {
+        std::thread::spawn(move || {
+            let _ = tx_out.send(drain(Some(out)));
+        });
+    }
+    if let Some(err) = child.stderr.take() {
+        std::thread::spawn(move || {
+            let _ = tx_err.send(drain(Some(err)));
+        });
+    }
 
     let deadline = Instant::now() + timeout;
     let mut timed_out = false;
@@ -475,15 +504,20 @@ fn run_tool(program: &Path, args: &[String], timeout: Duration, skip: &SkipContr
         }
         if skip.take() {
             // 老师点了「跳过」：结束子进程，把已经产出的输出留下。
-            // `kill` 只杀直接子进程；sfc/chkdsk 没有自己起孙子进程，
-            // 这两个工具（以及 DISM）都是单进程干活的。
+            //
+            // 必须连子孙一起杀：DISM 会自己起 `DismHost.exe`，
+            // 只杀 dism.exe 的话 DismHost 还攥着继承来的 stdout 管道，
+            // 读线程永远等不到 EOF —— 界面就停在「正在修复」不动，
+            // 老师点「跳过此环节」看起来毫无反应。
             skipped = true;
+            kill_tree(child.id());
             let _ = child.kill();
             let _ = child.wait();
             break None;
         }
         if Instant::now() >= deadline {
             timed_out = true;
+            kill_tree(child.id());
             let _ = child.kill();
             let _ = child.wait();
             break None;
@@ -491,9 +525,16 @@ fn run_tool(program: &Path, args: &[String], timeout: Duration, skip: &SkipContr
         std::thread::sleep(Duration::from_millis(400));
     };
 
-    // 杀掉子进程后管道会关闭，两条读线程随即返回 —— 这一步不会卡住
-    let stdout = h1.join().unwrap_or_default();
-    let stderr = h2.join().unwrap_or_default();
+    // 等输出：最多 5 秒。命令正常结束时管道立刻关闭，这里是毫秒级；
+    // 只有在「杀了进程但还有孙子攥着管道」时才可能等到超时，那也不能等死。
+    let stdout = match rx_out.recv_timeout(OUTPUT_GRACE) {
+        Ok(v) => v,
+        Err(_) => {
+            log::warn!("{} 的输出管道 5 秒内没关闭，先按空输出继续", program.display());
+            Vec::new()
+        }
+    };
+    let stderr = rx_err.recv_timeout(OUTPUT_GRACE).unwrap_or_default();
     let mut text = decode_console(&stdout);
     let err_text = decode_console(&stderr);
     if !err_text.trim().is_empty() {
@@ -897,6 +938,39 @@ mod tests {
         assert!(
             spent < Duration::from_secs(12),
             "跳过之后还等了 {spent:?}"
+        );
+    }
+
+    /// 跳过时如果命令起了「孙子进程」（DISM 会起 DismHost），而且它还攥着
+    /// 我们的 stdout 管道，也不能把修复卡住 —— 真机上的「点了跳过没反应」
+    /// 就是这么来的。
+    #[test]
+    fn skip_returns_even_if_a_grandchild_holds_the_pipe() {
+        let skip = Arc::new(SkipControl::new());
+        let for_timer = skip.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(600));
+            for_timer.request();
+        });
+
+        let started = Instant::now();
+        // `start /b` 起的 ping 是我们的「孙子进程」，继承 stdout 并一直输出；
+        // 前台那个 ping 是直接子进程，会被跳过逻辑杀掉。
+        let result = run_tool(
+            Path::new("C:\\Windows\\System32\\cmd.exe"),
+            &[
+                "/c".to_string(),
+                "start /b ping -n 20 127.0.0.1 & ping -n 20 127.0.0.1".to_string(),
+            ],
+            Duration::from_secs(120),
+            &skip,
+        );
+
+        assert!(result.skipped, "应当记为「已跳过」");
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "孙子进程攥着管道时也不该卡住，实际用了 {:?}",
+            started.elapsed()
         );
     }
 

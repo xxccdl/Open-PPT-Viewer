@@ -361,6 +361,12 @@ struct PendingBsod {
 /// 不是把过去一周的历史一次补齐。若改成逐条回填，升级后的机器会
 /// 每启动一次就补报一条旧记录，服务器上反而更乱。
 ///
+/// 但「最近一条事件已经报过」**不等于没有新蓝屏**：第二次蓝屏如果
+/// WER 那条 1001 事件没落盘（写日志失败、断电、事件日志被清），
+/// 现场就只剩一份新的 minidump。所以事件报过之后还要再看一眼转储，
+/// 只认**比已报过的那次更新**的转储 —— 这样既不会漏掉第二次，
+/// 也不会把旧账翻出来。
+///
 /// 抽成纯函数是为了能直接测：真实的事件日志在开发机上不一定有蓝屏记录，
 /// 而这段挑选逻辑恰恰是「第二次蓝屏没反应」的根源所在。
 fn pick_bsod(
@@ -369,31 +375,31 @@ fn pick_bsod(
     seen: &[String],
     since: u64,
 ) -> Option<PendingBsod> {
-    // 1) 事件日志里最近的一条（它带错误码，信息最全）
-    let newest = events
+    let newest_event = events
         .iter()
         .filter(|e| e.epoch >= since && e.epoch > 0)
         .max_by_key(|e| e.epoch);
-
-    if let Some(e) = newest {
-        if seen.iter().any(|s| s == &event_key(e)) {
-            return None;
-        }
-        return Some(PendingBsod {
-            epoch: e.epoch,
-            bugcheck: e.code.clone(),
-            fingerprint: event_key(e),
-            has_dump: dumps.iter().any(|d| d.modified >= since),
-        });
-    }
-
-    // 2) 没有可用事件：退而看最近的一份转储（事件日志被清过、或读不到事件时）
     let newest_dump = dumps
         .iter()
         .filter(|d| d.modified >= since)
         .max_by_key(|d| d.modified);
 
-    newest_dump
+    // 1) 事件日志里最近的一条（它带错误码，信息最全）
+    if let Some(e) = newest_event {
+        if !seen.iter().any(|s| s == &event_key(e)) {
+            return Some(PendingBsod {
+                epoch: e.epoch,
+                bugcheck: e.code.clone(),
+                fingerprint: event_key(e),
+                has_dump: dumps.iter().any(|d| d.modified >= since),
+            });
+        }
+    }
+
+    // 2) 事件要么没有、要么已经报过：看有没有**更新**的转储
+    let floor = newest_event.map(|e| e.epoch).unwrap_or(since);
+    let fresh = newest_dump.filter(|d| d.modified >= floor);
+    fresh
         .filter(|d| !seen.iter().any(|s| s == &dump_key(d)))
         .map(|d| PendingBsod {
             epoch: d.modified,
@@ -435,6 +441,12 @@ pub fn detect(mode: Mode) -> Option<Report> {
 
     let events = bugcheck_events().unwrap_or_default();
     let dumps = recent_dumps(since);
+    log::info!(
+        "蓝屏检查：事件 {} 条、转储 {} 份、已报 {} 条",
+        events.len(),
+        dumps.len(),
+        marker.seen.len()
+    );
 
     let Some(hit) = pick_bsod(&events, &dumps, &marker.seen, since) else {
         // 没有新东西：只更新「上次检查时刻」，不动 seen
@@ -1688,6 +1700,11 @@ pub fn spawn_startup_check(app: AppHandle) {
         return;
     }
     std::thread::spawn(move || {
+        // 先等一会儿：登录自检那条路（计划任务，登录后 12 秒）会自己把诊断窗口
+        // 叫出来。它一到就把 `STARTED` 抢走，这里什么都不会做 —— 否则静默这条路
+        // 抢先把这次蓝屏「消化」掉，老师就看不到那条带修复的诊断窗口了
+        // （真机上「第二次蓝屏什么也没弹」就是这种时序）。
+        std::thread::sleep(Duration::from_secs(20));
         if STARTED.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -1695,7 +1712,7 @@ pub fn spawn_startup_check(app: AppHandle) {
             STARTED.store(false, Ordering::SeqCst);
             return;
         };
-        log::info!("应用启动时发现待处理的蓝屏：{}", report.id);
+        log::info!("应用启动时发现待处理的蓝屏（静默分析）：{}", report.id);
         run(app, report, false);
     });
 }
@@ -2371,6 +2388,35 @@ mod tests {
         let picked = pick_bsod(&events, &[], &seen, first - 60).expect("第二次蓝屏应当被挑到");
         assert_eq!(picked.epoch, second);
         assert_eq!(picked.bugcheck, "0x000000ef");
+    }
+
+    /// 第二次蓝屏如果 **WER 的 1001 事件没落盘**，现场只剩一份新的 minidump：
+    /// 这时不能因为「最近一条事件已经报过」就整体放弃（真机上就是「第二次蓝屏
+    /// 重启后什么也没发生」）。
+    #[test]
+    fn a_later_crash_that_only_left_a_dump_is_still_reported() {
+        let first = 1_790_000_000;
+        let second = first + 3600;
+        let events = vec![event(first, "0x000000d1")];
+        let dumps = vec![dump(second, "102526-9999-01.dmp")];
+        let seen = vec![event_key(&events[0])];
+
+        let picked = pick_bsod(&events, &dumps, &seen, first - 60)
+            .expect("第二次只留了转储，也必须报出来");
+        assert_eq!(picked.fingerprint, "dump:102526-9999-01.dmp");
+        assert!(picked.has_dump);
+    }
+
+    /// 但要防住反向的坑：同一场蓝屏的转储比 1001 事件早写几十秒，
+    /// 事件已经报过之后不能又拿这份转储再报一次。
+    #[test]
+    fn the_dump_of_an_already_reported_crash_is_not_reported_again() {
+        let crash = 1_790_000_000;
+        let events = vec![event(crash, "0x000000ef")];
+        let dumps = vec![dump(crash - 30, "102526-6437-01.dmp")];
+        let seen = vec![event_key(&events[0])];
+
+        assert!(pick_bsod(&events, &dumps, &seen, crash - 3600).is_none());
     }
 
     /// 开机时事件日志还没落盘：那一轮什么都没看到，**不能**因此把这次蓝屏永久跳过。

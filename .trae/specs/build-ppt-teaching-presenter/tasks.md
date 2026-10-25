@@ -2026,24 +2026,33 @@ if endpoint.is_empty() {
 - [x] `reagentc /info` 解析同时认中英文（「Windows 恢复环境 (WinRE) 位置」/
       「Windows RE location」），并排除「恢复映像位置」那一行；复制镜像后核对
       字节数，半截镜像直接删掉报错（免得撤销时换回一个坏镜像）。
+- [x] 修**真机第一次进 openFixOS 就报错**：`openfixos.cmd` 是 UTF-8，而 cmd.exe
+      按控制台代码页（中文系统 GBK）读批处理 → `'谁针凝?N' 不是内部或外部命令`、
+      `X:\result.log 试图引用不存在的令牌`。脚本改成**纯 ASCII + 显式 CRLF**，
+      日志目录也改成 `%WIN%\OpenPPTView\fixos`（恢复环境里系统盘不一定还是 C:）。
+      新增 `SCRIPT_REV`：脚本改动后，已装过的机器下次准备会自动重装镜像里的副本。
 
 ### 验证
 
-- [x] `cargo test -p ppt-app`：**44 passed**，新增 6 条：
+- [x] `cargo test -p ppt-app`：**46 passed**，新增 8 条：
   - `boot_related_codes_are_recognised`（7B/ED/EF/109/C0000218 命中；
     0x116/0x9F/0xD1 不命中）
   - `openfixos_script_always_reboots`（脚本必须以 `wpeutil reboot` 收尾）
   - `openfixos_script_can_be_skipped`（常驻接管入口，必须留 20 秒跳过出口）
+  - `openfixos_script_is_pure_ascii`（真机乱码的回归测试）
+  - `openfixos_script_is_written_with_crlf`（cmd 只认 CRLF）
   - `boot_result_parses_what_the_script_writes`
   - `reagentc_info_is_read_in_both_languages`（中英文 `/info` 都能取到位置）
   - `a_disabled_recovery_environment_is_not_mistaken_for_enabled`
 - [x] `cargo check` 通过；设置页在真机上能看到新分区（下方截图）
 - [x] CDP 点「立即准备」：同步返回 2ms、界面继续响应，提示条显示
-      「上次准备失败：需要管理员权限」（开发机以普通权限运行，不会真去改引导）；
-      以管理员跑的真实链路（复制镜像期间轮询出进度）仍需下面那台机器验证。
-- [ ] **需要一台备用机/虚拟机验证**：`reagentc /setreimage` 指向副本、
-      恢复环境里脚本执行、`wpeutil reboot` 回到 Windows。
-      —— 这一步在开发机上做等于拿用户的工作系统冒险，没有执行。
+      「上次准备失败：需要管理员权限」（开发机以普通权限运行，不会真去改引导）。
+- [x] **真机第一次走通「进入 openFixOS」这一步**（0.3.5）：`/disable` →
+      `/setreimage` → `/enable` → `/boottore` 都成功，重启确实进了恢复环境并
+      运行了我们的脚本 —— 也就是这一步暴露了编码 bug。修完（0.3.6）还需要再进
+      一次，确认脚本按步骤跑完、`result.json` 能读回来。
+- [ ] 还要确认（0.3.6）：脚本把 4 步跑完、`result.json` 能读回来、`wpeutil reboot`
+      后正常回到 Windows、点「撤销」能把恢复环境换回原镜像。
 
 # Task Dependencies
 

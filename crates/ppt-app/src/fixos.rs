@@ -35,21 +35,32 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// 写进恢复环境的脚本版本。
+///
+/// 改了 `openfixos.cmd` / `winpeshl.ini` 就 +1：已经装过的机器下次准备时会自动
+/// 重装一遍，否则它们会一直跑着旧脚本（镜像里的是副本，不会自己更新）。
+const SCRIPT_REV: u32 = 2;
+
 /// 恢复环境里用的目录（系统盘根目录，WinRE 里也能写）。
-const RESULT_DIR: &str = r"C:\OpenPPTView\fixos";
+///
+/// 不写死 `C:`：Windows 不一定装在 C 盘，恢复环境里盘符也可能变。
+fn result_dir() -> PathBuf {
+    let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+    PathBuf::from(format!(r"{drive}\OpenPPTView\fixos"))
+}
 
 /// 我们自己那份镜像与挂载点所在的目录。
 fn work_dir() -> PathBuf {
-    PathBuf::from(RESULT_DIR).join("WinRE")
+    result_dir().join("WinRE")
 }
 
 fn installed_path() -> PathBuf {
-    PathBuf::from(RESULT_DIR).join("installed.json")
+    result_dir().join("installed.json")
 }
 
 /// 「下次启动进 openFixOS」的一次性标记（正常启动后被清掉）。
 fn boot_pending_path() -> PathBuf {
-    PathBuf::from(RESULT_DIR).join("boottore.json")
+    result_dir().join("boottore.json")
 }
 
 /// 本机标记：openFixOS 已经装进恢复环境、原来的镜像在哪。
@@ -63,6 +74,9 @@ struct Installed {
     reason: String,
     /// 原来的 WinRE 位置（`reagentc /info` 里那一行）。
     original: String,
+    /// 当时装进去的脚本版本，见 [`SCRIPT_REV`]。
+    #[serde(default)]
+    script_rev: u32,
 }
 
 /// 「已经叫了 `/boottore`」的痕迹，只用来在设置页显示「下次重启会进修复」。
@@ -218,7 +232,7 @@ fn boot_pending() -> bool {
 
 /// 上次修复的结果（没有就是 None）。
 pub fn boot_result() -> Option<BootResult> {
-    let text = std::fs::read_to_string(PathBuf::from(RESULT_DIR).join("result.json")).ok()?;
+    let text = std::fs::read_to_string(result_dir().join("result.json")).ok()?;
     serde_json::from_str(&text).ok()
 }
 
@@ -265,6 +279,8 @@ pub fn status() -> Status {
         // 装过但恢复环境现在不可用：多半是系统更新把它还原/关掉了，重装一次即可
         "装过，但 Windows 恢复环境现在不可用（可能被系统更新还原了）：关掉开关再开启即可重装。"
             .to_string()
+    } else if installed.as_ref().map(|m| m.script_rev < SCRIPT_REV) == Some(true) {
+        "openFixOS 需要更新（程序里的修复脚本改过了）：点一次「立即准备」即可。".to_string()
     } else if installed.is_some() && pending {
         "已武装：下次重启会进入 openFixOS 自动修复，修完自己重启回 Windows。".to_string()
     } else if installed.is_some() {
@@ -308,9 +324,17 @@ pub fn status() -> Status {
 /// **这是阻塞的**：复制/挂载/搬镜像要几分钟。从界面调起时走
 /// [`install_background`]，别直接在命令里调用（会卡住主线程）。
 pub fn install(reason: &str) -> Result<(), String> {
-    // 已经待命：不重复搬镜像（那要几分钟，而且会白搬一次）
-    if read_installed().is_some() {
-        return Ok(());
+    // 已经待命、且镜像里是当前脚本：不重复搬镜像（那要几分钟，而且会白搬一次）
+    if let Some(done) = read_installed() {
+        if done.script_rev >= SCRIPT_REV {
+            return Ok(());
+        }
+        log::info!(
+            "openFixOS 脚本版本更新（{} → {}），重新装一遍",
+            done.script_rev,
+            SCRIPT_REV
+        );
+        let _ = std::fs::remove_file(installed_path());
     }
     set_step("读取恢复环境信息");
     if !crate::crash_repair::is_admin() {
@@ -389,6 +413,7 @@ pub fn install(reason: &str) -> Result<(), String> {
         installed_at: crate::crash::iso_utc(crate::crash::now_epoch()),
         reason: reason.to_string(),
         original,
+        script_rev: SCRIPT_REV,
     };
     std::fs::write(
         installed_path(),
@@ -425,7 +450,7 @@ pub fn arm_boot(reason: &str) -> Result<(), String> {
     let pending = BootPending {
         armed_at: crate::crash::iso_utc(crate::crash::now_epoch()),
     };
-    let _ = std::fs::create_dir_all(RESULT_DIR);
+    let _ = std::fs::create_dir_all(result_dir());
     std::fs::write(
         boot_pending_path(),
         serde_json::to_string_pretty(&pending).unwrap_or_default(),
@@ -513,7 +538,7 @@ pub fn after_normal_boot() {
 /// 复制成功后才删原件：万一这次报告没发出去，zip 还在 outbox 里，
 /// 结果也跟着 zip 一起等着下次补发，不会两处都没有。
 pub fn take_result_into(report_dir: &Path) {
-    let src = PathBuf::from(RESULT_DIR);
+    let src = result_dir();
     let dst = report_dir.join("fixos");
     let mut copied = false;
     for name in ["result.json", "result.log"] {
@@ -684,8 +709,12 @@ fn inject(image: &Path, mount: &Path) -> Result<(), String> {
         let _ = std::fs::copy(&ini, sys32.join("winpeshl.ini.orig"));
     }
     std::fs::write(&ini, WINPESHL_INI).map_err(|e| format!("写 winpeshl.ini 失败：{e}"))?;
-    std::fs::write(sys32.join("openfixos.cmd"), OPENFIXOS_CMD)
-        .map_err(|e| format!("写修复脚本失败：{e}"))?;
+    // cmd.exe 只认 CRLF；源码里的裸 LF 会让 `if` / `goto` / 重定向解析错位
+    std::fs::write(
+        sys32.join("openfixos.cmd"),
+        OPENFIXOS_CMD.replace('\n', "\r\n"),
+    )
+    .map_err(|e| format!("写修复脚本失败：{e}"))?;
 
     run_ok(
         "dism",
@@ -734,61 +763,69 @@ const WINPESHL_INI: &str = "[LaunchApps]\r\n%SYSTEMROOT%\\System32\\openfixos.cm
 
 /// 自动修复脚本。
 ///
-/// 原则：**一定要重启回去**。脚本中途任何一步失败都跳到 `:done`，
-/// 老师最多是「这次没修成」，绝不会停在一个没有界面的恢复环境里。
+/// 原则：
+/// - **一定要重启回去**：任何一步失败都走到 `wpeutil reboot`，不会停在半截；
+/// - **只能是纯 ASCII**：cmd.exe 按控制台代码页（中文系统是 GBK）读批处理，
+///   UTF-8 的中文会被读成乱码，还会把下一行吃掉 —— 真机上就是
+///   `'谁针凝?N' 不是内部或外部命令`、`X:\result.log 试图引用不存在的令牌`；
+/// - **盘符不写死**：恢复环境里盘符可能变，先找 `\Windows\System32\config\SYSTEM`
+///   定位系统盘，日志也写到那个盘上（否则应用读不到 `result.json`）。
 const OPENFIXOS_CMD: &str = r#"@echo off
 setlocal enabledelayedexpansion
-set OUT=C:\OpenPPTView\fixos
-set WIN=C:
-echo Powered by xxccdl 
-REM 找系统盘：哪个盘上有 \Windows\System32\config\SYSTEM
+
+rem ---- locate the Windows volume ----
+set WIN=
 for %%d in (C D E F G H) do if exist "%%d:\Windows\System32\config\SYSTEM" set WIN=%%d:
+if "%WIN%"=="" set WIN=C:
+set OUT=%WIN%\OpenPPTView\fixos
 if not exist "%OUT%" mkdir "%OUT%"
+set LOG=%OUT%\result.log
 del /q "%OUT%\result.json" 2>nul
-echo ==== openFixOS 开始 %DATE% %TIME% ==== > "%OUT%\result.log"
-echo 系统盘：%WIN% >> "%OUT%\result.log"
+echo ==== openFixOS start %DATE% %TIME% ==== > "%LOG%"
+echo Windows volume: %WIN% >> "%LOG%"
 
 set S_START=%DATE% %TIME%
 set STEPS=
 
-REM 0) 恢复环境入口被我们接管了：给老师一个反悔的机会。
-REM    没人按键（自动修复/蓝屏重启）就走默认 y，直接修。
-echo [0/4] 20 秒倒计时，按 N 跳过 >> "%OUT%\result.log"
-choice /c yn /n /t 20 /d y /m "openFixOS: repair starts in 20s, press N to skip"
+rem ---- 0) we took over the recovery entry: let the user opt out ----
+echo [0/4] countdown 20s, N to skip >> "%LOG%"
+if not exist "%SYSTEMROOT%\System32\choice.exe" goto countdown_done
+choice /c yn /n /t 20 /d y /m "openFixOS: repair starts in 20 seconds, press N to skip"
 if errorlevel 2 if not errorlevel 3 goto skip
+:countdown_done
 
-REM 1) 磁盘：坏扇区与文件系统
-echo [1/4] chkdsk %WIN% /f >> "%OUT%\result.log"
-chkdsk %WIN% /f >> "%OUT%\result.log" 2>&1
+rem ---- 1) disk: bad sectors and file system ----
+echo [1/4] chkdsk %WIN% /f >> "%LOG%"
+chkdsk %WIN% /f >> "%LOG%" 2>&1
 set STEPS=!STEPS!{"step":"chkdsk","exit":!ERRORLEVEL!},
 
-REM 2) 系统文件（离线）
-echo [2/4] sfc /scannow /offbootdir=%WIN%\ /offwindir=%WIN%\Windows >> "%OUT%\result.log"
-sfc /scannow /offbootdir=%WIN%\ /offwindir=%WIN%\Windows >> "%OUT%\result.log" 2>&1
+rem ---- 2) system files, offline ----
+echo [2/4] sfc /scannow /offbootdir=%WIN%\ /offwindir=%WIN%\Windows >> "%LOG%"
+sfc /scannow /offbootdir=%WIN%\ /offwindir=%WIN%\Windows >> "%LOG%" 2>&1
 set STEPS=!STEPS!{"step":"sfc","exit":!ERRORLEVEL!},
 
-REM 3) 组件存储
-echo [3/4] dism /Image:%WIN%\ /Cleanup-Image /RestoreHealth >> "%OUT%\result.log"
-dism /Image:%WIN%\ /Cleanup-Image /RestoreHealth >> "%OUT%\result.log" 2>&1
+rem ---- 3) component store ----
+echo [3/4] dism /Image:%WIN%\ /Cleanup-Image /RestoreHealth >> "%LOG%"
+dism /Image:%WIN%\ /Cleanup-Image /RestoreHealth >> "%LOG%" 2>&1
 set STEPS=!STEPS!{"step":"dism","exit":!ERRORLEVEL!},
 
-REM 4) 引导记录（MBR / 引导扇区 / BCD）
-echo [4/4] bootrec /fixmbr /fixboot /rebuildbcd >> "%OUT%\result.log"
-bootrec /fixmbr >> "%OUT%\result.log" 2>&1
-bootrec /fixboot >> "%OUT%\result.log" 2>&1
-bootrec /rebuildbcd >> "%OUT%\result.log" 2>&1
+rem ---- 4) boot records: MBR / boot sector / BCD ----
+echo [4/4] bootrec /fixmbr /fixboot /rebuildbcd >> "%LOG%"
+bootrec /fixmbr >> "%LOG%" 2>&1
+bootrec /fixboot >> "%LOG%" 2>&1
+bootrec /rebuildbcd >> "%LOG%" 2>&1
 set STEPS=!STEPS!{"step":"bootrec","exit":!ERRORLEVEL!}
 
 set S_END=%DATE% %TIME%
-> "%OUT%\result.json" echo {"startedAt":"%S_START%","finishedAt":"%S_END%","systemDrive":"%WIN%","steps":[!STEPS!],"summary":"磁盘、系统文件与引导记录已检查，详见 result.log"}
-echo ==== openFixOS 结束 %S_END% ==== >> "%OUT%\result.log"
-
-:done
-echo 正在重启回 Windows…
-wpeutil reboot
+> "%OUT%\result.json" echo {"startedAt":"%S_START%","finishedAt":"%S_END%","systemDrive":"%WIN%","steps":[!STEPS!],"summary":"chkdsk / sfc / dism / bootrec finished, see result.log"}
+echo ==== openFixOS end %S_END% ==== >> "%LOG%"
+goto done
 
 :skip
-echo 已跳过本次修复，正在重启回 Windows…
+echo openFixOS skipped by user >> "%LOG%"
+
+:done
+echo Rebooting to Windows...
 wpeutil reboot
 "#;
 
@@ -817,8 +854,25 @@ mod tests {
     fn openfixos_script_always_reboots() {
         // 这条是安全底线：脚本最后必须重启，不能把机器留在恢复环境
         assert!(OPENFIXOS_CMD.contains("wpeutil reboot"));
-        // 结果一定写进系统盘的固定目录
-        assert!(OPENFIXOS_CMD.contains(r"C:\OpenPPTView\fixos"));
+        // 结果写进找到的那个系统盘的固定目录（盘符不写死）
+        assert!(OPENFIXOS_CMD.contains(r"%WIN%\OpenPPTView\fixos"));
+    }
+
+    /// 真机上踩过的坑：cmd 按 GBK 读批处理，UTF-8 的中文会变成
+    /// `'谁针凝?N' 不是内部或外部命令`，还会把 `>` 重定向搞坏
+    /// （`X:\result.log` 试图引用不存在的令牌）。脚本必须是纯 ASCII。
+    #[test]
+    fn openfixos_script_is_pure_ascii() {
+        assert!(OPENFIXOS_CMD.is_ascii());
+        assert!(WINPESHL_INI.is_ascii());
+    }
+
+    /// 脚本写进镜像时要把 LF 换成 CRLF，否则 `if` / `goto` 会错位。
+    #[test]
+    fn openfixos_script_is_written_with_crlf() {
+        let text = OPENFIXOS_CMD.replace('\n', "\r\n");
+        assert!(!text.contains("\r\r\n"));
+        assert!(text.starts_with("@echo off\r\n"));
     }
 
     #[test]

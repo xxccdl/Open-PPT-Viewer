@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// 改了 `openfixos.cmd` / `winpeshl.ini` 就 +1：已经装过的机器下次准备时会自动
 /// 重装一遍，否则它们会一直跑着旧脚本（镜像里的是副本，不会自己更新）。
-const SCRIPT_REV: u32 = 3;
+const SCRIPT_REV: u32 = 4;
 
 /// 恢复环境里用的目录（系统盘根目录，WinRE 里也能写）。
 ///
@@ -77,6 +77,9 @@ struct Installed {
     /// 当时装进去的脚本版本，见 [`SCRIPT_REV`]。
     #[serde(default)]
     script_rev: u32,
+    /// 装完后核对过「系统里现在用的确实是我们这份」吗？`None` = 老记录，没核过。
+    #[serde(default)]
+    verified: Option<bool>,
 }
 
 /// 「已经叫了 `/boottore`」的痕迹，只用来在设置页显示「下次重启会进修复」。
@@ -284,6 +287,10 @@ pub fn status() -> Status {
             .to_string()
     } else if installed.as_ref().map(|m| m.script_rev < SCRIPT_REV) == Some(true) {
         "openFixOS 需要更新（程序里的修复脚本改过了）：点一次「立即准备」即可。".to_string()
+    } else if installed.as_ref().and_then(|m| m.verified) == Some(false) {
+        "装好了，但系统里的恢复镜像和刚装的那份对不上（很可能还在用旧副本）：\
+         重启一次后再点「立即准备」。"
+            .to_string()
     } else if installed.is_some() && pending {
         "已武装：下次重启会进入 openFixOS 自动修复，修完自己重启回 Windows。".to_string()
     } else if installed.is_some() {
@@ -332,15 +339,16 @@ pub fn status() -> Status {
 /// **这是阻塞的**：复制/挂载/搬镜像要几分钟。从界面调起时走
 /// [`install_background`]，别直接在命令里调用（会卡住主线程）。
 pub fn install(reason: &str) -> Result<(), String> {
-    // 已经待命、且镜像里是当前脚本：不重复搬镜像（那要几分钟，而且会白搬一次）
+    // 已经待命、脚本是当前版本、而且上次核对通过：不重复搬镜像（那要几分钟）
     if let Some(done) = read_installed() {
-        if done.script_rev >= SCRIPT_REV {
+        if done.script_rev >= SCRIPT_REV && done.verified != Some(false) {
             return Ok(());
         }
         log::info!(
-            "openFixOS 脚本版本更新（{} → {}），重新装一遍",
+            "openFixOS 需要重装（脚本 {} → {}，上次校验 {:?}）",
             done.script_rev,
-            SCRIPT_REV
+            SCRIPT_REV,
+            done.verified
         );
         let _ = std::fs::remove_file(installed_path());
     }
@@ -413,6 +421,22 @@ pub fn install(reason: &str) -> Result<(), String> {
         return Err(format!("启用恢复环境失败：{e}"));
     }
 
+    // 7) 核对：系统现在用的到底是不是我们刚装的那份？
+    //
+    // 真机上遇到过「装完重启还是旧脚本」：/enable 说成功，但恢复分区里没换。
+    // 大小对不上就先记下来（设置页会提示重启后再点一次），别假装成功。
+    set_step("核对系统里的恢复镜像");
+    let expected = std::fs::metadata(&image).map(|m| m.len()).unwrap_or(0);
+    let active = active_wim_size().unwrap_or(0);
+    let verified = expected != 0 && active == expected;
+    if verified {
+        log::info!("恢复镜像已确认换成本次注入的副本（{expected} 字节）");
+    } else {
+        log::warn!(
+            "恢复镜像校验没过：系统里是 {active} 字节，本次注入的是 {expected} 字节"
+        );
+    }
+
     // 副本已经装进恢复分区，工作目录里那份可以扔了；只留干净的底用于撤销
     let _ = std::fs::remove_dir_all(&image_dir);
     let _ = std::fs::remove_dir_all(&mount);
@@ -422,6 +446,7 @@ pub fn install(reason: &str) -> Result<(), String> {
         reason: reason.to_string(),
         original,
         script_rev: SCRIPT_REV,
+        verified: Some(verified),
     };
     std::fs::write(
         installed_path(),
@@ -685,6 +710,18 @@ fn original_winre_path(info: &str) -> Option<String> {
     None
 }
 
+/// 系统当前实际使用的恢复镜像有多大（读不到就是 None）。
+///
+/// 用在 `/enable` 之后核对「恢复分区里到底换没换」—— 真机上出现过
+/// reagentc 报成功、但重启后跑的仍是旧脚本。
+fn active_wim_size() -> Option<u64> {
+    let info = run("reagentc", &["/info"]).ok()?;
+    let loc = original_winre_path(&info)?;
+    std::fs::metadata(Path::new(&loc).join("winre.wim"))
+        .ok()
+        .map(|m| m.len())
+}
+
 /// 复制恢复镜像，并核对字节数。
 ///
 /// 半截的镜像比没有更糟：它会被当成「干净的底」留着，撤销时换回一个坏镜像。
@@ -725,12 +762,13 @@ fn inject(image: &Path, mount: &Path) -> Result<(), String> {
         let _ = std::fs::copy(&ini, sys32.join("winpeshl.ini.orig"));
     }
     std::fs::write(&ini, WINPESHL_INI).map_err(|e| format!("写 winpeshl.ini 失败：{e}"))?;
-    // cmd.exe 只认 CRLF；源码里的裸 LF 会让 `if` / `goto` / 重定向解析错位
-    std::fs::write(
-        sys32.join("openfixos.cmd"),
-        OPENFIXOS_CMD.replace('\n', "\r\n"),
-    )
-    .map_err(|e| format!("写修复脚本失败：{e}"))?;
+    // 脚本里留了 {REV} 占位（这样版本号只有 SCRIPT_REV 一个来源）；
+    // cmd.exe 只认 CRLF，源码里的裸 LF 会让 `if` / `goto` / 重定向解析错位。
+    let text = OPENFIXOS_CMD
+        .replace("{REV}", &SCRIPT_REV.to_string())
+        .replace('\n', "\r\n");
+    std::fs::write(sys32.join("openfixos.cmd"), text)
+        .map_err(|e| format!("写修复脚本失败：{e}"))?;
 
     run_ok(
         "dism",
@@ -805,7 +843,7 @@ color 0B
 echo.
 echo %BAR%
 echo.
-echo       o p e n F i x O S
+echo       o p e n F i x O S                                    rev {REV}
 echo.
 echo       offline repair for Windows startup and system files
 echo.
@@ -823,6 +861,7 @@ set OUT=%WIN%\OpenPPTView\fixos
 if not exist "%OUT%" mkdir "%OUT%" >nul 2>nul
 set LOG=%OUT%\result.log
 del /q "%OUT%\result.json" >nul 2>nul
+echo ==== openFixOS rev {REV} start %DATE% %TIME% ==== > "%LOG%"
 
 echo    Windows volume : %WIN%
 echo    Log file       : %LOG%
@@ -959,6 +998,15 @@ mod tests {
     fn openfixos_screen_credits_the_author() {
         assert!(OPENFIXOS_CMD.matches("xxccdl").count() >= 3);
         assert!(OPENFIXOS_CMD.contains("o p e n F i x O S"));
+    }
+
+    /// 屏幕上要能看出跑的是哪一版脚本：版本号写在开屏右上角，写镜像时替换掉占位符。
+    #[test]
+    fn openfixos_screen_shows_the_script_revision() {
+        assert!(OPENFIXOS_CMD.contains("{REV}"));
+        let rendered = OPENFIXOS_CMD.replace("{REV}", &SCRIPT_REV.to_string());
+        assert!(!rendered.contains("{REV}"));
+        assert!(rendered.contains(&format!("rev {SCRIPT_REV}")));
     }
 
     /// 脚本写进镜像时要把 LF 换成 CRLF，否则 `if` / `goto` 会错位。

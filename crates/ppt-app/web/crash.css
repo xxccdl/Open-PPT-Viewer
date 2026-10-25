@@ -279,6 +279,50 @@ body {
   color: var(--ok);
 }
 
+/* ---------- 跳过此环节 ---------- */
+
+/* 默认不占位：一个正在正常推进的环节不该出现「要不要跳过」的诱惑。
+   跑满 20 秒（后端发来 crash-skip-available）才由 body[data-skip] 放出来。 */
+.skip-btn {
+  display: none;
+  flex: none;
+  align-self: center;
+  padding: 5px 9px;
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.2;
+  color: var(--text);
+  white-space: nowrap;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 7px;
+  cursor: pointer;
+  transition: background 140ms var(--ease), border-color 140ms var(--ease);
+}
+
+.skip-btn:hover {
+  background: rgba(255, 255, 255, 0.14);
+  border-color: rgba(255, 255, 255, 0.28);
+}
+
+.skip-btn:active {
+  transform: scale(0.96);
+}
+
+.skip-btn:disabled {
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+body[data-skip="on"] .skip-btn {
+  display: block;
+}
+
+/* 按钮出来时给正文让一点位置：标题本来就有省略号，不会把布局撑破 */
+body[data-skip="on"] .compact-body {
+  padding-right: 2px;
+}
+
 /* ---------- 阶段切换 ---------- */
 
 /* 只要不是「正在分析」，就是小条形态 */

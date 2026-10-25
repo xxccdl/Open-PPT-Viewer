@@ -57,6 +57,24 @@ const UPLOAD_TIMEOUT: Duration = Duration::from_secs(45);
 static STARTED: AtomicBool = AtomicBool::new(false);
 /// 主进程启动前已经探测到的报告，交给 `setup` 用。
 static PENDING: std::sync::Mutex<Option<Report>> = std::sync::Mutex::new(None);
+/// 正在跑的那一轮修复的「跳过」开关（没有修复在跑时是 `None`）。
+static SKIP: std::sync::Mutex<Option<std::sync::Arc<crate::crash_repair::SkipControl>>> =
+    std::sync::Mutex::new(None);
+
+/// 界面点了「跳过此环节」。
+///
+/// 返回是否真的交给了一个正在跑的环节：修复已经结束时按钮可能还没来得及
+/// 收起来，这时什么都不做即可，不该报错。
+pub fn skip_current_step() -> bool {
+    let Ok(slot) = SKIP.lock() else {
+        return false;
+    };
+    let Some(control) = slot.as_ref() else {
+        return false;
+    };
+    control.request();
+    true
+}
 
 /* ------------------------------------------------------------------ */
 /* 设置                                                                */
@@ -1522,9 +1540,31 @@ fn run(app: AppHandle, report: Report) {
     // 不该去动一台老师的机器。
     if settings.repair {
         let a = app.clone();
-        let outcome =
-            crate::crash_repair::run(&dir, report.demo, &mut |msg| emit(&a, "repairing", msg));
+        let skip = std::sync::Arc::new(crate::crash_repair::SkipControl::new());
+        if let Ok(mut slot) = SKIP.lock() {
+            *slot = Some(skip.clone());
+        }
+        // 某个环节跑满 20 秒：把小条上的「跳过此环节」露出来
+        let for_slow = app.clone();
+        let on_slow: crate::crash_repair::SlowNotify = std::sync::Arc::new(move |step: &str| {
+            log::info!("修复环节「{step}」已超过 20 秒，允许跳过");
+            let _ = for_slow.emit("crash-skip-available", serde_json::json!({ "step": step }));
+        });
+
+        let outcome = crate::crash_repair::run(
+            &dir,
+            report.demo,
+            &mut |msg| emit(&a, "repairing", msg),
+            &skip,
+            &on_slow,
+        );
         log::info!("修复阶段结束：{}", outcome["verdict"]);
+
+        if let Ok(mut slot) = SKIP.lock() {
+            *slot = None;
+        }
+        // 修复结束，那个按钮不该再留着
+        let _ = app.emit("crash-skip-closed", ());
     }
 
     emit(&app, "sending", "");

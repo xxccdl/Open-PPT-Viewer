@@ -1769,6 +1769,49 @@ HKLM\...\Run\OpenPPTViewCrashReport。后来改用 `cargo tauri build`
   C:\Windows\Minidump\*.dmp。想确认，装好后打开设置页点「立即检查一次」。
 - 若是**断电 / 卡死强关**（不是蓝屏），Windows 只记 Kernel-Power 41，
   没有 bugcheck 码可分析 —— 这条我们不主动修，只靠 chkdsk /scan 那一步兜底。
+## Task 53: 修复环节超过 20 秒时，可以「跳过此环节」—— 已交付（0.3.2）
+
+### 需求
+
+修复阶段某一个环节跑得久（>20 秒），右下角小条右侧自动出现「跳过此环节」，
+点一下结束当前环节、直接进入下一环节。
+
+### 为什么必须留这个出口
+
+`sfc /scannow`、`DISM /RestoreHealth`、`chkdsk /scan` 在慢盘/老机器上都要
+十几分钟到半小时。老师是在等着上课，不能盯着一个没有出口的进度条 ——
+要么他强杀进程（报告就废了），要么他干脆不用这个功能。
+
+### 做法
+
+- **`SkipControl`**（`crash_repair.rs`）：一个 `AtomicBool` 旗子。命令的
+  轮询循环每 400ms 看一次，看到就 `kill` 子进程、把已产出的输出留下、
+  记一条「已跳过」，然后跑下一个环节。
+- **旗子是一次性的**：`request()` 置位、`take()` 取值即清，并且每进入一个
+  新环节还会 `clear()` —— 在 A 环节点的跳过，不能把还没开始的 B 也跳掉。
+- **20 秒怎么算**：每个环节挂一条计时线程（`watch_slow`），到点看
+  `SlowWatch` 还活着就发事件。用 `Drop` 收旗而不是手工置位，
+  命令提前返回（找不到程序、启动失败）也会正常收，不会出现
+  「命令早结束了，20 秒后却冒出按钮」的鬼影。
+- **界面**：`crash.js` 听 `crash-skip-available` → `body[data-skip="on"]` →
+  按钮出现；任何新环节（`crash-phase`）或整轮修复结束（`crash-skip-closed`）
+  都立刻收起，点不到过期按钮。点下去先自己禁用，再
+  `invoke('crash_skip_step')`，后端返回「有没有环节真的收到」。
+- **报告里分得清**：`verdict()` 把「跳过」和「失败」分开写 ——
+  跳过是老师主动的选择，不是这一项出问题，混在一起会让看报告的人
+  以为系统坏了三处。单条 `Step` 的 `summary` 也写明「跑了 N 秒后跳过」。
+
+### 验证
+
+- [x] `cargo test -p ppt-app`：**27 passed**，新增两条：
+  - `skip_stops_the_running_command`：真跑 `ping -n 30`（约 30 秒），
+    0.8 秒后请求跳过，断言返回 `< 12s` 且 `skipped=true`（实测整组测试 0.83s 跑完）
+  - `skip_flag_does_not_leak_into_the_next_step`：取一次即清 + 新环节 clear
+- [x] 界面（CDP 广播与后端同一条事件通道）：`crash-skip-available` 之后
+  `data-skip=on`、按钮 `display:block`、尺寸 75×25 @ (261,46)，
+  截图确认在右侧且不裁切；再发一个 `crash-phase` 后按钮自动收起
+- [ ] 真机上等 `sfc` 满 20 秒点一次（需要管理员权限 + 慢机器，本机没跑真 sfc）
+
 # Task Dependencies
 
 - Task 2 依赖 Task 1

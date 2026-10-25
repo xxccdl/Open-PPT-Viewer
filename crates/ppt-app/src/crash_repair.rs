@@ -29,12 +29,55 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
 /// 单条命令的进度回调（给右下角小条用）。
 pub type Progress<'a> = &'a mut dyn FnMut(&str);
+
+/// 某个环节跑满这么久，就把「跳过此环节」的按钮显示出来。
+///
+/// 20 秒是刻意选的：`sfc` / `chkdsk` 正常也要几分钟，但**开始**的这 20 秒
+/// 都还在扫描，跑得快慢很快就能看出来。老师在等着上课，不能让他盯着
+/// 一个没有出口的进度条。
+pub const SLOW_AFTER: Duration = Duration::from_secs(20);
+
+/// 「跳过当前环节」的开关。
+///
+/// 修复是一串阻塞的命令，没法从外面直接打断；这里给每条命令一个共享的
+/// 旗子，命令的轮询循环每 400ms 看一次，看到就结束子进程、记一条
+/// 「已跳过」，接着跑下一个环节。
+///
+/// 旗子**每进入一个环节就清一次**：老师在 A 环节点的跳过，不能顺手把
+/// 还没开始的 B 也跳掉。
+#[derive(Default)]
+pub struct SkipControl {
+    requested: AtomicBool,
+}
+
+impl SkipControl {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 请当前环节立刻收尾。
+    pub fn request(&self) {
+        self.requested.store(true, Ordering::SeqCst);
+    }
+
+    /// 进入新环节前清掉上一次的请求。
+    pub fn clear(&self) {
+        self.requested.store(false, Ordering::SeqCst);
+    }
+
+    /// 有没有人按了「跳过」（取一次就清，避免影响下一环节）。
+    fn take(&self) -> bool {
+        self.requested.swap(false, Ordering::SeqCst)
+    }
+}
 
 /// 一条修复命令跑完的样子。
 #[derive(Debug, Clone, Serialize)]
@@ -57,10 +100,55 @@ pub struct Step {
     pub log: String,
 }
 
+/// 「这个环节已经跑太久了」的通知（参数：给老师看的环节名）。
+///
+/// 用 `Arc<dyn Fn + Send + Sync>` 而不是普通引用：它要交给一条计时线程，
+/// 而那条线程在命令跑完前都不该被挡住。
+pub type SlowNotify = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// 「这一环节还没结束」的凭据：计时线程到点时先看它。
+///
+/// 用 `Drop` 而不是手工置位：`run_tool` 中途提前返回（命令不存在、
+/// 启动失败）也照样会把旗子放下来，不会出现「命令早结束了，
+/// 20 秒后却弹出跳过按钮」这种鬼影。
+struct SlowWatch {
+    alive: Arc<AtomicBool>,
+}
+
+impl Drop for SlowWatch {
+    fn drop(&mut self) {
+        self.alive.store(false, Ordering::SeqCst);
+    }
+}
+
+/// 给自己挂一个「20 秒后通知界面可以跳过」的计时器。
+fn watch_slow(on_slow: &SlowNotify, name: &str) -> SlowWatch {
+    let alive = Arc::new(AtomicBool::new(true));
+    let handle = {
+        let alive = alive.clone();
+        let name = name.to_string();
+        let on_slow = on_slow.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(SLOW_AFTER);
+            if alive.load(Ordering::SeqCst) {
+                on_slow(&name);
+            }
+        })
+    };
+    drop(handle); // 让它自己跑，不等它结束
+    SlowWatch { alive }
+}
+
 /// 运行修复。产物全部落在 `dir`（也就是 `crash/reports/<id>/`）下的 `repair/`。
 ///
 /// 返回的 JSON 会被合并进报告的 `summary.json`，随整包一起上传。
-pub fn run(dir: &Path, demo: bool, progress: Progress<'_>) -> serde_json::Value {
+pub fn run(
+    dir: &Path,
+    demo: bool,
+    progress: Progress<'_>,
+    skip: &SkipControl,
+    on_slow: &SlowNotify,
+) -> serde_json::Value {
     let started = crate::crash::now_epoch();
     let rdir = dir.join("repair");
     let _ = std::fs::create_dir_all(&rdir);
@@ -112,6 +200,8 @@ pub fn run(dir: &Path, demo: bool, progress: Progress<'_>) -> serde_json::Value 
         &sys32.join("sfc.exe"),
         &["/scannow".to_string()],
         Duration::from_secs(45 * 60),
+        skip,
+        on_slow,
     ));
 
     // 2) 组件存储：先扫，扫出问题才修（RestoreHealth 要联网，离线机房上跑不动）
@@ -127,6 +217,8 @@ pub fn run(dir: &Path, demo: bool, progress: Progress<'_>) -> serde_json::Value 
             "/ScanHealth".to_string(),
         ],
         Duration::from_secs(20 * 60),
+        skip,
+        on_slow,
     );
     let need_restore = store_needs_repair(&rdir, &scan);
     steps.push(scan);
@@ -144,6 +236,8 @@ pub fn run(dir: &Path, demo: bool, progress: Progress<'_>) -> serde_json::Value 
                 "/RestoreHealth".to_string(),
             ],
             Duration::from_secs(30 * 60),
+            skip,
+            on_slow,
         ));
     }
 
@@ -156,11 +250,17 @@ pub fn run(dir: &Path, demo: bool, progress: Progress<'_>) -> serde_json::Value 
         &sys32.join("chkdsk.exe"),
         &[system_drive.clone(), "/scan".to_string()],
         Duration::from_secs(25 * 60),
+        skip,
+        on_slow,
     ));
 
-    // 4) 驱动体检
+    // 4) 驱动体检：也是一次 PowerShell 查询，同样可能卡住，所以照样挂计时
     progress("正在检查驱动…");
-    let drivers = driver_check(&rdir);
+    let drivers = {
+        skip.clear();
+        let _slow = watch_slow(on_slow, "驱动体检");
+        driver_check(&rdir, skip)
+    };
 
     out["steps"] = serde_json::json!(steps);
     out["drivers"] = drivers;
@@ -205,20 +305,39 @@ fn store_output_needs_repair(text: &str) -> bool {
 }
 
 /// 一句话结论，给服务器和老师看。
+///
+/// 「跳过」和「失败」要分开说：跳过是老师主动做的选择，不是这一项出了问题，
+/// 混在一起会让看报告的人以为系统坏了三处。
 fn verdict(steps: &[Step]) -> String {
-    let broken: Vec<&Step> = steps.iter().filter(|s| !s.ok).collect();
-    if broken.is_empty() {
-        "修复已经跑完，没有发现需要处理的问题".to_string()
-    } else {
-        format!(
+    let skipped: Vec<&Step> = steps.iter().filter(|s| s.skipped).collect();
+    let broken: Vec<&Step> = steps.iter().filter(|s| !s.ok && !s.skipped).collect();
+
+    let names = |list: &[&Step]| {
+        list.iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>()
+            .join("、")
+    };
+
+    match (broken.is_empty(), skipped.is_empty()) {
+        (true, true) => "修复已经跑完，没有发现需要处理的问题".to_string(),
+        (true, false) => format!(
+            "修复已经跑完；其中 {} 项被跳过（{}），这几项没有结论",
+            skipped.len(),
+            names(&skipped)
+        ),
+        (false, true) => format!(
             "修复已经跑完，其中 {} 项没能完成：{}",
             broken.len(),
-            broken
-                .iter()
-                .map(|s| s.name.as_str())
-                .collect::<Vec<_>>()
-                .join("、")
-        )
+            names(&broken)
+        ),
+        (false, false) => format!(
+            "修复已经跑完，其中 {} 项没能完成：{}；另有 {} 项被跳过：{}",
+            broken.len(),
+            names(&broken),
+            skipped.len(),
+            names(&skipped)
+        ),
     }
 }
 
@@ -244,25 +363,38 @@ fn run_step(
     program: &Path,
     args: &[String],
     timeout: Duration,
+    skip: &SkipControl,
+    on_slow: &SlowNotify,
 ) -> Step {
     let command = format!("{} {}", program.display(), args.join(" "));
     let log_name = format!("{key}.log");
     let started = Instant::now();
 
+    // 新环节开始：上一次点的「跳过」不能顺手把这一条也跳了
+    skip.clear();
+
+    // 20 秒后还没跑完，就让界面把「跳过此环节」露出来
+    let _slow = watch_slow(on_slow, name);
+
     let result = if program.exists() {
-        run_tool(program, args, timeout)
+        run_tool(program, args, timeout, skip)
     } else {
         ToolResult {
             code: None,
             timed_out: false,
+            skipped: false,
             output: format!("找不到 {}", program.display()),
             spawn_error: Some("找不到程序".to_string()),
         }
     };
 
     let seconds = started.elapsed().as_secs();
-    let ok = !result.timed_out && result.code == Some(0);
-    let summary = if result.timed_out {
+    let ok = !result.timed_out && !result.skipped && result.code == Some(0);
+    let summary = if result.skipped {
+        format!(
+            "跑了 {seconds} 秒后跳过（这一项没有结论，报告里会注明）"
+        )
+    } else if result.timed_out {
         format!("超过 {} 分钟没有结束，已经中止", timeout.as_secs() / 60)
     } else if let Some(e) = &result.spawn_error {
         e.clone()
@@ -272,8 +404,9 @@ fn run_step(
 
     // 完整输出留档：排查时往往要看那几行「发现损坏并已修复」
     let log_text = format!(
-        "# {name}\n# {command}\n# 退出码 {code:?}　耗时 {seconds}s\n\n{output}",
+        "# {name}\n# {command}\n# 退出码 {code:?}　耗时 {seconds}s　跳过={skipped}\n\n{output}",
         code = result.code,
+        skipped = result.skipped,
         output = result.output
     );
     let _ = std::fs::write(rdir.join(&log_name), log_text);
@@ -283,7 +416,7 @@ fn run_step(
         name: name.to_string(),
         command,
         ok,
-        skipped: false,
+        skipped: result.skipped,
         timed_out: result.timed_out,
         exit_code: result.code,
         seconds,
@@ -295,11 +428,13 @@ fn run_step(
 struct ToolResult {
     code: Option<i32>,
     timed_out: bool,
+    /// 老师按了「跳过此环节」，这一条被提前结束。
+    skipped: bool,
     output: String,
     spawn_error: Option<String>,
 }
 
-fn run_tool(program: &Path, args: &[String], timeout: Duration) -> ToolResult {
+fn run_tool(program: &Path, args: &[String], timeout: Duration, skip: &SkipControl) -> ToolResult {
     use std::os::windows::process::CommandExt;
 
     let child = Command::new(program)
@@ -316,6 +451,7 @@ fn run_tool(program: &Path, args: &[String], timeout: Duration) -> ToolResult {
             return ToolResult {
                 code: None,
                 timed_out: false,
+                skipped: false,
                 output: String::new(),
                 spawn_error: Some(format!("启动失败：{e}")),
             }
@@ -330,11 +466,21 @@ fn run_tool(program: &Path, args: &[String], timeout: Duration) -> ToolResult {
 
     let deadline = Instant::now() + timeout;
     let mut timed_out = false;
+    let mut skipped = false;
     let code = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status.code(),
             Ok(None) => {}
             Err(_) => break None,
+        }
+        if skip.take() {
+            // 老师点了「跳过」：结束子进程，把已经产出的输出留下。
+            // `kill` 只杀直接子进程；sfc/chkdsk 没有自己起孙子进程，
+            // 这两个工具（以及 DISM）都是单进程干活的。
+            skipped = true;
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
         }
         if Instant::now() >= deadline {
             timed_out = true;
@@ -345,6 +491,7 @@ fn run_tool(program: &Path, args: &[String], timeout: Duration) -> ToolResult {
         std::thread::sleep(Duration::from_millis(400));
     };
 
+    // 杀掉子进程后管道会关闭，两条读线程随即返回 —— 这一步不会卡住
     let stdout = h1.join().unwrap_or_default();
     let stderr = h2.join().unwrap_or_default();
     let mut text = decode_console(&stdout);
@@ -359,6 +506,7 @@ fn run_tool(program: &Path, args: &[String], timeout: Duration) -> ToolResult {
     ToolResult {
         code,
         timed_out,
+        skipped,
         output: text,
         spawn_error: None,
     }
@@ -492,7 +640,7 @@ const DISABLE_CODES: &[i64] = &[10, 18, 28, 31, 37, 43];
 /// 一次最多停用几个。批量停一堆设备比蓝屏更难收场。
 const MAX_DISABLE: usize = 2;
 
-fn driver_check(rdir: &Path) -> serde_json::Value {
+fn driver_check(rdir: &Path, skip: &SkipControl) -> serde_json::Value {
     let script = r#"
 $ErrorActionPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
@@ -508,7 +656,7 @@ ConvertTo-Json -InputObject $list -Depth 4 -Compress
         "note": "",
     });
 
-    let Some(json) = ps_json(script, Duration::from_secs(45)) else {
+    let Some(json) = ps_json(script, Duration::from_secs(45), skip) else {
         value["note"] = serde_json::json!("读不到设备信息（PowerShell 查询失败或超时）");
         return value;
     };
@@ -549,7 +697,7 @@ ConvertTo-Json -InputObject $list -Depth 4 -Compress
         let cmd = format!(
             "$ErrorActionPreference='Stop'; Disable-PnpDevice -InstanceId '{safe_id}' -Confirm:$false"
         );
-        match run_powershell(&cmd, Duration::from_secs(30)) {
+        match run_powershell(&cmd, Duration::from_secs(30), skip) {
             Ok(text) if text.trim().is_empty() => {
                 log::info!("已停用反复报错的设备：{id}（{class}）");
                 disabled.push(serde_json::json!({
@@ -598,12 +746,12 @@ ConvertTo-Json -InputObject $list -Depth 4 -Compress
     value
 }
 
-fn ps_json(script: &str, timeout: Duration) -> Option<serde_json::Value> {
-    let text = run_powershell(script, timeout).ok()?;
+fn ps_json(script: &str, timeout: Duration, skip: &SkipControl) -> Option<serde_json::Value> {
+    let text = run_powershell(script, timeout, skip).ok()?;
     serde_json::from_str(text.trim()).ok()
 }
 
-fn run_powershell(script: &str, timeout: Duration) -> Result<String, String> {
+fn run_powershell(script: &str, timeout: Duration, skip: &SkipControl) -> Result<String, String> {
     let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
     let ps = PathBuf::from(system_root)
         .join("System32\\WindowsPowerShell\\v1.0\\powershell.exe");
@@ -621,7 +769,11 @@ fn run_powershell(script: &str, timeout: Duration) -> Result<String, String> {
             script.to_string(),
         ],
         timeout,
+        skip,
     );
+    if result.skipped {
+        return Err("已跳过".into());
+    }
     if result.timed_out {
         return Err("PowerShell 超时".into());
     }
@@ -716,5 +868,48 @@ mod tests {
             bytes.extend_from_slice(&u.to_le_bytes());
         }
         assert_eq!(decode_console(&bytes), "需要修复");
+    }
+
+    /// 点了「跳过」之后，正在跑的命令必须**很快**收尾。
+    ///
+    /// 用一个真的会跑约 30 秒的命令：`ping -n 30` 每秒一次。要求 12 秒内
+    /// 返回，既证明跳过生效，也留足了慢机器上调度延迟的余量。
+    #[test]
+    fn skip_stops_the_running_command() {
+        let skip = Arc::new(SkipControl::new());
+        let for_timer = skip.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(800));
+            for_timer.request();
+        });
+
+        let started = Instant::now();
+        let result = run_tool(
+            Path::new("C:\\Windows\\System32\\ping.exe"),
+            &["-n".to_string(), "30".to_string(), "127.0.0.1".to_string()],
+            Duration::from_secs(120),
+            &skip,
+        );
+        let spent = started.elapsed();
+
+        assert!(result.skipped, "应当记为「已跳过」");
+        assert!(!result.timed_out, "这不是超时");
+        assert!(
+            spent < Duration::from_secs(12),
+            "跳过之后还等了 {spent:?}"
+        );
+    }
+
+    /// 跳过旗子是一次性的：跳过一个环节之后，下一个环节不该被连坐。
+    #[test]
+    fn skip_flag_does_not_leak_into_the_next_step() {
+        let skip = SkipControl::new();
+        skip.request();
+        assert!(skip.take(), "第一次应当取到");
+        assert!(!skip.take(), "取过一次就该清掉");
+
+        skip.request();
+        skip.clear(); // 进入新环节
+        assert!(!skip.take(), "新环节开始后旧请求应当失效");
     }
 }

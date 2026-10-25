@@ -39,10 +39,25 @@ const PHASES = {
 };
 
 const detailEl = document.getElementById('detail');
+const skipBtn = document.getElementById('skip-btn');
+
+/**
+ * 「跳过此环节」的显隐。
+ *
+ * 后端只在某个环节跑满 20 秒后才发 `crash-skip-available`；任何一个
+ * 新环节开始（`crash-phase`）或者整轮修复结束，都立刻收起来 ——
+ * 不能让老师点到一个已经过期、点下去毫无反应的按钮。
+ */
+function setSkip(on) {
+  document.body.dataset.skip = on ? 'on' : 'off';
+  if (skipBtn) skipBtn.disabled = false;
+}
 
 function render(phase, message) {
   const p = PHASES[phase] || PHASES.analyzing;
   document.body.dataset.phase = phase;
+  // 阶段一变，上一环节的「跳过」就作废了
+  setSkip(false);
   if (phase === 'analyzing') return; // 大卡片那一段不换字
   const titleEl = document.querySelector('.compact-title');
   if (titleEl) titleEl.textContent = p.title;
@@ -55,8 +70,35 @@ function render(phase, message) {
       const payload = (event && event.payload) || {};
       render(payload.phase || 'analyzing', payload.message || '');
     });
+
+    // 某个环节跑太久了：把「跳过此环节」露出来
+    await listen('crash-skip-available', (event) => {
+      const step = (event && event.payload && event.payload.step) || '';
+      setSkip(true);
+      if (step && skipBtn) skipBtn.title = `跳过「${step}」`;
+    });
+
+    // 整轮修复结束
+    await listen('crash-skip-closed', () => setSkip(false));
   } catch (e) {
     console.warn('订阅 crash-phase 失败', e);
+  }
+
+  if (skipBtn) {
+    skipBtn.addEventListener('click', async () => {
+      // 先自己收起来：连点两下不该发两次请求
+      skipBtn.disabled = true;
+      setSkip(false);
+      try {
+        const accepted = await invoke('crash_skip_step');
+        if (!accepted) {
+          // 后端说「没有环节在跑」—— 那就不该假装跳过了
+          console.warn('跳过请求没被接收：当前没有正在执行的修复环节');
+        }
+      } catch (e) {
+        console.warn('跳过失败', e);
+      }
+    });
   }
 
   // 先按「正在分析」画出来，再让后端开始 —— 不留白屏

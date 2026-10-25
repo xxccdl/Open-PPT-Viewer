@@ -1889,6 +1889,12 @@ fn crash_self_test() -> crash::SelfTest {
     crash::self_test()
 }
 
+/// 诊断窗口上点了「跳过此环节」：让正在跑的那条修复命令收尾。
+#[tauri::command]
+fn crash_skip_step() -> bool {
+    crash::skip_current_step()
+}
+
 /// 打开蓝屏报告的留档目录（老师/管理员可以直接看到采集了什么）。
 #[tauri::command]
 fn open_crash_dir() -> Result<(), String> {
@@ -2573,6 +2579,7 @@ fn main() {
             crash_settings,
             set_crash_settings,
             crash_self_test,
+            crash_skip_step,
             open_crash_dir,
             crash_ready,
             check_update,

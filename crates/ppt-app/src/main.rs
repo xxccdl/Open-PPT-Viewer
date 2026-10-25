@@ -2507,6 +2507,9 @@ fn main() {
             // NSIS 安装包不写计划任务，装完如果没人补，蓝屏后重启就毫无反应。
             crash::ensure_startup();
 
+            // 上次没发出去的蓝屏报告，应用一起来就补送（只在确有待发件时联网）
+            crash::spawn_outbox_flush();
+
             // 主窗口在配置里是 `visible: false`：正常启动到这里才显示它。
             //
             // 为什么不在配置里直接 `visible: true`：蓝屏诊断（`--crash-report`）

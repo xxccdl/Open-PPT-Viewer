@@ -489,7 +489,7 @@
             </div>
             <div class="set-row">
               <span class="set-label">上报服务器</span>
-              <span class="set-value" id="set-crash-endpoint">未配置</span>
+              <span class="set-value" id="set-crash-endpoint">正在读取…</span>
             </div>
             <div class="set-inline">
               <input
@@ -498,7 +498,7 @@
                 type="text"
                 spellcheck="false"
                 autocomplete="off"
-                placeholder="https://你的服务器/api/v1/crash"
+                placeholder="留空就用内置服务器"
               />
               <button class="link-btn" id="btn-save-crash-endpoint">保存</button>
             </div>
@@ -507,7 +507,11 @@
               蓝屏后，下次开机自动分析并尝试修复：运行 Windows 自带的系统文件检查、
               组件存储检查与磁盘只读扫描，停用 Windows 已判定无法启动的非关键设备；
               然后把蓝屏信息、内核转储、修复日志一起打包发送到上面这个地址。
-              不含课件内容；地址留空则只在本地留档、不发送。
+              不含课件内容。留空就用内置服务器，不必自己配。
+            </p>
+            <p class="assoc-hint">
+              传不出去（断网、服务器不可达）时报告会留在本机，
+              下次开机或下次打开本应用时自动补发 —— 不会悄无声息地丢掉。
             </p>
             <p class="assoc-hint">
               修复需要管理员权限，安装时已经登记好「登录时以最高权限运行」的计划任务；

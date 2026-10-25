@@ -1812,6 +1812,64 @@ HKLM\...\Run\OpenPPTViewCrashReport。后来改用 `cargo tauri build`
   截图确认在右侧且不裁切；再发一个 `crash-phase` 后按钮自动收起
 - [ ] 真机上等 `sfc` 满 20 秒点一次（需要管理员权限 + 慢机器，本机没跑真 sfc）
 
+## Task 54: 报告从来没上传过服务器 —— 已修复（0.3.3）
+
+### 现象
+
+蓝屏分析、修复都跑完了，但服务器上一条记录也没有。日志里是
+「报告已保存在本地：…\outbox\demo-….zip」。
+
+### 根因：默认地址是空的
+
+`Settings::default()` 里 `endpoint: ""`，而设置页的输入框默认也是空的。
+`run()` 的判断是：
+
+```rust
+let endpoint = load_settings().endpoint.trim();
+if endpoint.is_empty() {
+    emit(&app, "local", "没有配置上报服务器，报告已保存在本机");
+}
+```
+
+于是**只要老师没手动填地址，报告就永远不会发出去**。实测这台机器上
+`settings.json` 根本不存在 → 走 `Default` → 空地址 → 每次都只留本地。
+
+设计上把「填地址」当成用户的事，实际结果是零台机器在发 —— 这个功能等于没做。
+
+### 修法
+
+- [x] **内置默认地址** `DEFAULT_ENDPOINT = https://xxccdl.cn/crash/api/v1/crash`
+  （就是 Task 50 部署的那台）。`Settings::default()`、`resolve_endpoint("")`
+  都指向它；设置页里留空 = 用内置地址，填了就传给学校自己的服务器。
+- [x] `load_settings` 对老文件里的 `endpoint: ""` 也做同样的补全 ——
+  升级上来的机器不用手动改设置。
+- [x] 每个字段单独 `#[serde(default = …)]`：老版本 `settings.json` 少字段时
+  不会整份解析失败退回 `Default`，老师**明确关掉**的开关不会被悄悄顶开。
+- [x] **采集失败也上报**：`collect()` 出错（没权限读转储、磁盘满）不再
+  「分析没能完成」就退出，而是落一份最小报告（`summary.json` + `system.txt`，
+  里面写着失败原因），修复照跑、上传照发 —— 「蓝屏了但采不到现场」本身
+  就是要告诉服务器的事。
+- [x] **打包失败也上报**：`finish()` 失败时用最小报告重打一次再发。
+- [x] **应用启动时补发**：`spawn_outbox_flush()` 在 `setup` 里检查 outbox，
+  确有 `.zip` 才起线程补送（不为此联网）。以前只有「登录自检且当天没新蓝屏」
+  那一条路会补发，老师一直不重启就永远卡着。
+- [x] 设置页文案改成「留空就用内置服务器 …… 传不出去会留在本机，下次开机
+  或下次打开本应用时自动补发」。
+
+### 验证
+
+- [x] `cargo test -p ppt-app`：**29 passed**，新增两条：
+  - `empty_endpoint_falls_back_to_the_builtin_one`（空/空白→内置；自定义地址去空格保留）
+  - `partial_settings_keep_what_the_teacher_chose`（`{"enabled":false,"endpoint":""}`
+    解析后 `enabled` 仍是 false）
+- [x] **删掉 `settings.json` 后跑 `--crash-report-demo`**：
+  日志 `蓝屏报告已发送：demo-20261025-022336`；服务端 `GET /api/v1/crashes`
+  收到 5619 字节，`remote` 是真实公网 IP
+- [x] **启动补发**：手造 `outbox/probe-flush-0001.zip` + 旁挂 json，
+  正常启动应用 → 日志 `有待补发的蓝屏报告，正在后台补送` →
+  `上一次的蓝屏报告已补送：probe-flush-0001`，outbox 清空
+- [x] 服务端测试数据已清空（`count: 0`）
+
 # Task Dependencies
 
 - Task 2 依赖 Task 1

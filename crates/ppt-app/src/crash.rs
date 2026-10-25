@@ -80,18 +80,32 @@ pub fn skip_current_step() -> bool {
 /* 设置                                                                */
 /* ------------------------------------------------------------------ */
 
+/// 内置的上报地址。
+///
+/// # 为什么要有内置地址
+///
+/// 这个功能的价值全在「机器出问题的时候我们能看到」。地址只靠老师自己填，
+/// 实际结果就是**一台都不填**：装完之后每次都是「报告已保存在本机」，
+/// 服务器上一条记录也没有 —— 等于没做。
+///
+/// 所以默认就指向我们自己的接收服务；老师仍然可以在设置里改成学校自己的
+/// 地址（那台机器上传到那台），留空则回到这里。
+pub const DEFAULT_ENDPOINT: &str = "https://xxccdl.cn/crash/api/v1/crash";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
     /// 关掉之后：登录时仍然会启动一次，但**立刻退出**，不分析也不上传。
+    ///
+    /// 每个字段都单独给默认值：老版本留下的 `settings.json` 少字段时，
+    /// 不该整份解析失败退回 `Default` —— 那会把老师明确关掉的开关又打开。
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// 蓝屏后要不要自动尝试修复。关掉就只分析、只上报。
-    ///
-    /// `serde(default)`：这个字段是后加的，老版本留下的 `settings.json`
-    /// 里没有它 —— 缺省按「开」读，不能让老师升级完发现修复悄悄没了。
     #[serde(default = "default_true")]
     pub repair: bool,
-    /// 上报地址。留空 = 只分析、只存在本地。
+    /// 上报地址。空 = 用 [`DEFAULT_ENDPOINT`]。
+    #[serde(default = "default_endpoint")]
     pub endpoint: String,
 }
 
@@ -99,12 +113,29 @@ fn default_true() -> bool {
     true
 }
 
+fn default_endpoint() -> String {
+    DEFAULT_ENDPOINT.to_string()
+}
+
+/// 设置里那个地址 → 真正要用的地址。
+///
+/// 空（没填、或老版本写下的空串）就回到内置地址：这个功能的价值全在
+/// 「出事时我们能看到」，留空等于不发。
+fn resolve_endpoint(raw: &str) -> String {
+    let t = raw.trim();
+    if t.is_empty() {
+        DEFAULT_ENDPOINT.to_string()
+    } else {
+        t.to_string()
+    }
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
             enabled: true,
             repair: true,
-            endpoint: String::new(),
+            endpoint: default_endpoint(),
         }
     }
 }
@@ -127,6 +158,9 @@ pub fn load_settings() -> Settings {
         .ok()
         .and_then(|t| serde_json::from_str::<Settings>(&t).ok())
         .unwrap_or_default();
+    // 旧版本写过 `endpoint: ""`（那时留空表示「只留本地」）。
+    // 现在留空一律回到内置地址：不填地址就收不到报告，这个功能等于没做。
+    s.endpoint = resolve_endpoint(&s.endpoint);
     // 环境变量优先：部署时（或我们排查时）不必去改用户目录里的文件
     if let Ok(v) = std::env::var("OPENPPTVIEW_CRASH_ENDPOINT") {
         if !v.trim().is_empty() {
@@ -138,7 +172,10 @@ pub fn load_settings() -> Settings {
 
 pub fn save_settings(s: &Settings) -> Result<(), String> {
     std::fs::create_dir_all(root_dir()).map_err(|e| format!("建不出目录：{e}"))?;
-    let text = serde_json::to_string_pretty(s).map_err(|e| e.to_string())?;
+    // 空地址不落盘成空串：存成内置地址，下次打开设置页看到的就是真正在用的那个
+    let mut s = s.clone();
+    s.endpoint = resolve_endpoint(&s.endpoint);
+    let text = serde_json::to_string_pretty(&s).map_err(|e| e.to_string())?;
     std::fs::write(settings_path(), text).map_err(|e| format!("写设置失败：{e}"))
 }
 
@@ -602,6 +639,48 @@ pub fn collect(report: &Report) -> Result<PathBuf, String> {
     write_json(&dir.join("summary.json"), &summary)?;
 
     Ok(dir)
+}
+
+/// 采集失败时也要留下**能发出去的东西**。
+///
+/// # 为什么不直接放弃
+///
+/// 采集失败本身就是线索：读不了 `C:\Windows\Minidump` 通常意味着没拿到
+/// 管理员权限（这正是「为什么没修」的答案），写不进文件常常意味着磁盘满了
+/// —— 而磁盘满是蓝屏的常见原因之一。这些比「服务器上什么都没有」有用得多。
+///
+/// 所以失败也落一个只含 `summary.json` + `system.txt` 的目录，让后面的
+/// 打包与上传照常走完。
+fn collect_fallback(report: &Report, error: &str) -> PathBuf {
+    let dir = root_dir().join("reports").join(&report.id);
+    let _ = std::fs::create_dir_all(&dir);
+
+    let mut info = vec![
+        ("应用版本".to_string(), env!("CARGO_PKG_VERSION").to_string()),
+        ("采集时间".to_string(), iso_utc(now_epoch())),
+        ("蓝屏代码".to_string(), report.bugcheck.clone()),
+        ("发生时间".to_string(), report.occurred_at.clone()),
+        ("采集失败".to_string(), error.to_string()),
+    ];
+    info.extend(system_info());
+
+    let text = info
+        .iter()
+        .map(|(k, v)| format!("{k}: {v}"))
+        .collect::<Vec<_>>()
+        .join("\r\n");
+    let _ = std::fs::write(dir.join("system.txt"), text);
+
+    let summary = serde_json::json!({
+        "version": 1,
+        "report": report,
+        "collectError": error,
+        "hasDumpFiles": [],
+        "system": info.iter().map(|(k, v)| serde_json::json!({"name": k, "value": v}))
+            .collect::<Vec<_>>(),
+    });
+    let _ = write_json(&dir.join("summary.json"), &summary);
+    dir
 }
 
 /// 把「修复日志」并进摘要，再封包。
@@ -1255,10 +1334,10 @@ pub fn self_test() -> SelfTest {
 /// 也就不必在客户端和服务端各背一套 multipart 实现。
 pub fn upload(receipt: &Receipt, report: &Report) -> Result<(), String> {
     let settings = load_settings();
-    let endpoint = settings.endpoint.trim();
-    if endpoint.is_empty() {
-        return Err("没有配置上报服务器".into());
-    }
+    // `load_settings` 已经把空地址补成内置地址，这里再兜一道：
+    // 万一将来有人加了别的来源，也不该出现「悄悄不发」。
+    let endpoint = resolve_endpoint(&settings.endpoint);
+    let endpoint = endpoint.as_str();
 
     let client = reqwest::blocking::Client::builder()
         .user_agent(format!("OpenPPTView/{}", env!("CARGO_PKG_VERSION")))
@@ -1289,6 +1368,33 @@ pub fn upload(receipt: &Receipt, report: &Report) -> Result<(), String> {
         return Err(format!("服务器返回 {}", resp.status()));
     }
     Ok(())
+}
+
+/// 应用正常启动时调一次：把上次没发出去的报告补发掉。
+///
+/// 只在**确实有待发件**时才起线程：绝大多数启动是空的，不该为此连一次网。
+///
+/// 为什么不能只靠登录自检那条路：老师可能一直没重启过机器，或者自检那次
+/// 因为断网没发出去 —— 只要他打开过一次课件，这份报告就应该送到服务器。
+pub fn spawn_outbox_flush() {
+    if !enabled() {
+        return;
+    }
+    let outbox = root_dir().join("outbox");
+    let pending = std::fs::read_dir(&outbox)
+        .map(|entries| {
+            entries.flatten().any(|e| {
+                e.path().extension().and_then(|s| s.to_str()) == Some("zip")
+            })
+        })
+        .unwrap_or(false);
+    if !pending {
+        return;
+    }
+    std::thread::spawn(|| {
+        log::info!("有待补发的蓝屏报告，正在后台补送");
+        flush_outbox();
+    });
 }
 
 /// 上次没送出去的包，这次开机再试一遍。
@@ -1518,21 +1624,17 @@ fn run(app: AppHandle, report: Report) {
     };
     shrink_to_corner(&app);
 
+    // 采集失败也继续往下走：先落一个最小报告，修复照跑、上传照发。
+    // 「这台机器蓝屏了但我们没采到现场」本身就是要告诉服务器的事。
     let dir = match rx.recv_timeout(Duration::from_secs(120)) {
         Ok(Ok(dir)) => dir,
         Ok(Err(e)) => {
-            log::warn!("蓝屏分析没完成：{e}");
-            emit(&app, "failed", &format!("分析没能完成：{e}"));
-            std::thread::sleep(OUTRO_HOLD + Duration::from_millis(1200));
-            app.exit(0);
-            return;
+            log::warn!("采集没完成（仍会上报一份最小报告）：{e}");
+            collect_fallback(&report, &e)
         }
         Err(_) => {
-            log::warn!("蓝屏分析超时");
-            emit(&app, "failed", "分析没能完成：超时");
-            std::thread::sleep(OUTRO_HOLD + Duration::from_millis(1200));
-            app.exit(0);
-            return;
+            log::warn!("采集超时（仍会上报一份最小报告）");
+            collect_fallback(&report, "采集超时（120 秒）")
         }
     };
 
@@ -1575,38 +1677,39 @@ fn run(app: AppHandle, report: Report) {
     }
     let sending_at = sending_at.unwrap();
 
+    // 打包。失败也不能就此收手：重打一份最小值（只有一个摘要）再试一次 ——
+    // 只要服务器能收到「谁、什么时候、什么错误码」，这一趟就没白跑。
     let receipt = match finish(&report, &dir) {
         Ok(r) => r,
         Err(e) => {
-            log::warn!("蓝屏报告没能打包：{e}");
-            emit(&app, "failed", &format!("报告没能打包：{e}"));
-            std::thread::sleep(OUTRO_HOLD + Duration::from_millis(1200));
-            app.exit(0);
-            return;
+            log::warn!("报告没能打包，改用最小包重试：{e}");
+            let fallback = collect_fallback(&report, &format!("打包失败：{e}"));
+            match finish(&report, &fallback) {
+                Ok(r) => r,
+                Err(e2) => {
+                    log::warn!("最小包也没打成（只能留本地）：{e2}");
+                    emit(&app, "failed", &format!("报告没能打包：{e2}"));
+                    std::thread::sleep(OUTRO_HOLD + Duration::from_millis(1200));
+                    app.exit(0);
+                    return;
+                }
+            }
         }
     };
 
-    let endpoint = load_settings().endpoint.trim().to_string();
-    if endpoint.is_empty() {
-        hold_phase(sending_at, 1200);
-        emit(&app, "local", "没有配置上报服务器，报告已保存在本机");
-        log::info!("报告已保存在本地：{}", receipt.zip.display());
-        std::thread::sleep(OUTRO_HOLD + Duration::from_millis(600));
-    } else {
-        match upload(&receipt, &report) {
-            Ok(()) => {
-                log::info!("蓝屏报告已发送：{}", receipt.id);
-                hold_phase(sending_at, 1200);
-                emit(&app, "sent", "");
-                let _ = std::fs::remove_file(&receipt.zip);
-                let _ = std::fs::remove_file(receipt.zip.with_extension("json"));
-                std::thread::sleep(OUTRO_HOLD);
-            }
-            Err(e) => {
-                log::warn!("蓝屏报告发送失败（留着下次再试）：{e}");
-                emit(&app, "failed", &e);
-                std::thread::sleep(OUTRO_HOLD + Duration::from_millis(1500));
-            }
+    match upload(&receipt, &report) {
+        Ok(()) => {
+            log::info!("蓝屏报告已发送：{}", receipt.id);
+            hold_phase(sending_at, 1200);
+            emit(&app, "sent", "");
+            let _ = std::fs::remove_file(&receipt.zip);
+            let _ = std::fs::remove_file(receipt.zip.with_extension("json"));
+            std::thread::sleep(OUTRO_HOLD);
+        }
+        Err(e) => {
+            log::warn!("蓝屏报告发送失败（留在本地，下次开机再试）：{e}");
+            emit(&app, "failed", &e);
+            std::thread::sleep(OUTRO_HOLD + Duration::from_millis(1500));
         }
     }
 
@@ -1839,5 +1942,28 @@ mod tests {
         let r = detect(Mode::Demo).expect("演示模式总该有报告");
         assert!(r.demo);
         assert!(r.id.starts_with("demo-"));
+    }
+
+    /// 没填地址时一律用内置服务器。
+    ///
+    /// 这条是「报告从没上传过」的直接回归：以前留空 = 只留本地，
+    /// 而设置页默认就是空的，等于这个功能从来没联通过网。
+    #[test]
+    fn empty_endpoint_falls_back_to_the_builtin_one() {
+        assert_eq!(resolve_endpoint(""), DEFAULT_ENDPOINT);
+        assert_eq!(resolve_endpoint("   "), DEFAULT_ENDPOINT);
+        assert_eq!(
+            resolve_endpoint(" https://school.example/crash "),
+            "https://school.example/crash"
+        );
+    }
+
+    /// 老版本留下的 `settings.json` 少字段时，不能把老师关掉的开关顶开。
+    #[test]
+    fn partial_settings_keep_what_the_teacher_chose() {
+        let s: Settings =
+            serde_json::from_str(r#"{"enabled":false,"endpoint":""}"#).expect("应当能解析");
+        assert!(!s.enabled, "关闭状态必须保留");
+        assert!(s.repair, "缺字段按默认为开");
     }
 }

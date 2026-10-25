@@ -4241,7 +4241,7 @@ function paintFixos(st) {
   // 后台准备期间按钮不能点：重复点会再复制一份镜像
   el.btnFixosArm.disabled = !!st.busy;
   el.btnFixosToggle.disabled = !!st.busy;
-  el.btnFixosCancel.disabled = !!st.busy || !st.installed;
+  el.btnFixosCancel.disabled = !!st.busy || !st.canRestore;
 }
 
 async function refreshFixos() {

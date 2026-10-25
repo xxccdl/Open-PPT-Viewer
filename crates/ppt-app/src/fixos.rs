@@ -133,6 +133,8 @@ pub struct Status {
     pub installed_at: String,
     /// 已经叫过 `reagentc /boottore`：下次重启会进 openFixOS。
     pub boot_pending: bool,
+    /// 还能「撤销」：装过，或者至少还留着干净的原始镜像。
+    pub can_restore: bool,
     /// 上次修复的结果（没有就是 null）。
     pub result: Option<BootResult>,
     /// 正在准备（复制/挂载镜像要一两分钟）。
@@ -260,6 +262,7 @@ pub fn status() -> Status {
     };
     let installed = read_installed();
     let pending = boot_pending();
+    let can_restore = installed.is_some() || work_dir().join("original").join("winre.wim").exists();
     let result = boot_result();
 
     let detail = if busy {
@@ -285,6 +288,10 @@ pub fn status() -> Status {
         "已武装：下次重启会进入 openFixOS 自动修复，修完自己重启回 Windows。".to_string()
     } else if installed.is_some() {
         "已待命：恢复环境已换成 openFixOS，蓝屏或系统起不来时会自动修复。".to_string()
+    } else if can_restore {
+        // 标记丢了但镜像还在：多半是安装被打断（比如装到一半重启）
+        "恢复环境里可能还留着上一版 openFixOS：点「立即准备」重装，或点「撤销」还原。"
+            .to_string()
     } else {
         "已开启，但还没装好 —— 点「立即准备」装一次（几分钟，只需一次）。".to_string()
     };
@@ -296,6 +303,7 @@ pub fn status() -> Status {
         installed: installed.is_some(),
         installed_at: installed.map(|m| m.installed_at).unwrap_or_default(),
         boot_pending: pending,
+        can_restore,
         result,
         busy,
         step,
@@ -498,14 +506,22 @@ pub fn arm_boot_background(reason: &str) -> Result<(), String> {
 }
 
 /// 撤销：把恢复环境还原成原来的镜像，删掉我们的副本。
+///
+/// 不依赖 `installed.json`：那个文件可能被清理软件删掉、也可能某次安装刚好在
+/// 写标记前被打断 —— 只要还留着干净的底（`WinRE\original\winre.wim`）就照样能还原。
+/// 否则「装进去了却撤不回来」是最糟的状态。
 pub fn cancel() -> Result<(), String> {
     if !crate::crash_repair::is_admin() {
         return Err("需要管理员权限".into());
     }
-    let Some(marker) = read_installed() else {
+    let marker = read_installed();
+    let pristine = work_dir().join("original").join("winre.wim");
+    if marker.is_none() && !pristine.exists() {
+        // 没装过、也没有镜像可还原：什么也不用做
         return Ok(());
-    };
-    if !restore_original(&marker.original) {
+    }
+    let original = marker.map(|m| m.original).unwrap_or_default();
+    if !restore_original(&original) {
         return Err(
             "没能完全还原恢复环境：镜像先留在 C:\\OpenPPTView\\fixos\\，\
              请在管理员命令行执行一次 reagentc /enable 后重试撤销"

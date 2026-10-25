@@ -2092,15 +2092,15 @@ fn run_update(app: &tauri::AppHandle, release: update::Release) -> Result<(), St
         app,
         "installing",
         100.0,
-        "正在安装，请在弹出的系统提示里点「是」",
+        "马上打开安装程序，按向导点几下就好（本窗口会自动关闭）",
         mbps,
     );
     update::launch_installer(&dest)?;
-    log::info!("升级程序已启动，本程序即将退出");
+    log::info!("安装程序将在约 4 秒后打开，本程序先退出（免得它以为我们还在跑而放弃安装）");
 
-    // 给界面一点时间把这句话显示出来，再请自己退出。
-    // 退出走「先把标注落盘」那条路（见 `resident::quit`）。
-    std::thread::sleep(std::time::Duration::from_millis(1500));
+    // 尽快退出：安装程序会检查 OpenPPTView 是否还在运行，我们晚走一步，
+    // 它就可能在「应用还在跑」上直接放弃。那 4 秒延迟写在 cmd 那条命令里。
+    std::thread::sleep(std::time::Duration::from_millis(600));
     resident::quit(app);
     Ok(())
 }

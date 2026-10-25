@@ -300,25 +300,54 @@ pub fn verify(path: &Path, release: &Release) -> Result<(), String> {
     Ok(())
 }
 
-/// 静默安装新版本。
+/// 打开安装程序（**带界面**）。
 ///
-/// # 参数是 NSIS 的那一套，不是我们自己安装器的
+/// # 以前为什么看起来像「安装程序没出来，应用自己又开了一个」
 ///
-/// 打包已经换成 Tauri 自带的 NSIS（`cargo tauri build`），它认的是
-/// `/S`（静默）和 `/R`（装完把应用拉回来）。以前自制安装器认 `--silent`，
-/// 照搬过来的话 NSIS 会当成未知参数忽略 —— 老师点「立即更新」，
-/// 弹出来的是一整屏安装向导，而且装完应用不会回来。
+/// 以前是 `ShellExecuteW(setup, "/S /R")`：
+/// - `/S` 是静默安装 —— 老师根本看不到安装程序；
+/// - 而安装程序自己会检查 OpenPPTView 是否还在运行，我们这边 1.5 秒后才退出，
+///   它一看还在跑就直接放弃（静默模式下连提示都没有）；
+/// - 接着 `/R` 把应用重新拉起来 —— 于是看起来就是「没安装，弹了个自己」。
 ///
-/// `/R` 尤其重要：Tauri 模板用 `nsis_tauri_utils::RunAsUser` 拉起应用，
-/// 是**普通用户权限**，顺带避开了「装完那份带管理员权限、拖拽失效」的老问题。
+/// # 现在怎么做
 ///
-/// # 为什么走 `ShellExecuteW` 而不是 `Command::new`
+/// 用 `cmd /c ping … & start "" "<安装包>"`：先等 4 秒（那时本进程已经退出），
+/// 再用外壳打开安装程序。向导一屏屏走，完成页默认勾着「打开 OpenPPTView」，
+/// 所以不需要 `/R`。
 ///
-/// 安装程序带「需要管理员权限」的清单，用 `CreateProcess` 直接起会
-/// 以 `ERROR_ELEVATION_REQUIRED(740)` 失败。交给系统外壳才会弹出
-/// 「是否允许此应用对你的设备进行更改」那个系统提示。
+/// `start` 和以前一样走 ShellExecute，安装包里「需要管理员权限」的清单照样会
+/// 弹系统提示；这里不经过 URL，也就不必担心 `&` 被当成命令分隔符 ——
+/// 万一路径里真出现了 cmd 的元字符，直接退回外壳立即打开，绝不拼进命令行。
 pub fn launch_installer(setup: &Path) -> Result<(), String> {
-    crate::shell_execute(&setup.to_string_lossy(), Some("/S /R"))
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let path = setup.to_string_lossy();
+    let Some(cmdline) = installer_cmdline(&path) else {
+        return crate::shell_execute(&path, None);
+    };
+
+    std::process::Command::new("cmd.exe")
+        .raw_arg(cmdline)
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("启动安装程序失败：{e}"))
+}
+
+/// `cmd` 的命令行：等 4 秒再打开安装包。
+///
+/// 路径里含 cmd 元字符（`& | < > ^ % "`）时返回 `None` —— 那种路径拼进命令行
+/// 会被当成别的命令执行，宁可退回「立刻用外壳打开」。
+fn installer_cmdline(path: &str) -> Option<String> {
+    if path.contains(['&', '|', '<', '>', '^', '%', '"']) {
+        return None;
+    }
+    // ping 当 sleep 用：`-n 5` 约等于 4 秒（timeout.exe 在精简环境里不一定有）
+    Some(format!(
+        "/c ping -n 5 127.0.0.1 >nul & start \"\" \"{path}\""
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -508,6 +537,28 @@ mod tests {
         assert!(is_newer("0.0.2", "0.0.1"));
         assert!(!is_newer("0.1.0", "0.1.0"));
         assert!(!is_newer("0.0.9", "0.1.0"));
+    }
+
+    /// 更新时打开安装程序的命令行：**带界面**、先等几秒、绝不再用 `/S`。
+    ///
+    /// 真机上的坑：`/S /R` 让安装程序静默跑，它又因为我们还没退出而直接放弃，
+    /// 最后 `/R` 把应用重新拉起来 —— 老师看到的就是「安装程序没出来，应用又开了一个」。
+    #[test]
+    fn installer_is_launched_with_ui_after_a_short_wait() {
+        let line = installer_cmdline(r"C:\Users\a\AppData\Local\Temp\OpenPPTView-0.3.11.exe")
+            .expect("普通路径应当能拼出命令行");
+        assert!(line.contains("start \"\" \""), "要用外壳打开（会弹 UAC）：{line}");
+        assert!(line.contains("ping -n 5"), "先等本进程退出：{line}");
+        assert!(!line.contains("/S"), "不能再静默安装：{line}");
+        assert!(!line.contains("/R"), "应用由完成页那个勾选拉起来：{line}");
+    }
+
+    /// 路径里有 cmd 元字符时不做命令行拼接，退回外壳立即打开。
+    #[test]
+    fn installer_path_with_cmd_metacharacters_falls_back() {
+        assert!(installer_cmdline(r"C:\Temp\a&b.exe").is_none());
+        assert!(installer_cmdline(r"C:\Temp\a%b.exe").is_none());
+        assert!(installer_cmdline(r"C:\Temp\a b.exe").is_some(), "空格是允许的");
     }
 
     #[test]

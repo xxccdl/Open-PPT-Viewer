@@ -825,6 +825,408 @@ fn total_ram_mb() -> Option<u64> {
 }
 
 /* ------------------------------------------------------------------ */
+/* 开机自检的登记                                                      */
+/* ------------------------------------------------------------------ */
+
+/// 登录时跑一次诊断的计划任务名。
+///
+/// 与 `ppt-installer` 的 `TASK_NAME` 必须一致：安装程序登记的是这个名字，
+/// 应用自愈时查的也是它。
+const TASK_NAME: &str = "OpenPPTViewCrashReport";
+/// `HKCU\...\Run` 下的值名（退路：不需要管理员权限）。
+const RUN_VALUE: &str = "OpenPPTViewCrashReport";
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Startup {
+    /// 计划任务在不在（能拿到管理员权限的那条路）。
+    pub task: bool,
+    /// 登录项在不在（没有管理员时的那条路）。
+    pub run_entry: bool,
+    /// 当前账号是不是管理员（决定「修复」能不能真的跑）。
+    pub admin: bool,
+    /// 计划任务或登录项指向的当前程序路径。
+    pub exe: String,
+}
+
+impl Startup {
+    pub fn ready(&self) -> bool {
+        self.task || self.run_entry
+    }
+}
+
+/// 现在这台机器上，开机自检是怎么被拉起来的。
+pub fn startup_state() -> Startup {
+    Startup {
+        task: task_registered(),
+        run_entry: run_entry_registered(),
+        admin: crate::crash_repair::is_admin(),
+        exe: std::env::current_exe()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default(),
+    }
+}
+
+/// 应用正常启动时调一次：没登记过就自己补上。
+///
+/// # 为什么要在应用里做，而不是只靠安装程序
+///
+/// 这功能曾经只在自制安装器里登记计划任务；打包换成 Tauri 的 NSIS 之后，
+/// 安装包里就没有那一步了 —— 结果装完什么都没登记，蓝屏后重启毫无反应。
+/// 把「补登记」放进应用自己，任何安装方式（NSIS、免安装、换目录）
+/// 都能自愈，不必依赖某一条打包链路记得做这件事。
+///
+/// 优先登记计划任务（带最高权限，修复命令才跑得动）；普通账号下这一步会
+/// 被拒，就退到 `HKCU\...\Run` —— 它不需要管理员，至少能把「分析 + 上报」
+/// 跑起来，报告里会写明「没有管理员权限，未执行修复」。
+pub fn ensure_startup() {
+    if !enabled() {
+        return;
+    }
+    let Some(exe) = std::env::current_exe().ok() else {
+        return;
+    };
+    // 开发时跑的是 target/ 下的产物：别把调试版写进登录项
+    let path = exe.to_string_lossy().to_lowercase();
+    if path.contains("\\target\\") || path.contains("cargo-target") {
+        log::info!("开发版不登记开机自检（{path}）");
+        return;
+    }
+
+    // 已登记**并且指向这一份**才算数。
+    //
+    // 只查「任务在不在」是不够的：换过安装目录之后，旧任务还指着那份
+    // 已经删掉的 exe，开机时它只会失败一次，而这里会以为一切都好 ——
+    // 症状和「什么都没登记」一模一样，却更难查。
+    let this_exe = exe.to_string_lossy().to_lowercase();
+    if task_registered() && task_points_to(&this_exe) {
+        return;
+    }
+    if run_entry_points_to(&this_exe) {
+        return;
+    }
+
+    match create_task(&exe) {
+        Ok(()) => {
+            log::info!("已登记开机自检计划任务（任意用户登录、最高权限）");
+            remove_run_entry();
+        }
+        Err(e) => {
+            log::warn!("登记计划任务失败，退到登录项：{e}");
+            match set_run_entry(&exe) {
+                Ok(()) => log::info!("已写入登录项，开机时会做蓝屏分析（无管理员权限，不修复）"),
+                Err(e) => log::warn!("连登录项也写不进去：{e}"),
+            }
+        }
+    }
+}
+
+/// 计划任务的命令是不是指向 `exe`（小写路径）。
+///
+/// 查不出来时**当作指向自己**：读不到不等于配错了，贸然重登记只会在
+/// 没有管理员权限的机器上白写一份登录项。
+fn task_points_to(exe: &str) -> bool {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let Ok(out) = std::process::Command::new("schtasks.exe")
+        .args(["/Query", "/TN", TASK_NAME, "/XML"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+    else {
+        return true;
+    };
+    if !out.status.success() {
+        return true;
+    }
+    let xml = crate::crash_repair::decode_console(&out.stdout);
+    match (xml.find("<Command>"), xml.find("</Command>")) {
+        (Some(a), Some(b)) if b > a => {
+            let command = xml[a + 9..b].to_lowercase();
+            let command = command.replace("&quot;", "\"").replace('"', "");
+            command.trim() == exe
+        }
+        _ => true,
+    }
+}
+
+fn run_entry_points_to(exe: &str) -> bool {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+
+    let value = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Run")
+        .ok()
+        .and_then(|k| k.get_value::<String, _>(RUN_VALUE).ok())
+        .unwrap_or_default();
+    !value.is_empty() && value.to_lowercase().replace('"', "").contains(exe)
+}
+
+fn task_registered() -> bool {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    std::process::Command::new("schtasks.exe")
+        .args(["/Query", "/TN", TASK_NAME])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn create_task(exe: &Path) -> Result<(), String> {
+    let command = format!("\"{}\"", escape_xml(&exe.to_string_lossy()));
+    // 先按 `Users` 组登记：机房一台机器常有好几个账号，谁登录都该检查；
+    // 失败再退回「只给当前账号」。
+    match register_task(&task_xml(&command, Principal::Users)) {
+        Ok(()) => Ok(()),
+        Err(first) => {
+            log::warn!("按 Users 组登记计划任务失败，改试当前账号：{first}");
+            register_task(&task_xml(&command, Principal::CurrentUser))
+        }
+    }
+}
+
+/// 计划任务的主体。
+enum Principal {
+    /// `Users` 组：任意账号登录都触发。
+    Users,
+    /// 兜底：只有当前账号。
+    CurrentUser,
+}
+
+fn task_xml(command: &str, principal: Principal) -> String {
+    let principal = match principal {
+        // 组主体**不能**带 `<LogonType>`：带上它 Task Scheduler 直接报
+        // 「XML 中有错误节点」。系统自带的「任意用户登录」任务
+        // （例如 WPS 的 WpsWakeWnsLogonTask）也只写 `<GroupId>`。
+        Principal::Users => "<GroupId>S-1-5-32-545</GroupId>".to_string(),
+        Principal::CurrentUser => {
+            let user = std::env::var("USERNAME").unwrap_or_else(|_| "user".into());
+            let domain = std::env::var("USERDOMAIN")
+                .or_else(|_| std::env::var("COMPUTERNAME"))
+                .unwrap_or_default();
+            let who = if domain.is_empty() {
+                user
+            } else {
+                format!("{domain}\\{user}")
+            };
+            format!(
+                "<UserId>{}</UserId><LogonType>InteractiveToken</LogonType>",
+                escape_xml(&who)
+            )
+        }
+    };
+
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>登录时检查上一次是否蓝屏；有记录就分析、尝试修复并上报。</Description>
+    <URI>\{task}</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <Delay>PT12S</Delay>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      {principal}
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>false</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT6H</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{command}</Command>
+      <Arguments>--crash-report</Arguments>
+    </Exec>
+  </Actions>
+</Task>"#,
+        task = TASK_NAME,
+        principal = principal,
+        command = command
+    )
+}
+
+fn register_task(xml: &str) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    // `schtasks /XML` 只认 UTF-16LE（带 BOM）
+    let mut bytes = vec![0xFF, 0xFE];
+    for unit in xml.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    let path = std::env::temp_dir().join(format!("{TASK_NAME}-{}.xml", std::process::id()));
+    std::fs::write(&path, &bytes).map_err(|e| format!("写任务定义失败：{e}"))?;
+
+    let out = std::process::Command::new("schtasks.exe")
+        .args(["/Create", "/TN", TASK_NAME, "/XML"])
+        .arg(&path)
+        .arg("/F")
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("调不起 schtasks：{e}"));
+    let _ = std::fs::remove_file(&path);
+    let out = out?;
+
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+fn escape_xml(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// `--install-crash-task`：由安装程序用管理员权限拉起，登记计划任务。
+pub fn install_task_for_installer() -> i32 {
+    let Ok(exe) = std::env::current_exe() else {
+        return 1;
+    };
+    match create_task(&exe) {
+        Ok(()) => {
+            remove_run_entry();
+            log::info!("安装程序已登记开机自检计划任务");
+            0
+        }
+        Err(e) => {
+            log::warn!("安装程序登记计划任务失败：{e}");
+            1
+        }
+    }
+}
+
+/// `--remove-crash-task`：卸载时清掉计划任务。
+pub fn remove_task_for_uninstaller() -> i32 {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let out = std::process::Command::new("schtasks.exe")
+        .args(["/Delete", "/TN", TASK_NAME, "/F"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    match out {
+        Ok(o) if o.status.success() => 0,
+        _ => 0, // 本来就不在，也算成功
+    }
+}
+
+fn run_entry_registered() -> bool {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+
+    RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Run")
+        .ok()
+        .and_then(|k| k.get_value::<String, _>(RUN_VALUE).ok())
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn set_run_entry(exe: &Path) -> Result<(), String> {
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_WRITE};
+    use winreg::RegKey;
+
+    let (key, _) = RegKey::predef(HKEY_CURRENT_USER)
+        .create_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Run")
+        .map_err(|e| format!("写登录项失败：{e}"))?;
+    key.set_value(RUN_VALUE, &format!("\"{}\" --crash-report", exe.display()))
+        .map_err(|e| format!("写登录项失败：{e}"))?;
+    Ok(())
+}
+
+fn remove_run_entry() {
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_WRITE};
+    use winreg::RegKey;
+    if let Ok(key) = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags("Software\\Microsoft\\Windows\\CurrentVersion\\Run", KEY_WRITE)
+    {
+        let _ = key.delete_value(RUN_VALUE);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* 自检（设置页「立即检查一次」）                                      */
+/* ------------------------------------------------------------------ */
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelfTest {
+    pub startup: Startup,
+    /// 上次检查记下的时刻（Unix 秒），没有就是 0。
+    pub last_check: u64,
+    /// 这次真的查到的蓝屏；`None` 表示没有。
+    pub found: Option<Report>,
+    /// 给老师看的一句话。
+    pub detail: String,
+}
+
+/// 按登录时的同一套规则查一遍，把结果原样告诉界面。
+///
+/// 这是「明明蓝屏了却没反应」的唯一自证手段：它区分三件完全不同的事 ——
+/// ① 开机自检根本没登记；② 登记了但 Windows 没留下蓝屏记录（事件日志与
+/// 转储都没有）；③ 找到了记录，下次登录就会自动分析。
+pub fn self_test() -> SelfTest {
+    let startup = startup_state();
+    let last_check = read_marker().map(|m| m.last_check).unwrap_or(0);
+    let found = detect(Mode::Real);
+
+    let detail = if !startup.ready() {
+        "开机自检还没有登记：下次开机不会自动检查。\
+         重启一次应用会自动补上（需要管理员权限才能带修复）。"
+            .to_string()
+    } else if let Some(r) = &found {
+        format!(
+            "找到了蓝屏记录（{}，{}）。下次登录时会自动分析并尝试修复；\
+             也可以现在重启应用，用 `--crash-report` 立即走一遍。",
+            r.bugcheck, r.occurred_at
+        )
+    } else {
+        format!(
+            "没有查到蓝屏记录：Windows 的事件日志里没有 BugCheck 事件，\
+             系统盘也没有近期的转储文件。上次检查时刻 {}。",
+            if last_check == 0 {
+                "（首次运行，只回看 24 小时）".to_string()
+            } else {
+                iso_utc(last_check)
+            }
+        )
+    };
+
+    SelfTest {
+        startup,
+        last_check,
+        found,
+        detail,
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* 上传                                                                */
 /* ------------------------------------------------------------------ */
 

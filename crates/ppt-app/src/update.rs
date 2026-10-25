@@ -28,7 +28,10 @@ use std::time::{Duration, Instant};
 /// 发布版本所在的仓库。
 pub const REPO: &str = "xxccdl/Open-PPT-Viewer";
 
-/// 发布里那个安装包的名字（打包脚本产出的就是它）。
+/// 旧版自制安装器的固定名。
+///
+/// 现在发的是 Tauri 的 NSIS 包（`OpenPPTView_0.3.0_x64-setup.exe`，带版本号），
+/// 这个名字通常匹配不上 —— 真正的挑选在后缀那一条（见 [`pick_release`]）。
 const ASSET_NAME: &str = "OpenPPTView-Setup.exe";
 
 /// 测一条线路探多少字节。
@@ -299,16 +302,23 @@ pub fn verify(path: &Path, release: &Release) -> Result<(), String> {
 
 /// 静默安装新版本。
 ///
+/// # 参数是 NSIS 的那一套，不是我们自己安装器的
+///
+/// 打包已经换成 Tauri 自带的 NSIS（`cargo tauri build`），它认的是
+/// `/S`（静默）和 `/R`（装完把应用拉回来）。以前自制安装器认 `--silent`，
+/// 照搬过来的话 NSIS 会当成未知参数忽略 —— 老师点「立即更新」，
+/// 弹出来的是一整屏安装向导，而且装完应用不会回来。
+///
+/// `/R` 尤其重要：Tauri 模板用 `nsis_tauri_utils::RunAsUser` 拉起应用，
+/// 是**普通用户权限**，顺带避开了「装完那份带管理员权限、拖拽失效」的老问题。
+///
 /// # 为什么走 `ShellExecuteW` 而不是 `Command::new`
 ///
 /// 安装程序带「需要管理员权限」的清单，用 `CreateProcess` 直接起会
 /// 以 `ERROR_ELEVATION_REQUIRED(740)` 失败。交给系统外壳才会弹出
 /// 「是否允许此应用对你的设备进行更改」那个系统提示。
-///
-/// 安装程序自己会请正在运行的我们让开位置（`--quit`，先落盘标注再退），
-/// 所以这里只管把它叫起来。
 pub fn launch_installer(setup: &Path) -> Result<(), String> {
-    crate::shell_execute(&setup.to_string_lossy(), Some("--silent"))
+    crate::shell_execute(&setup.to_string_lossy(), Some("/S /R"))
 }
 
 // ---------------------------------------------------------------------------
@@ -362,9 +372,19 @@ fn parse_release(body: &str) -> Result<Release, String> {
     }
 
     // 优先认我们自己的名字；改了名/传了别的包时退一步，找一个 exe
+    //
+    // NSIS 打包出来的叫 `OpenPPTView_0.3.0_x64-setup.exe`（带版本号），
+    // 与自制安装器那个固定名不同 —— 所以先按「名字里带 openpptview、
+    // 以 -setup.exe 结尾」认，最后才退回「任意 .exe」。
     let asset = assets
         .iter()
         .find(|a| name_of(a) == ASSET_NAME)
+        .or_else(|| {
+            assets.iter().find(|a| {
+                let n = name_of(a).to_ascii_lowercase();
+                n.contains("openpptview") && n.ends_with("-setup.exe")
+            })
+        })
         .or_else(|| {
             assets
                 .iter()

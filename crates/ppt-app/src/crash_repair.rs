@@ -419,8 +419,8 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 /// 控制台程序被重定向时，中文 Windows 上的输出一般是 OEM 代码页（936），
-/// 但 `chkdsk` / `sfc` 有时直接吐 UTF-16LE。两种都得认。
-fn decode_console(bytes: &[u8]) -> String {
+/// 但 `chkdsk` / `sfc` / `schtasks` 有时直接吐 UTF-16LE。两种都得认。
+pub(crate) fn decode_console(bytes: &[u8]) -> String {
     if bytes.is_empty() {
         return String::new();
     }

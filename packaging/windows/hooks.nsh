@@ -462,15 +462,35 @@ FunctionEnd
   ; 记住老师的选择：应用首启按它走，不必再自己猜设备
   WriteRegStr HKLM "${OPPVREGKEY}" "InputMode" "$OppvMode"
   WriteRegDWORD HKLM "${OPPVREGKEY}" "DesktopShortcut" "$OppvDesktop"
+  ; 应用靠这个值判断「我是不是装在这台机器上的那一份」（见 is_installed_copy）：
+  ; 不写的话，升级后文件关联自愈、开机自检自愈都会以为自己是个开发版。
+  WriteRegStr HKLM "${OPPVREGKEY}" "InstallLocation" "$INSTDIR"
 
   ; 桌面快捷方式在这里建，而不是放在「完成」页的复选框里 ——
   ; 装的时候就按他勾的办，省得回头找不到程序
   ${If} $OppvDesktop = ${BST_CHECKED}
     Call CreateOrUpdateDesktopShortcut
   ${EndIf}
+
+  ; 蓝屏自检：登记「登录时检查、以最高权限运行」的计划任务。
+  ;
+  ; 交给应用自己的 `--install-crash-task` 做，而不是在 NSIS 里写一份任务 XML：
+  ; 那份 XML（Users 组 + HighestAvailable + 延迟）只在 Rust 里维护一处，
+  ; 两边各写一份迟早会跑偏。安装程序此刻是提权的，应用继承这个权限，
+  ; 正好能登记「任意用户登录」的任务；普通启动时是登记不了的。
+  ${If} ${FileExists} "$INSTDIR\${MAINBINARYNAME}.exe"
+    ExecWait '"$INSTDIR\${MAINBINARYNAME}.exe" --install-crash-task' $0
+    ${If} $0 != 0
+      DetailPrint "蓝屏自检没能登记成计划任务，应用下次启动会自己再试"
+    ${EndIf}
+  ${EndIf}
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
   ; 卸载时把这一项留着的选择清掉，免得重装后读到上一次的旧值
   DeleteRegKey HKLM "${OPPVREGKEY}"
+
+  ; 计划任务是机器级的：留着的话，卸载之后每次登录都会去拉起一个
+  ; 已经不存在的 exe，老师看不到任何提示，只觉得装了个怪东西。
+  ExecWait '"$SYSDIR\schtasks.exe" /Delete /TN "OpenPPTViewCrashReport" /F' $0
 !macroend

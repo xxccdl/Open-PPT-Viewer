@@ -159,6 +159,8 @@ const el = {
   setCrashHint: $('set-crash-hint'),
   setCrashInput: $('set-crash-endpoint-input'),
   setCrashRepair: $('set-crash-repair'),
+  setCrashStartup: $('set-crash-startup'),
+  btnCrashSelfTest: $('btn-crash-self-test'),
   btnCrashToggle: $('btn-crash-toggle'),
   btnCrashRepairToggle: $('btn-crash-repair-toggle'),
   btnDoUpdate: $('btn-do-update'),
@@ -4136,9 +4138,22 @@ async function refreshCrash() {
     const parts = [st.enabled ? '已开启（登录时检查）' : '已关闭'];
     if (st.pending) parts.push(`本地还有 ${st.pending} 份未发出的报告`);
     el.setCrashHint.textContent = `${parts.join('　·　')}。`;
+
+    // 开机自检是哪条路拉起来的 —— 这是「蓝屏了却没反应」时最先要看的东西
+    const test = await invoke('crash_self_test');
+    el.setCrashStartup.textContent = describeStartup(test.startup);
+    el.setCrashHint.textContent = `${parts.join('　·　')}。${test.detail}`;
   } catch (e) {
     el.setCrashHint.textContent = `读不到设置：${e}`;
   }
+}
+
+/** 把后端的自检结果说成人话。 */
+function describeStartup(s) {
+  if (!s) return '未知';
+  if (s.task) return '已登记（计划任务，最高权限）';
+  if (s.runEntry) return '已登记（登录项，仅分析）';
+  return '未登记';
 }
 
 async function toggleCrash(btn) {
@@ -4371,6 +4386,19 @@ function bindUi() {
 
   // 蓝屏诊断
   el.btnCrashToggle.addEventListener('click', () => toggleCrash(el.btnCrashToggle));
+  el.btnCrashSelfTest.addEventListener('click', async () => {
+    el.btnCrashSelfTest.disabled = true;
+    try {
+      const test = await invoke('crash_self_test');
+      el.setCrashStartup.textContent = describeStartup(test.startup);
+      el.setCrashHint.textContent = test.detail;
+      toast(test.found ? '找到了蓝屏记录' : '这次没有查到蓝屏记录');
+    } catch (e) {
+      toast(`检查失败：${e}`, true);
+    } finally {
+      el.btnCrashSelfTest.disabled = false;
+    }
+  });
   el.btnCrashRepairToggle.addEventListener('click', () =>
     toggleCrashRepair(el.btnCrashRepairToggle)
   );

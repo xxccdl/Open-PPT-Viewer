@@ -1880,6 +1880,15 @@ fn set_crash_settings(
     Ok(crash::view())
 }
 
+/// 立即按登录时的那套规则检查一遍（设置页用）。
+///
+/// 老师报「蓝屏了但没反应」时，这是唯一能自证的办法：一眼看出是
+/// 「开机自检没登记」还是「Windows 压根没留下记录」。
+#[tauri::command]
+fn crash_self_test() -> crash::SelfTest {
+    crash::self_test()
+}
+
 /// 打开蓝屏报告的留档目录（老师/管理员可以直接看到采集了什么）。
 #[tauri::command]
 fn open_crash_dir() -> Result<(), String> {
@@ -2409,6 +2418,17 @@ fn main() {
     // 所以不会建 WebView2、不会预热导出内核、不会出现任何窗口。
     // 老师每次开机都要经过这里，它必须轻到察觉不出来。
     let args: Vec<String> = std::env::args().collect();
+
+    // 安装/卸载程序用这两个开关登记和清理「登录时检查蓝屏」的计划任务。
+    // 由提权过的安装程序调起，所以这一刻有管理员权限（计划任务的
+    // HIGHEST 与“任意用户登录”都要它）。做完就走，不建窗口。
+    if args.iter().skip(1).any(|a| a == "--install-crash-task") {
+        std::process::exit(crash::install_task_for_installer());
+    }
+    if args.iter().skip(1).any(|a| a == "--remove-crash-task") {
+        std::process::exit(crash::remove_task_for_uninstaller());
+    }
+
     if let Some(mode) = crash::requested(&args) {
         if !crash::enabled() {
             log::info!("蓝屏诊断已在设置里关闭，直接退出");
@@ -2476,6 +2496,10 @@ fn main() {
             // 关窗后进程留在后台，托盘是它的出口
             resident::setup_tray(app.handle())?;
             resident::spawn_idle_watchdog(app.handle().clone());
+
+            // 开机自检的登记：任何安装方式下都自己补一次。
+            // NSIS 安装包不写计划任务，装完如果没人补，蓝屏后重启就毫无反应。
+            crash::ensure_startup();
 
             // 主窗口在配置里是 `visible: false`：正常启动到这里才显示它。
             //
@@ -2548,6 +2572,7 @@ fn main() {
             open_log_dir,
             crash_settings,
             set_crash_settings,
+            crash_self_test,
             open_crash_dir,
             crash_ready,
             check_update,

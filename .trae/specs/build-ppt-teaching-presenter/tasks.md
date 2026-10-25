@@ -1692,6 +1692,83 @@ where blocking is not allowed`，来自启动时的检查更新（`reqwest::bloc
 但它会杀掉一个 tokio worker。后续可以把检查更新换成异步接口，或在独立线程里
 显式建 runtime。
 
+## Task 52: 蓝屏后重启没有触发自检 —— 已修复（0.3.1）
+
+### 现象
+
+蓝屏、重启、进系统，什么都没发生：没有「正在分析」，也没有修复。
+
+### 根因一：换成 Tauri 的 NSIS 打包之后，开机启动就没人登记了
+
+0.3.0 的第一个包是自制安装器打的，它会在安装时登记
+HKLM\...\Run\OpenPPTViewCrashReport。后来改用 `cargo tauri build`
+的官方 NSIS 包，那条登记只写在一个已经用不上的安装器里 —— **新包里没有**。
+现场核对：
+
+- schtasks /Query /TN OpenPPTViewCrashReport → 找不到
+- HKLM/HKCU\...\Run → 没有这个值
+
+于是每次登录都只是「什么都没发生」。
+
+### 根因二（这台机器上）：Windows 根本没留下蓝屏记录
+
+同一台机器上核对：
+
+- Get-WinEvent -FilterHashtable @{LogName='System'; Id=1001} → **0 条**
+- C:\Windows\Minidump → **空**
+- Kernel-Power 41 → 只有 10/07 那一条（更早的异常关机）
+- 本次开机 09:08，是**正常关机后启动**（没有 41）
+
+也就是说：至少在这一台上，没有可分析的现场。detect() 的判据一直是对的
+（1001 事件 或 近期 minidump），它只是如实报「没有蓝屏记录」。
+
+### 修法
+
+- [x] **登记搬进应用自己**（crash::ensure_startup，正常启动时执行一次）：
+  任何安装方式都能自愈，不必指望某条打包链路记得做。
+  优先登记计划任务（Users 组 + HighestAvailable + 延迟 12s，任意账号登录、
+  带管理员权限）；被拒（普通账号）就退到 HKCU\...\Run —— 至少能分析上报。
+- [x] **任务 XML 的组主体不能带 <LogonType>**：带上它 Task Scheduler 直接报
+  「XML 中有错误节点 (15,68)」。系统自带的「任意用户登录」任务
+  （WPS 的 WpsWakeWnsLogonTask）也只写 <GroupId>。
+- [x] **「已登记」要验指向**：任务是按绝对路径写死的，换过安装目录后旧任务
+  指着已删的 exe，开机失败一次、看起来和没登记一模一样。现在会读
+  schtasks /Query /XML 里的 <Command>，指向别处就重登记。
+- [x] 安装程序（NSIS hooks）装完调用 "<安装目录>\<程序>.exe" --install-crash-task：
+  此刻是提权的，正好能登记「任意用户 + 最高权限」；同时写
+  InstallLocation（应用的 is_installed_copy 靠它认自己），
+  卸载时 schtasks /Delete。
+- [x] 设置页新增「开机自检」一行 + 「立即检查一次」：直接显示
+  已登记（计划任务）/ 已登记（登录项）/ 未登记，并把本次查到的结果
+  （有没有蓝屏记录、上次检查时刻）写成人话 —— 这是这条链路唯一的自证手段。
+- [x] 更新包参数从自制安装器的 --silent 改成 NSIS 的 /S /R：
+  否则 0.3.1 之后点「立即更新」会弹出整屏向导，而且装完应用不回来。
+- [x] 资产名改成按后缀认：NSIS 产物叫 OpenPPTView_0.3.1_x64-setup.exe
+  （带版本号），原来固定名匹配不上。
+
+### 验证
+
+- [x] cargo test -p ppt-app：25 passed
+- [x] 静默安装 0.3.1 后：
+  `xml
+  <GroupId>S-1-5-32-545</GroupId>
+  <RunLevel>HighestAvailable</RunLevel>
+  <Delay>PT12S</Delay>
+  <Command>"H:\ppt-app.exe"</Command>
+  <Arguments>--crash-report</Arguments>
+  `
+- [x] 提权手动 schtasks /Run（模拟登录触发）：Last Result = 0，
+  应用日志 自上次检查以来没有蓝屏记录，退出
+- [x] 无管理员时（把 release 版复制到用户目录跑）：日志
+  登记计划任务失败，退到登录项 … 已写入登录项，开机时会做蓝屏分析
+  且 HKCU\...\Run 值指向该副本（验证完已清理）
+
+### 留给现场的两句话
+
+- 真蓝屏一定会留 EventID 1001（WER-SystemErrorReporting）和/或
+  C:\Windows\Minidump\*.dmp。想确认，装好后打开设置页点「立即检查一次」。
+- 若是**断电 / 卡死强关**（不是蓝屏），Windows 只记 Kernel-Power 41，
+  没有 bugcheck 码可分析 —— 这条我们不主动修，只靠 chkdsk /scan 那一步兜底。
 # Task Dependencies
 
 - Task 2 依赖 Task 1

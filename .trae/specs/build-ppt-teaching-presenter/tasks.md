@@ -2031,6 +2031,11 @@ if endpoint.is_empty() {
       `X:\result.log 试图引用不存在的令牌`。脚本改成**纯 ASCII + 显式 CRLF**，
       日志目录也改成 `%WIN%\OpenPPTView\fixos`（恢复环境里系统盘不一定还是 C:）。
       新增 `SCRIPT_REV`：脚本改动后，已装过的机器下次准备会自动重装镜像里的副本。
+- [x] openFixOS 那一屏的版式（0.3.7）：窗口标题、品牌蓝（`color 0B`，对应主界面
+      `#0071e3`）、双线框 + 字距拉开的 `o p e n F i x O S`、右侧署名 `by xxccdl`；
+      每一步前面一条会往前走的进度条（25/50/75/100%）、跑完标起止时间与退出码；
+      结尾一行结果 + `openFixOS - crafted by xxccdl`，停 3 秒再重启。
+      控制台里没法做真动画（无 ANSI/无 PowerShell），就让进度条推进来体现「在动」。
 
 ### 验证
 

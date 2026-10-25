@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// 改了 `openfixos.cmd` / `winpeshl.ini` 就 +1：已经装过的机器下次准备时会自动
 /// 重装一遍，否则它们会一直跑着旧脚本（镜像里的是副本，不会自己更新）。
-const SCRIPT_REV: u32 = 2;
+const SCRIPT_REV: u32 = 3;
 
 /// 恢复环境里用的目录（系统盘根目录，WinRE 里也能写）。
 ///
@@ -786,62 +786,133 @@ const WINPESHL_INI: &str = "[LaunchApps]\r\n%SYSTEMROOT%\\System32\\openfixos.cm
 ///   `'谁针凝?N' 不是内部或外部命令`、`X:\result.log 试图引用不存在的令牌`；
 /// - **盘符不写死**：恢复环境里盘符可能变，先找 `\Windows\System32\config\SYSTEM`
 ///   定位系统盘，日志也写到那个盘上（否则应用读不到 `result.json`）。
+///
+/// 版式上刻意做成一块「屏幕」：自己的标题栏、上下双线、左边留白、
+/// 每步一条会往前走的进度条、每步跑完标出起止时间与退出码，
+/// 结尾署名 xxccdl。黑窗口在恢复环境里是唯一能用的界面，
+/// 那就把它排得像样一点 —— 老师看到的第一屏不该是一堆裸 echo。
 const OPENFIXOS_CMD: &str = r#"@echo off
 setlocal enabledelayedexpansion
+title openFixOS
+mode con: cols=100 lines=34 >nul 2>nul
+cls
+
+set RULE=  ----------------------------------------------------------------------
+set BAR=  ======================================================================
+
+rem brand blue (same as #0071e3 in the app); body text goes back to grey
+color 0B
+echo.
+echo %BAR%
+echo.
+echo       o p e n F i x O S
+echo.
+echo       offline repair for Windows startup and system files
+echo.
+echo                                            by  xxccdl
+echo.
+echo %BAR%
+color 07
+echo.
 
 rem ---- locate the Windows volume ----
 set WIN=
 for %%d in (C D E F G H) do if exist "%%d:\Windows\System32\config\SYSTEM" set WIN=%%d:
 if "%WIN%"=="" set WIN=C:
 set OUT=%WIN%\OpenPPTView\fixos
-if not exist "%OUT%" mkdir "%OUT%"
+if not exist "%OUT%" mkdir "%OUT%" >nul 2>nul
 set LOG=%OUT%\result.log
-del /q "%OUT%\result.json" 2>nul
-echo ==== openFixOS start %DATE% %TIME% ==== > "%LOG%"
-echo Windows volume: %WIN% >> "%LOG%"
+del /q "%OUT%\result.json" >nul 2>nul
+
+echo    Windows volume : %WIN%
+echo    Log file       : %LOG%
+echo    Started        : %DATE% %TIME%
+echo.
+echo %RULE%
+echo.
 
 set S_START=%DATE% %TIME%
 set STEPS=
 
 rem ---- 0) we took over the recovery entry: let the user opt out ----
-echo [0/4] countdown 20s, N to skip >> "%LOG%"
 if not exist "%SYSTEMROOT%\System32\choice.exe" goto countdown_done
-choice /c yn /n /t 20 /d y /m "openFixOS: repair starts in 20 seconds, press N to skip"
+echo    Repair starts in 20 seconds.
+echo    Press N to skip and boot Windows.
+echo.
+choice /c yn /n /t 20 /d y >nul
 if errorlevel 2 if not errorlevel 3 goto skip
 :countdown_done
+echo.
+echo %RULE%
+echo.
 
 rem ---- 1) disk: bad sectors and file system ----
-echo [1/4] chkdsk %WIN% /f >> "%LOG%"
+echo    [ 25%%] [####------------]  [1/4] disk check - chkdsk /f
+set T=%TIME%
 chkdsk %WIN% /f >> "%LOG%" 2>&1
-set STEPS=!STEPS!{"step":"chkdsk","exit":!ERRORLEVEL!},
+set E=!ERRORLEVEL!
+echo            started %T%   finished %TIME%   exit !E!
+set STEPS=!STEPS!{"step":"chkdsk","exit":!E!},
+echo.
 
 rem ---- 2) system files, offline ----
-echo [2/4] sfc /scannow /offbootdir=%WIN%\ /offwindir=%WIN%\Windows >> "%LOG%"
+echo    [ 50%%] [########--------]  [2/4] system files - sfc /scannow
+set T=%TIME%
 sfc /scannow /offbootdir=%WIN%\ /offwindir=%WIN%\Windows >> "%LOG%" 2>&1
-set STEPS=!STEPS!{"step":"sfc","exit":!ERRORLEVEL!},
+set E=!ERRORLEVEL!
+echo            started %T%   finished %TIME%   exit !E!
+set STEPS=!STEPS!{"step":"sfc","exit":!E!},
+echo.
 
 rem ---- 3) component store ----
-echo [3/4] dism /Image:%WIN%\ /Cleanup-Image /RestoreHealth >> "%LOG%"
+echo    [ 75%%] [############----]  [3/4] component store - DISM /RestoreHealth
+set T=%TIME%
 dism /Image:%WIN%\ /Cleanup-Image /RestoreHealth >> "%LOG%" 2>&1
-set STEPS=!STEPS!{"step":"dism","exit":!ERRORLEVEL!},
+set E=!ERRORLEVEL!
+echo            started %T%   finished %TIME%   exit !E!
+set STEPS=!STEPS!{"step":"dism","exit":!E!},
+echo.
 
 rem ---- 4) boot records: MBR / boot sector / BCD ----
-echo [4/4] bootrec /fixmbr /fixboot /rebuildbcd >> "%LOG%"
+echo    [100%%] [################]  [4/4] boot records - bootrec
+set T=%TIME%
 bootrec /fixmbr >> "%LOG%" 2>&1
 bootrec /fixboot >> "%LOG%" 2>&1
 bootrec /rebuildbcd >> "%LOG%" 2>&1
-set STEPS=!STEPS!{"step":"bootrec","exit":!ERRORLEVEL!}
+set E=!ERRORLEVEL!
+echo            started %T%   finished %TIME%   exit !E!
+set STEPS=!STEPS!{"step":"bootrec","exit":!E!}
+echo.
 
 set S_END=%DATE% %TIME%
 > "%OUT%\result.json" echo {"startedAt":"%S_START%","finishedAt":"%S_END%","systemDrive":"%WIN%","steps":[!STEPS!],"summary":"chkdsk / sfc / dism / bootrec finished, see result.log"}
-echo ==== openFixOS end %S_END% ==== >> "%LOG%"
+echo ==== openFixOS done %S_END% ==== >> "%LOG%"
+color 0B
+echo %RULE%
+echo.
+echo    Finished %S_END% - rebooting to Windows...
+echo.
+echo                                            openFixOS - crafted by xxccdl
+echo %BAR%
+color 07
 goto done
 
 :skip
-echo openFixOS skipped by user >> "%LOG%"
+echo ==== openFixOS skipped by user ==== >> "%LOG%"
+color 0B
+echo.
+echo %RULE%
+echo.
+echo    Skipped - no changes were made.
+echo    Rebooting to Windows...
+echo.
+echo                                            openFixOS - crafted by xxccdl
+echo %BAR%
+color 07
 
 :done
-echo Rebooting to Windows...
+rem hold 3s so the result screen above can be read, then reboot
+choice /c y /n /t 3 /d y >nul
 wpeutil reboot
 "#;
 
@@ -881,6 +952,13 @@ mod tests {
     fn openfixos_script_is_pure_ascii() {
         assert!(OPENFIXOS_CMD.is_ascii());
         assert!(WINPESHL_INI.is_ascii());
+    }
+
+    /// 恢复环境那一屏是唯一会露脸的品牌位置：开屏与结尾都要带上署名。
+    #[test]
+    fn openfixos_screen_credits_the_author() {
+        assert!(OPENFIXOS_CMD.matches("xxccdl").count() >= 3);
+        assert!(OPENFIXOS_CMD.contains("o p e n F i x O S"));
     }
 
     /// 脚本写进镜像时要把 LF 换成 CRLF，否则 `if` / `goto` 会错位。

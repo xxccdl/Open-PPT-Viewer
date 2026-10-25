@@ -4223,6 +4223,25 @@ async function saveCrashEndpoint(btn) {
 
 /* ---------------- openFixOS（实验性） ---------------- */
 
+/** 恢复环境里的步骤名 → 老师看得懂的说法。 */
+const FIXOS_STEP_NAMES = {
+  chkdsk: '磁盘检查',
+  sfc: '系统文件',
+  dism: '组件存储',
+  bootrec: '引导记录',
+};
+
+/** 把 result.json 折成一句中文（脚本里的 summary 是英文，别直接摊给老师）。 */
+function fixosResultLine(r) {
+  const steps = Array.isArray(r?.steps) ? r.steps : [];
+  if (!steps.length) return r?.summary || '';
+  const names = steps.map((s) => FIXOS_STEP_NAMES[s.step] || s.step).join(' / ');
+  const bad = steps.filter((s) => s.exit !== 0).length;
+  return bad
+    ? `${names}：${bad} 个步骤没成功（详见 result.log）`
+    : `${names}：全部完成`;
+}
+
 /** 把一次 `fixos_status` 的结果画到设置页。 */
 function paintFixos(st) {
   el.btnFixosToggle.textContent = st.enabled ? '关闭' : '开启';
@@ -4236,7 +4255,8 @@ function paintFixos(st) {
     el.setFixosArmed.textContent = `已待命（${fmtMoment(st.installedAt)}）：蓝屏/起不来时自动修复`;
   }
   const bits = [st.detail];
-  if (st.result?.summary) bits.push(`上次修复：${st.result.summary}`);
+  const last = fixosResultLine(st.result);
+  if (last) bits.push(`上次修复：${last}`);
   el.setFixosHint.textContent = bits.join('　·　');
   // 后台准备期间按钮不能点：重复点会再复制一份镜像
   el.btnFixosArm.disabled = !!st.busy;

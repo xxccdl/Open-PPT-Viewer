@@ -112,6 +112,20 @@ pub struct Settings {
     /// 默认关闭：它要改 Windows 恢复环境的指向、还要重启，属于「宁可不开」的那类开关。
     #[serde(default)]
     pub boot_fix: bool,
+    /// 修复里单独的四个环节。老师可以在设置里关掉耗时的项（`sfc` 十几分钟），
+    /// 只留磁盘检查 —— 机房等不起。默认全开。
+    #[serde(default = "default_true")]
+    pub repair_sfc: bool,
+    #[serde(default = "default_true")]
+    pub repair_dism: bool,
+    #[serde(default = "default_true")]
+    pub repair_chkdsk: bool,
+    #[serde(default = "default_true")]
+    pub repair_drivers: bool,
+    /// 采集时顺手做的几项快速体检（系统盘、页面文件、驱动加载失败…）。
+    /// 默认开：全是毫秒级到一两秒的查询，不占上课时间。
+    #[serde(default = "default_true")]
+    pub quick_checks: bool,
 }
 
 fn default_true() -> bool {
@@ -142,6 +156,11 @@ impl Default for Settings {
             repair: true,
             endpoint: default_endpoint(),
             boot_fix: false,
+            repair_sfc: true,
+            repair_dism: true,
+            repair_chkdsk: true,
+            repair_drivers: true,
+            quick_checks: true,
         }
     }
 }
@@ -685,7 +704,10 @@ pub struct Receipt {
 ///
 /// 打包（[`finish`]）故意放到修复之后：修复日志要一起进包，
 /// 所以先「把现场收下来」，修完再「封包」。
-pub fn collect(report: &Report) -> Result<PathBuf, String> {
+///
+/// `note` 用来给界面报进度（「正在读取事件记录…」）。采集有几项要等
+/// 事件日志与 WMI，秒级；有个逐条进度，老师就不用盯着一个不动的省略号。
+pub fn collect(report: &Report, note: &dyn Fn(&str)) -> Result<PathBuf, String> {
     let dir = root_dir().join("reports").join(&report.id);
     if dir.exists() {
         let _ = std::fs::remove_dir_all(&dir);
@@ -693,6 +715,7 @@ pub fn collect(report: &Report) -> Result<PathBuf, String> {
     std::fs::create_dir_all(&dir).map_err(|e| format!("建不出目录：{e}"))?;
 
     // 1. 事件记录（原始形状，含参数）：排查时往往靠这三个参数定位到具体驱动
+    note("读取蓝屏事件记录");
     let events = bugcheck_events().unwrap_or_default();
     let events_json = serde_json::json!({
         "collectedAt": iso_utc(now_epoch()),
@@ -701,6 +724,7 @@ pub fn collect(report: &Report) -> Result<PathBuf, String> {
     write_json(&dir.join("bugcheck-events.json"), &events_json)?;
 
     // 2. 系统信息：版本、补丁号、CPU、内存、显卡
+    note("采集系统信息");
     let mut info = vec![
         ("应用版本".to_string(), env!("CARGO_PKG_VERSION").to_string()),
         ("采集时间".to_string(), iso_utc(now_epoch())),
@@ -709,6 +733,23 @@ pub fn collect(report: &Report) -> Result<PathBuf, String> {
         ("演示数据".to_string(), if report.demo { "是" } else { "否" }.to_string()),
     ];
     info.extend(system_info());
+
+    // 2.5 快速体检：系统盘、页面文件、快速启动、驱动加载失败…
+    //     默认开；关掉之后照样能分析，只是少几行「为什么会崩」的线索。
+    if load_settings().quick_checks {
+        note("快速体检：系统盘、页面文件、驱动加载失败");
+        let checks = quick_checks();
+        if !checks.is_empty() {
+            let text = checks
+                .iter()
+                .map(|(k, v)| format!("{k}: {v}"))
+                .collect::<Vec<_>>()
+                .join("\r\n");
+            let _ = std::fs::write(dir.join("quick-checks.txt"), text);
+            info.extend(checks);
+        }
+    }
+
     let info_text = info
         .iter()
         .map(|(k, v)| format!("{k}: {v}"))
@@ -717,6 +758,7 @@ pub fn collect(report: &Report) -> Result<PathBuf, String> {
     std::fs::write(dir.join("system.txt"), info_text).map_err(|e| e.to_string())?;
 
     // 3. 应用日志尾部（出事前老师做过什么，这里最清楚）
+    note("带上应用日志");
     let log_dir = dir.join("logs");
     std::fs::create_dir_all(&log_dir).map_err(|e| e.to_string())?;
     for (name, tail) in [
@@ -736,6 +778,9 @@ pub fn collect(report: &Report) -> Result<PathBuf, String> {
     //    说明一下为什么敢传：这是内核内存镜像，可能含少量用户态残留；
     //    设置页写明了「会上传内存转储」，关掉开关就什么都不传。
     let dumps = recent_dumps(0);
+    if !dumps.is_empty() {
+        note("复制内核转储");
+    }
     let mut budget = MAX_DUMP_BYTES;
     let mut copied = Vec::new();
     if !dumps.is_empty() {
@@ -1136,6 +1181,227 @@ fn system_info() -> Vec<(String, String)> {
         out.push(("显卡".into(), gpus.join(" / ")));
     }
     out
+}
+
+/// 采集时顺手做的几项**快速**体检（毫秒级到一两秒）。
+///
+/// 为什么要这些：只拿到一个错误码，很多蓝屏只能猜。真实诱因往往就是
+/// 「系统盘快满了」「页面文件不够写转储」「有驱动加载失败」「刚装了更新」
+/// 「快速启动开着（0xEF 高发）」这类环境事实 —— 几秒钟就能问清，
+/// 却能把「猜」变成「看得见」。
+///
+/// 这些行会进 `summary.json` 的 `system` 数组，管理后台的「系统信息」里
+/// 直接能看到，不需要服务端改代码。
+fn quick_checks() -> Vec<(String, String)> {
+    let mut out = env_probe();
+    out.push(("驱动加载失败".into(), driver_load_failures()));
+    out
+}
+
+/// 一次 PowerShell 问完：系统盘、内存、页面文件、快速启动、内核隔离、安全启动。
+fn env_probe() -> Vec<(String, String)> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let system_drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'; \
+         $d=Get-CimInstance Win32_LogicalDisk -Filter \"DeviceID='{system_drive}'\"; \
+         $os=Get-CimInstance Win32_OperatingSystem; \
+         $pf=Get-CimInstance Win32_PageFileUsage | Select-Object -First 1; \
+         $fb=(Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Power' -Name HiberbootEnabled).HiberbootEnabled; \
+         $hv=(Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\DeviceGuard\\Scenarios\\HypervisorEnforcedCodeIntegrity' -Name Enabled).Enabled; \
+         $sb=try {{ Confirm-SecureBootUEFI }} catch {{ 'n/a' }}; \
+         [pscustomobject]@{{ \
+           total=[math]::Round($d.Size/1GB,1); \
+           free=[math]::Round($d.FreeSpace/1GB,1); \
+           fs=$d.FileSystem; \
+           mem=[math]::Round($os.TotalVisibleMemorySize/1MB,1); \
+           pfName=$pf.Name; pfMB=$pf.AllocatedBaseSize; \
+           fastboot=$fb; hvci=$hv; secureboot=[string]$sb; \
+           boot=if($os.LastBootUpTime){{$os.LastBootUpTime.ToString('yyyy-MM-dd HH:mm')}}else{{''}} \
+         }} | ConvertTo-Json -Compress"
+    );
+
+    let out = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    let Ok(out) = out else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text.trim()) else {
+        log::warn!("环境体检拿不到结果（不影响报告）");
+        return Vec::new();
+    };
+
+    let num = |k: &str| v.get(k).and_then(|x| x.as_f64());
+    let s = |k: &str| {
+        v.get(k)
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+
+    let mut rows = Vec::new();
+
+    if let (Some(total), Some(free)) = (num("total"), num("free")) {
+        let fs = s("fs");
+        let pct = if total > 0.0 { free / total * 100.0 } else { 100.0 };
+        let mut line = format!("{free:.1} GB 可用 / {total:.1} GB");
+        if !fs.is_empty() {
+            line.push_str(&format!("（{fs}）"));
+        }
+        if pct < 10.0 {
+            // 这里不写「可能」：磁盘快满时蓝屏概率是实打实的。
+            // 保留一位小数：只剩 0.5% 时写「0%」看着像读错了。
+            let shown = format!("{pct:.1}");
+            let shown = shown.trim_end_matches(".0");
+            line.push_str(&format!("　⚠ 只剩 {shown}%，空间不足本身就是常见诱因"));
+        }
+        rows.push(("系统盘".to_string(), line));
+    }
+
+    if let Some(mem) = num("mem") {
+        rows.push(("内存".to_string(), format!("{mem:.1} GB")));
+    }
+
+    let pf_name = s("pfName");
+    let pf_mb = num("pfMB");
+    match (pf_name.is_empty(), pf_mb) {
+        (false, Some(mb)) => rows.push((
+            "页面文件".to_string(),
+            format!("{mb:.0} MB @ {pf_name}（写内核转储要用它）"),
+        )),
+        _ => rows.push((
+            "页面文件".to_string(),
+            "没有页面文件：蓝屏时写不出转储，现场会丢".to_string(),
+        )),
+    }
+
+    match v.get("fastboot").and_then(|x| x.as_i64()) {
+        Some(1) => rows.push((
+            "快速启动".to_string(),
+            "已开启（关机不是真关机，0xEF 类蓝屏的高发诱因；出问题可在「电源选项」里关掉）".to_string(),
+        )),
+        Some(0) => rows.push(("快速启动".to_string(), "已关闭".to_string())),
+        _ => {}
+    }
+
+    match v.get("hvci").and_then(|x| x.as_i64()) {
+        Some(1) => rows.push((
+            "内存完整性".to_string(),
+            "已开启（内核隔离；旧驱动容易被它拦下来）".to_string(),
+        )),
+        Some(0) => rows.push(("内存完整性".to_string(), "已关闭".to_string())),
+        _ => {}
+    }
+
+    match s("secureboot").to_ascii_lowercase().as_str() {
+        "true" => rows.push(("安全启动".to_string(), "已开启".to_string())),
+        "false" => rows.push(("安全启动".to_string(), "已关闭".to_string())),
+        "" => {}
+        _ => rows.push(("安全启动".to_string(), "这台机器不是 UEFI 启动".to_string())),
+    }
+
+    let boot = s("boot");
+    if !boot.is_empty() {
+        rows.push(("本次启动时间".to_string(), boot));
+    }
+
+    rows
+}
+
+/// 驱动加载失败：直接读 System 事件日志，**不走 PowerShell**（几百毫秒）。
+///
+/// - 7000：某个服务（多半是驱动）启动失败
+/// - 51：写转储时出错（页面文件不够 / 磁盘坏）
+///
+/// 刻意不查 7001：那条在正常的机器上天天都有（「用户体验计划登录通知」
+/// 之类），拿它当驱动失败会把一堆无关记录算进去。也不查 7026 ——
+/// 那是「引导期驱动都加载成功」的信息级事件。
+fn driver_load_failures() -> String {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let out = std::process::Command::new("wevtutil")
+        .args([
+            "qe",
+            "System",
+            "/q:*[System[(EventID=7000 or EventID=51)]]",
+            "/f:text",
+            "/rd:true",
+            "/c:8",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    let Ok(out) = out else {
+        return "读取失败（wevtutil 起不来）".into();
+    };
+    summarize_driver_failures(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// `wevtutil /f:text` 的输出 → 一句「最近 N 条：xxx.sys、yyy.sys」。
+///
+/// 抽成纯函数是为了能测：真机上未必有驱动加载失败。
+fn summarize_driver_failures(text: &str) -> String {
+    let mut names: Vec<String> = Vec::new();
+    let mut records = 0;
+    let mut load_failed = 0; // 7000：服务（多是驱动）启动失败
+    let mut dump_failed = 0; // 51：写转储时出错
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if t.starts_with("Event[") {
+            records += 1;
+            continue;
+        }
+        if let Some(n) = t.strip_prefix("Event ID:") {
+            match n.trim().parse::<u32>() {
+                Ok(7000) => load_failed += 1,
+                Ok(51) => dump_failed += 1,
+                _ => {}
+            }
+            continue;
+        }
+        // 从消息里挑出 *.sys 的名字（驱动加载失败的记录一定带它）
+        for token in t.split(|c: char| c.is_whitespace() || c == ',' || c == '，') {
+            let low = token.to_ascii_lowercase();
+            if let Some(at) = low.find(".sys") {
+                let raw: String = token.chars().take(at + 4).collect();
+                let name = raw
+                    .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
+                    .to_string();
+                if !name.is_empty() && !names.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
+                    names.push(name);
+                }
+            }
+        }
+    }
+
+    if records == 0 {
+        return "最近没有记录".into();
+    }
+    if !names.is_empty() {
+        return format!("最近 {records} 条：{}", names.join("、"));
+    }
+    // 认不出文件名时，至少把「是哪种失败」说清楚
+    let mut kinds = Vec::new();
+    if load_failed > 0 {
+        kinds.push(format!("服务/驱动启动失败 ×{load_failed}"));
+    }
+    if dump_failed > 0 {
+        kinds.push(format!("写转储失败 ×{dump_failed}"));
+    }
+    if kinds.is_empty() {
+        format!("最近 {records} 条")
+    } else {
+        format!("最近 {records} 条（{}）", kinds.join("、"))
+    }
 }
 
 /// 几个能标识这台机器的字符串 → 一个固定长度的机器码。
@@ -1926,8 +2192,14 @@ fn run(app: AppHandle, report: Report, ui: bool) {
     // 然后在 1.5 秒后缩到角上 —— 打包大转储可能要好几秒，不能卡住动画。
     let (tx, rx) = mpsc::channel::<Result<PathBuf, String>>();
     let for_worker = report.clone();
+    let for_note = app.clone();
     std::thread::spawn(move || {
-        let _ = tx.send(collect(&for_worker));
+        let note = |msg: &str| {
+            if ui {
+                let _ = for_note.emit("crash-note", msg);
+            }
+        };
+        let _ = tx.send(collect(&for_worker, &note));
     });
 
     if ui {
@@ -1995,6 +2267,12 @@ fn run(app: AppHandle, report: Report, ui: bool) {
         let outcome = crate::crash_repair::run(
             &dir,
             report.demo,
+            crate::crash_repair::Plan {
+                sfc: settings.repair_sfc,
+                dism: settings.repair_dism,
+                chkdsk: settings.repair_chkdsk,
+                drivers: settings.repair_drivers,
+            },
             &mut |msg| emit(&a, "repairing", msg),
             &skip,
             &on_slow,
@@ -2167,6 +2445,13 @@ pub struct View {
     pub endpoint: String,
     /// 实验性：引导类蓝屏后准备一次 openFixOS 离线修复。
     pub boot_fix: bool,
+    /// 修复里四个环节各自的开关（见 `Settings`）。
+    pub repair_sfc: bool,
+    pub repair_dism: bool,
+    pub repair_chkdsk: bool,
+    pub repair_drivers: bool,
+    /// 采集时顺手做的快速体检。
+    pub quick_checks: bool,
     pub dir: String,
     /// 还没送出去的包有几个。
     pub pending: usize,
@@ -2189,6 +2474,11 @@ pub fn view() -> View {
         repair: s.repair,
         endpoint: s.endpoint,
         boot_fix: s.boot_fix,
+        repair_sfc: s.repair_sfc,
+        repair_dism: s.repair_dism,
+        repair_chkdsk: s.repair_chkdsk,
+        repair_drivers: s.repair_drivers,
+        quick_checks: s.quick_checks,
         dir: root_dir().to_string_lossy().to_string(),
         pending,
         admin: crate::crash_repair::is_admin(),
@@ -2482,6 +2772,24 @@ mod tests {
 
         let seen = vec![picked.fingerprint.clone()];
         assert!(pick_bsod(&[], &dumps, &seen, t - 60).is_none());
+    }
+
+    /// 驱动加载失败要从消息里认出文件名；认不出时至少说清是哪一类失败。
+    #[test]
+    fn driver_failures_are_summarised_with_the_file_names() {
+        let text = "Event[0]\r\n  Event ID: 7000\r\n  Message: 由于下列错误，nvlddmkm 服务启动失败:\r\n \
+                    系统找不到指定的文件。\r\n\r\nEvent[1]\r\n  Event ID: 7000\r\n  \
+                    Message: 驱动程序 pci.sys 加载失败\r\n";
+
+        assert_eq!(summarize_driver_failures(text), "最近 2 条：pci.sys");
+        assert!(summarize_driver_failures("").contains("没有记录"));
+
+        let unnamed = "Event[0]\r\n  Event ID: 7000\r\n  Message: 服务启动失败\r\n\r\n\
+                       Event[1]\r\n  Event ID: 51\r\n  Message: 写入转储失败\r\n";
+        assert_eq!(
+            summarize_driver_failures(unnamed),
+            "最近 2 条（服务/驱动启动失败 ×1、写转储失败 ×1）"
+        );
     }
 
     /// SMBIOS 没填时常见的一串占位值，按「没有」处理。

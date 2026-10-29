@@ -496,6 +496,22 @@
               <span class="set-value" id="set-crash-repair">未开启</span>
               <button class="link-btn" id="btn-crash-repair-toggle">开启</button>
             </div>
+            <!-- 修一次可能要十几分钟：机房里想快一点，就在这儿把耗时项关掉 -->
+            <div class="set-row">
+              <span class="set-label">修复环节</span>
+              <span class="set-value" id="set-crash-steps">正在读取…</span>
+            </div>
+            <div class="set-inline step-chips">
+              <button class="link-btn" id="btn-step-sfc">系统文件 · 开</button>
+              <button class="link-btn" id="btn-step-dism">组件存储 · 开</button>
+              <button class="link-btn" id="btn-step-chkdsk">磁盘检查 · 开</button>
+              <button class="link-btn" id="btn-step-drivers">驱动体检 · 开</button>
+            </div>
+            <div class="set-row">
+              <span class="set-label">快速体检</span>
+              <span class="set-value" id="set-crash-quick">正在读取…</span>
+              <button class="link-btn" id="btn-crash-quick">关闭</button>
+            </div>
             <div class="set-row">
               <span class="set-label">上报服务器</span>
               <span class="set-value" id="set-crash-endpoint">正在读取…</span>
@@ -517,6 +533,11 @@
               组件存储检查与磁盘只读扫描，停用 Windows 已判定无法启动的非关键设备；
               然后把蓝屏信息、内核转储、修复日志一起打包发送到上面这个地址。
               不含课件内容。留空就用内置服务器，不必自己配。
+            </p>
+            <p class="assoc-hint">
+              上面四个小开关决定「这次跑哪几项」：全跑一遍可能要十几分钟，机房赶时间就留磁盘检查。
+              「快速体检」只是采集时顺带读几项环境事实（系统盘容量、页面文件、快速启动、
+              驱动加载失败），一两秒就完，建议一直开着 —— 这些往往就是蓝屏的真正原因。
             </p>
             <p class="assoc-hint">
               传不出去（断网、服务器不可达）时报告会留在本机，

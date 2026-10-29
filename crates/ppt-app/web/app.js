@@ -161,6 +161,13 @@ const el = {
   setCrashInput: $('set-crash-endpoint-input'),
   setCrashRepair: $('set-crash-repair'),
   setCrashStartup: $('set-crash-startup'),
+  setCrashSteps: $('set-crash-steps'),
+  setCrashQuick: $('set-crash-quick'),
+  btnStepSfc: $('btn-step-sfc'),
+  btnStepDism: $('btn-step-dism'),
+  btnStepChkdsk: $('btn-step-chkdsk'),
+  btnStepDrivers: $('btn-step-drivers'),
+  btnCrashQuick: $('btn-crash-quick'),
   btnCrashSelfTest: $('btn-crash-self-test'),
   btnCrashToggle: $('btn-crash-toggle'),
   btnCrashRepairToggle: $('btn-crash-repair-toggle'),
@@ -4143,6 +4150,41 @@ async function refreshCrash() {
     el.btnCrashRepairToggle.textContent = st.repair ? '关闭' : '开启';
     el.btnCrashRepairToggle.classList.toggle('strong', st.repair);
 
+    // 修复环节：四个单项开关。修复总开关关着时它们没有意义，置灰
+    const stepRows = [
+      [el.btnStepSfc, 'repairSfc', '系统文件'],
+      [el.btnStepDism, 'repairDism', '组件存储'],
+      [el.btnStepChkdsk, 'repairChkdsk', '磁盘检查'],
+      [el.btnStepDrivers, 'repairDrivers', '驱动体检'],
+    ];
+    let onCount = 0;
+    for (const [btn, key, label] of stepRows) {
+      if (!btn) continue;
+      const on = !!st[key];
+      if (on) onCount += 1;
+      btn.textContent = `${label} · ${on ? '开' : '跳过'}`;
+      btn.classList.toggle('strong', on);
+      btn.disabled = !st.repair;
+      btn.title = on ? '这次会跑这一项（点一下改成跳过）' : '这次跳过这一项（点一下加回来）';
+    }
+    if (el.setCrashSteps) {
+      el.setCrashSteps.textContent = st.repair
+        ? `已选 ${onCount}/4 项`
+        : '修复总开关关着，这几项不会跑';
+    }
+
+    // 快速体检：采集时顺带查系统盘、页面文件、驱动加载失败
+    if (el.btnCrashQuick) {
+      el.btnCrashQuick.textContent = st.quickChecks ? '关闭' : '开启';
+      el.btnCrashQuick.classList.toggle('strong', st.quickChecks);
+      el.btnCrashQuick.title = '采集时顺带查：系统盘容量 / 页面文件 / 快速启动 / 驱动加载失败';
+    }
+    if (el.setCrashQuick) {
+      el.setCrashQuick.textContent = st.quickChecks
+        ? '开（顺带查系统盘、页面文件、驱动加载失败，约 1–2 秒）'
+        : '关';
+    }
+
     const parts = [st.enabled ? '已开启（登录时检查）' : '已关闭'];
     if (st.pending) parts.push(`本地还有 ${st.pending} 份未发出的报告`);
     el.setCrashHint.textContent = `${parts.join('　·　')}。`;
@@ -4164,16 +4206,31 @@ function describeStartup(s) {
   return '未登记';
 }
 
+/**
+ * `set_crash_settings` 的参数：拿当前设置当底，只覆盖要改的那一项。
+ *
+ * 单独写一个是因为后台命令有 9 个参数，四个调用点挨个手抄一遍迟早漏。
+ */
+function crashArgs(cur, patch = {}) {
+  return {
+    enabled: cur.enabled,
+    repair: cur.repair,
+    endpoint: cur.endpoint,
+    bootFix: cur.bootFix,
+    repairSfc: cur.repairSfc,
+    repairDism: cur.repairDism,
+    repairChkdsk: cur.repairChkdsk,
+    repairDrivers: cur.repairDrivers,
+    quickChecks: cur.quickChecks,
+    ...patch,
+  };
+}
+
 async function toggleCrash(btn) {
   btn.disabled = true;
   try {
     const cur = await invoke('crash_settings');
-    await invoke('set_crash_settings', {
-      enabled: !cur.enabled,
-      repair: cur.repair,
-      endpoint: cur.endpoint,
-      bootFix: cur.bootFix,
-    });
+    await invoke('set_crash_settings', crashArgs(cur, { enabled: !cur.enabled }));
     await refreshCrash();
     toast(cur.enabled ? '蓝屏诊断已关闭' : '蓝屏诊断已开启');
   } catch (e) {
@@ -4187,14 +4244,25 @@ async function toggleCrashRepair(btn) {
   btn.disabled = true;
   try {
     const cur = await invoke('crash_settings');
-    await invoke('set_crash_settings', {
-      enabled: cur.enabled,
-      repair: !cur.repair,
-      endpoint: cur.endpoint,
-      bootFix: cur.bootFix,
-    });
+    await invoke('set_crash_settings', crashArgs(cur, { repair: !cur.repair }));
     await refreshCrash();
     toast(cur.repair ? '自动修复已关闭' : '自动修复已开启');
+  } catch (e) {
+    toast(`改不了：${e}`, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/** 修复里的单项开关（系统的文件 / 组件存储 / 磁盘 / 驱动）。 */
+async function toggleCrashStep(btn, key) {
+  btn.disabled = true;
+  try {
+    const cur = await invoke('crash_settings');
+    const next = !cur[key];
+    await invoke('set_crash_settings', crashArgs(cur, { [key]: next }));
+    await refreshCrash();
+    toast(next ? '已加入这次的修复流程' : '已跳过（省时间）');
   } catch (e) {
     toast(`改不了：${e}`, true);
   } finally {
@@ -4206,12 +4274,10 @@ async function saveCrashEndpoint(btn) {
   btn.disabled = true;
   try {
     const cur = await invoke('crash_settings');
-    await invoke('set_crash_settings', {
-      enabled: cur.enabled,
-      repair: cur.repair,
-      endpoint: el.setCrashInput.value.trim(),
-      bootFix: cur.bootFix,
-    });
+    await invoke(
+      'set_crash_settings',
+      crashArgs(cur, { endpoint: el.setCrashInput.value.trim() })
+    );
     await refreshCrash();
     toast('上报地址已保存');
   } catch (e) {
@@ -4317,12 +4383,7 @@ async function toggleFixos(btn) {
   try {
     const cur = await invoke('crash_settings');
     const on = !cur.bootFix;
-    await invoke('set_crash_settings', {
-      enabled: cur.enabled,
-      repair: cur.repair,
-      endpoint: cur.endpoint,
-      bootFix: on,
-    });
+    await invoke('set_crash_settings', crashArgs(cur, { bootFix: on }));
     if (on) {
       // 开启就先装好待命：病毒把引导弄坏时 Windows 起不来，那会儿再装已经来不及了
       el.setFixosHint.textContent = '正在装进恢复环境待命（几分钟，只需一次）…';
@@ -4574,6 +4635,20 @@ function bindUi() {
   el.btnCrashRepairToggle.addEventListener('click', () =>
     toggleCrashRepair(el.btnCrashRepairToggle)
   );
+  // 修复环节的四个单项开关 + 快速体检
+  for (const [btn, key] of [
+    [el.btnStepSfc, 'repairSfc'],
+    [el.btnStepDism, 'repairDism'],
+    [el.btnStepChkdsk, 'repairChkdsk'],
+    [el.btnStepDrivers, 'repairDrivers'],
+  ]) {
+    if (btn) btn.addEventListener('click', () => toggleCrashStep(btn, key));
+  }
+  if (el.btnCrashQuick) {
+    el.btnCrashQuick.addEventListener('click', () =>
+      toggleCrashStep(el.btnCrashQuick, 'quickChecks')
+    );
+  }
 
   // openFixOS（实验性）
   $('btn-fixos-toggle').addEventListener('click', () => toggleFixos($('btn-fixos-toggle')));

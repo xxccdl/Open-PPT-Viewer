@@ -1763,6 +1763,28 @@ HKLM\...\Run\OpenPPTViewCrashReport。后来改用 `cargo tauri build`
       新增两条测试 `installer_is_launched_with_ui_after_a_short_wait`、
       `installer_path_with_cmd_metacharacters_falls_back`。
 
+### Task 60：蓝屏分析的「分项开关」+ 更多分析项 + 分析页动画（0.3.12）
+
+- [x] **分项开关**（省时间）：设置页「修复环节」四个小开关 —— 系统文件 / 组件存储 /
+      磁盘检查 / 驱动体检。关掉的项在 `crash_repair::run` 里直接跳过，并往进度里写
+      「设置里关掉了…，跳过」；事后看报告能解释「这次为什么没修系统文件」。
+      修复总开关关着时四个小项置灰（跑了也没意义）。
+- [x] **快速体检**（可在设置里关）：采集时顺带读几项环境事实，**一两秒**完成：
+      系统盘容量/可用（<10% 直接标⚠）、内存、页面文件（没有就提示「写不出转储」）、
+      快速启动（0xEF 高发）、内存完整性、安全启动、本次启动时间，
+      以及驱动加载失败（`7000/7001/51`，从消息里认出 `*.sys`）。
+      —— `7026` 刻意不查：那是「引导期驱动都加载成功」的信息级事件，会误导。
+- [x] 快速体检的结论进 `summary.json` 的 `system` 数组（管理后台「系统信息」直接可见，
+      服务端不用改），另存一份 `quick-checks.txt`。
+- [x] **分析页动画**：大卡片加一圈 8 秒转一圈的光环（conic 渐变描边）；
+      新增「采集进度」列表 —— 后端每做完一项发 `crash-note`，上一行打勾变淡、
+      新行淡入，最多留 4 行，固定高度不跳动。
+- [x] `prefers-reduced-motion` 下光环/进度行动画全部关掉。
+- [x] 验证：`cargo test -p ppt-app` 54 passed（新增
+      `driver_failures_are_summarised_with_the_file_names`）；
+      本机直接跑一遍那段 PowerShell 体检脚本，输出可用（这台 C: 只剩 3.9/342 GB，
+      正好触发「⚠ 只剩 1%」那条提示）。
+
 ### 验证
 
 - [x] cargo test -p ppt-app：25 passed

@@ -40,6 +40,36 @@ const PHASES = {
 
 const detailEl = document.getElementById('detail');
 const skipBtn = document.getElementById('skip-btn');
+const notesEl = document.getElementById('notes');
+
+/**
+ * 采集进度：一行一项，最多留 4 行。
+ *
+ * 后端每做完一项就发 `crash-note`（读事件记录 / 采集系统信息 / 快速体检 …）。
+ * 上一行打勾、新行淡入 —— 让窗口看起来「在往前走」，而不是一个不动的省略号。
+ */
+const notes = [];
+function pushNote(text) {
+  const t = (text || '').trim();
+  if (!t || !notesEl) return;
+  if (notes[notes.length - 1] === t) return; // 同一项重复报，不刷屏
+  notes.push(t);
+  if (notes.length > 4) notes.shift();
+
+  const done = notes.slice(0, -1);
+  const last = notes[notes.length - 1];
+  notesEl.innerHTML = '';
+  for (const n of done) {
+    const li = document.createElement('li');
+    li.className = 'note done';
+    li.textContent = n;
+    notesEl.appendChild(li);
+  }
+  const li = document.createElement('li');
+  li.className = 'note now';
+  li.textContent = last;
+  notesEl.appendChild(li);
+}
 
 /**
  * 「跳过此环节」的显隐。
@@ -69,6 +99,11 @@ function render(phase, message) {
     await listen('crash-phase', (event) => {
       const payload = (event && event.payload) || {};
       render(payload.phase || 'analyzing', payload.message || '');
+    });
+
+    // 采集进度：每做完一项亮一行
+    await listen('crash-note', (event) => {
+      pushNote(String((event && event.payload) || ''));
     });
 
     // 某个环节跑太久了：把「跳过此环节」露出来

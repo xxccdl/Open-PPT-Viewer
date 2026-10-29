@@ -1136,6 +1136,24 @@ html.touch-mode .media-play {
   font-variant-numeric: tabular-nums;
 }
 
+/* 修复环节的四个小开关：一行放不下就换行，别挤出横向滚动条 */
+.step-chips {
+  flex-wrap: wrap;
+  gap: 6px 10px;
+}
+
+.step-chips .link-btn {
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  line-height: 1.5;
+}
+
+.step-chips .link-btn.strong:not(:disabled) {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 42%, transparent);
+}
+
 /* 设置里需要就地填一行的地方（目前只有蓝屏上报地址）。
  * 输入框跟着主题走，不用系统默认的白底 —— 深色模式下那块白会很刺眼。 */
 .set-inline {

@@ -17,8 +17,11 @@
       <div class="stage">
         <!-- 第一段：大卡片，讲清楚在做什么 -->
         <section class="analyzing">
+          <div class="orb" aria-hidden="true"><div class="orb-core"></div></div>
           <h1>正在分析…</h1>
           <p class="shimmer">请稍候</p>
+          <!-- 采集到哪一步了：每完成一项就亮起来一行，比转圈的省略号有底 -->
+          <ul class="notes" id="notes" aria-live="polite"></ul>
           <div class="track"><div class="track-fill"></div></div>
           <p class="fineprint">
             正在读取系统记录的蓝屏信息与内核转储，不会打开或修改你的课件。

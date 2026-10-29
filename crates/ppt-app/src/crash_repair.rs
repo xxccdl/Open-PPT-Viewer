@@ -139,12 +139,37 @@ fn watch_slow(on_slow: &SlowNotify, name: &str) -> SlowWatch {
     SlowWatch { alive }
 }
 
+/// 一次修复要跑哪几项。
+///
+/// 老师在设置里可以单独关掉某一项（`sfc` 十几分钟，机房里有人只想要
+/// 「磁盘检查 + 驱动」）。**默认全开**，关掉的项直接跳过，日志里写明「按设置跳过」——
+/// 事后看报告时能解释「为什么这次没修系统文件」。
+#[derive(Debug, Clone, Copy)]
+pub struct Plan {
+    pub sfc: bool,
+    pub dism: bool,
+    pub chkdsk: bool,
+    pub drivers: bool,
+}
+
+impl Plan {
+    pub fn all() -> Self {
+        Self {
+            sfc: true,
+            dism: true,
+            chkdsk: true,
+            drivers: true,
+        }
+    }
+}
+
 /// 运行修复。产物全部落在 `dir`（也就是 `crash/reports/<id>/`）下的 `repair/`。
 ///
 /// 返回的 JSON 会被合并进报告的 `summary.json`，随整包一起上传。
 pub fn run(
     dir: &Path,
     demo: bool,
+    plan: Plan,
     progress: Progress<'_>,
     skip: &SkipControl,
     on_slow: &SlowNotify,
@@ -192,74 +217,92 @@ pub fn run(
     let sys32 = PathBuf::from(&system_root).join("System32");
 
     // 1) 系统文件
-    progress("正在修复系统文件…");
-    steps.push(run_step(
-        &rdir,
-        "sfc",
-        "系统文件检查",
-        &sys32.join("sfc.exe"),
-        &["/scannow".to_string()],
-        Duration::from_secs(45 * 60),
-        skip,
-        on_slow,
-    ));
-
-    // 2) 组件存储：先扫，扫出问题才修（RestoreHealth 要联网，离线机房上跑不动）
-    progress("正在检查组件存储…");
-    let scan = run_step(
-        &rdir,
-        "dism-scan",
-        "组件存储检查",
-        &sys32.join("Dism.exe"),
-        &[
-            "/Online".to_string(),
-            "/Cleanup-Image".to_string(),
-            "/ScanHealth".to_string(),
-        ],
-        Duration::from_secs(20 * 60),
-        skip,
-        on_slow,
-    );
-    let need_restore = store_needs_repair(&rdir, &scan);
-    steps.push(scan);
-
-    if need_restore {
-        progress("正在修复组件存储…");
+    if plan.sfc {
+        progress("正在修复系统文件…");
         steps.push(run_step(
             &rdir,
-            "dism-restore",
-            "组件存储修复",
+            "sfc",
+            "系统文件检查",
+            &sys32.join("sfc.exe"),
+            &["/scannow".to_string()],
+            Duration::from_secs(45 * 60),
+            skip,
+            on_slow,
+        ));
+    } else {
+        progress("设置里关掉了系统文件检查，跳过");
+    }
+
+    // 2) 组件存储：先扫，扫出问题才修（RestoreHealth 要联网，离线机房上跑不动）
+    if plan.dism {
+        progress("正在检查组件存储…");
+        let scan = run_step(
+            &rdir,
+            "dism-scan",
+            "组件存储检查",
             &sys32.join("Dism.exe"),
             &[
                 "/Online".to_string(),
                 "/Cleanup-Image".to_string(),
-                "/RestoreHealth".to_string(),
+                "/ScanHealth".to_string(),
             ],
-            Duration::from_secs(30 * 60),
+            Duration::from_secs(20 * 60),
             skip,
             on_slow,
-        ));
+        );
+        let need_restore = store_needs_repair(&rdir, &scan);
+        steps.push(scan);
+
+        if need_restore {
+            progress("正在修复组件存储…");
+            steps.push(run_step(
+                &rdir,
+                "dism-restore",
+                "组件存储修复",
+                &sys32.join("Dism.exe"),
+                &[
+                    "/Online".to_string(),
+                    "/Cleanup-Image".to_string(),
+                    "/RestoreHealth".to_string(),
+                ],
+                Duration::from_secs(30 * 60),
+                skip,
+                on_slow,
+            ));
+        }
+    } else {
+        progress("设置里关掉了组件存储检查，跳过");
     }
 
     // 3) 磁盘：只读扫描，不修、不卸载卷
-    progress("正在检查磁盘…");
-    steps.push(run_step(
-        &rdir,
-        "chkdsk",
-        "磁盘只读扫描",
-        &sys32.join("chkdsk.exe"),
-        &[system_drive.clone(), "/scan".to_string()],
-        Duration::from_secs(25 * 60),
-        skip,
-        on_slow,
-    ));
+    if plan.chkdsk {
+        progress("正在检查磁盘…");
+        steps.push(run_step(
+            &rdir,
+            "chkdsk",
+            "磁盘只读扫描",
+            &sys32.join("chkdsk.exe"),
+            &[system_drive.clone(), "/scan".to_string()],
+            Duration::from_secs(25 * 60),
+            skip,
+            on_slow,
+        ));
+    } else {
+        progress("设置里关掉了磁盘检查，跳过");
+    }
 
     // 4) 驱动体检：也是一次 PowerShell 查询，同样可能卡住，所以照样挂计时
-    progress("正在检查驱动…");
-    let drivers = {
-        skip.clear();
-        let _slow = watch_slow(on_slow, "驱动体检");
-        driver_check(&rdir, skip)
+    let drivers = if plan.drivers {
+        progress("正在检查驱动…");
+        let drivers = {
+            skip.clear();
+            let _slow = watch_slow(on_slow, "驱动体检");
+            driver_check(&rdir, skip)
+        };
+        drivers
+    } else {
+        progress("设置里关掉了驱动体检，跳过");
+        serde_json::Value::Null
     };
 
     out["steps"] = serde_json::json!(steps);

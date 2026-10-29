@@ -1867,6 +1867,11 @@ fn set_crash_settings(
     repair: bool,
     endpoint: String,
     boot_fix: bool,
+    repair_sfc: bool,
+    repair_dism: bool,
+    repair_chkdsk: bool,
+    repair_drivers: bool,
+    quick_checks: bool,
 ) -> Result<crash::View, String> {
     let endpoint = endpoint.trim().to_string();
     if !endpoint.is_empty()
@@ -1879,6 +1884,11 @@ fn set_crash_settings(
         repair,
         endpoint,
         boot_fix,
+        repair_sfc,
+        repair_dism,
+        repair_chkdsk,
+        repair_drivers,
+        quick_checks,
     })?;
     Ok(crash::view())
 }

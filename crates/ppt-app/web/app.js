@@ -168,6 +168,10 @@ const el = {
   btnStepChkdsk: $('btn-step-chkdsk'),
   btnStepDrivers: $('btn-step-drivers'),
   btnCrashQuick: $('btn-crash-quick'),
+  setCrashIntro: $('set-crash-intro'),
+  setCrashRemote: $('set-crash-remote'),
+  btnCrashRemote: $('btn-crash-remote'),
+  btnIntroSecs: [2, 5, 10, 20].map((s) => $('btn-intro-' + s)),
   btnCrashSelfTest: $('btn-crash-self-test'),
   btnCrashToggle: $('btn-crash-toggle'),
   btnCrashRepairToggle: $('btn-crash-repair-toggle'),
@@ -4185,6 +4189,31 @@ async function refreshCrash() {
         : '关';
     }
 
+    // 分析窗口停留多久：几秒之后就缩到右下角，不占教室的屏幕
+    const secs = Math.round((st.introMs ?? 5000) / 1000);
+    el.btnIntroSecs.forEach((btn, i) => {
+      if (!btn) return;
+      const s = [2, 5, 10, 20][i];
+      btn.classList.toggle('strong', s === secs);
+      btn.title = s === secs ? `就是现在这个：${s} 秒` : `改成 ${s} 秒`;
+    });
+    if (el.setCrashIntro) {
+      el.setCrashIntro.textContent = secs > 0
+        ? `${secs} 秒后缩到右下角`
+        : '立即缩到右下角';
+    }
+
+    // 远程协助：这条开关就是心跳的总闸，关掉服务器那边就再也连不上这台机器
+    if (el.btnCrashRemote) {
+      el.btnCrashRemote.textContent = st.remote ? '关闭' : '开启';
+      el.btnCrashRemote.classList.toggle('strong', st.remote);
+    }
+    if (el.setCrashRemote) {
+      el.setCrashRemote.textContent = st.remote
+        ? '已开启（管理员能看到屏幕、执行命令）'
+        : '已关闭（不与服务器通信）';
+    }
+
     const parts = [st.enabled ? '已开启（登录时检查）' : '已关闭'];
     if (st.pending) parts.push(`本地还有 ${st.pending} 份未发出的报告`);
     el.setCrashHint.textContent = `${parts.join('　·　')}。`;
@@ -4209,7 +4238,7 @@ function describeStartup(s) {
 /**
  * `set_crash_settings` 的参数：拿当前设置当底，只覆盖要改的那一项。
  *
- * 单独写一个是因为后台命令有 9 个参数，四个调用点挨个手抄一遍迟早漏。
+ * 单独写一个是因为后台命令的参数多得数不清，每个调用点挨个手抄一遍迟早漏。
  */
 function crashArgs(cur, patch = {}) {
   return {
@@ -4222,8 +4251,41 @@ function crashArgs(cur, patch = {}) {
     repairChkdsk: cur.repairChkdsk,
     repairDrivers: cur.repairDrivers,
     quickChecks: cur.quickChecks,
+    introMs: cur.introMs ?? 5000,
+    remote: cur.remote ?? true,
     ...patch,
   };
+}
+
+/** 分析窗口停留时间：点哪档存哪档。 */
+async function setCrashIntro(btn, secs) {
+  btn.disabled = true;
+  try {
+    const cur = await invoke('crash_settings');
+    await invoke('set_crash_settings', crashArgs(cur, { introMs: secs * 1000 }));
+    await refreshCrash();
+    toast(`分析窗口将停留 ${secs} 秒`);
+  } catch (e) {
+    toast(`改不了：${e}`, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/** 远程协助的总闸。关掉之后这台机器就不再向服务器取命令了。 */
+async function toggleCrashRemote(btn) {
+  btn.disabled = true;
+  try {
+    const cur = await invoke('crash_settings');
+    const next = !cur.remote;
+    await invoke('set_crash_settings', crashArgs(cur, { remote: next }));
+    await refreshCrash();
+    toast(next ? '远程协助已开启' : '远程协助已关闭，这台机器不再接受远程操作');
+  } catch (e) {
+    toast(`改不了：${e}`, true);
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 async function toggleCrash(btn) {
@@ -4647,6 +4709,16 @@ function bindUi() {
   if (el.btnCrashQuick) {
     el.btnCrashQuick.addEventListener('click', () =>
       toggleCrashStep(el.btnCrashQuick, 'quickChecks')
+    );
+  }
+  // 分析窗口停留的四个档位 + 远程协助
+  el.btnIntroSecs.forEach((btn, i) => {
+    const secs = [2, 5, 10, 20][i];
+    if (btn) btn.addEventListener('click', () => setCrashIntro(btn, secs));
+  });
+  if (el.btnCrashRemote) {
+    el.btnCrashRemote.addEventListener('click', () =>
+      toggleCrashRemote(el.btnCrashRemote)
     );
   }
 

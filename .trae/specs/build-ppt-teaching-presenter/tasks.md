@@ -1785,6 +1785,79 @@ HKLM\...\Run\OpenPPTViewCrashReport。后来改用 `cargo tauri build`
       本机直接跑一遍那段 PowerShell 体检脚本，输出可用（这台 C: 只剩 3.9/342 GB，
       正好触发「⚠ 只剩 1%」那条提示）。
 
+### Task 61：分析窗口停留时间 + 远程协助（0.3.13）
+
+- [x] **分析窗口停留**：设置页「蓝屏诊断」里新增一行 + 2/5/10/20 秒四个档位
+      （`Settings.intro_ms`，默认 5000）。`crash::run` 用它替代原来写死的
+      `INTRO_HOLD`，并夹在 0～60 秒之间；0 也不拦着，等于「立即缩角」。
+      原来的大卡片还是会缩到右下角，只是停留多久由老师决定 ——
+      机房赶时间就选 2 秒，一节课都挡着幻灯片是不能接受的。
+- [x] **远程协助（客户端 `remote.rs`）**：方向是**机器主动连出来**（学校没有公网 IP，
+      也不该为此开端口）。开着时每 3 秒 `POST /remote/poll` 报到，领三类命令：
+      - `shell`：`cmd.exe /C <文本>`，30 秒超时（`taskkill /T /F` 杀进程树），输出截 60 KB；
+      - `mouse`：`SetCursorPos` + `mouse_event`，坐标用 0～1 的比例（两端都不怕分辨率不同）；
+      - `key`：`keybd_event` 组合键 / `SendInput` + `KEYEVENTF_UNICODE` 打字（中文也行）；
+      以及「要不要推屏幕」。结果随下一次心跳 `POST /remote/result` 回传。
+- [x] **推屏幕**：后台打开开关后约 900ms 一轮 —— GDI `BitBlt` + `GetDIBits` 抓当前桌面，
+      按整数倍抽样缩到 ≤1920 宽，`image` 编 JPEG（质量 72），`POST /remote/frame` 推上去。
+      不引新依赖：`image` 本来就在 `ppt-render` 里。
+- [x] **服务端（`server/crash/remote.mjs`）**：状态全在内存（机器广播、命令队列、
+      结果、最新一帧）。机器接口吃 `Bearer TOKEN`；后台接口要管理员会话，
+      `cmd` / `screen` 额外要求 `admin` 角色（只读成员能看列表，不能碰别人的电脑）。
+      命令 3 分钟不领就作废（机器关机一整晚，早上不该执行昨晚那条）。
+      `GET /remote/frame?since=` 帧号没变回 204，省一条下行。
+- [x] **管理后台**：新增「远程」页 —— 机器列表（在线/离线、用户、权限、版本、最后心跳）
+      与机器控制台（画面 + 点击/双击/右键/滚轮映射、常用按键、打字、cmd 命令与结果）。
+- [x] 设置页新增「远程协助」开关（`Settings.remote`，默认开）：关掉即刻断开心跳，
+      服务器那边只剩一条过期记录。
+- [x] 验证：
+      - `cargo test -p ppt-app` **58 passed**（新增 `base_of_default_endpoint`、
+        `trims_and_keeps_custom_host`、`clip_keeps_utf8_whole`、`mouse_arg_parses`）；
+      - 服务端 19 项冒烟（心跳 / 命令 / 结果 / 帧 / 204 / 未登录 / 只读成员）全过；
+      - 真机端到端：release 版对着本地服务跑，后台看到 `0.3.13` 机器在线，
+        `echo oppv-remote-ok` 61ms 执行成功，打开屏幕后收到 **1920×1080 / 145 KB** 的真实 JPEG；
+      - CDP 实拍设置页：默认显示「5 秒后缩到右下角」，5 秒那档高亮，远程协助行正常。
+
+### Task 62：同一场蓝屏被分析两次（0.3.13）
+
+**现象**：一次蓝屏，应用跑了两遍分析；服务器上出现两条「时间差几秒、错误码一样」的记录。
+
+**两个独立成因，各修一处：**
+
+1. **两条检查路径同时开工。** 机器上有两个进程会做这件事：登录时的计划任务
+   （带诊断窗口）和老师打开应用时的静默补查。`seen` 是**分析完、包落地之后**
+   才写的，管不住「正在分析」—— 两边都读到「没报过」，于是各分析一遍。
+   修法：动手前先抢 `%LOCALAPPDATA%\OpenPPTView\crash\claims\<hash>.claim`
+   （`create_new` 原子创建）。抢到的负责分析，另一条原地退出。
+   锁带 1 小时过期时间，进程被杀也不会永远卡住；`end_run` 里显式放锁。
+2. **两条证据各自算一场。** 事件 1001 的时刻与 `Minidump\*.dmp` 的写入时刻
+   差几秒是常事。报过事件之后，下一轮检查会从「更新的转储」那边把**同一场**
+   再报一遍（id 也因此不同）。修法：`seen` 里额外记 `at:<发生时刻>`，
+   10 分钟内的候选一律算同一场（`close_to_reported`）；报事件时顺带把旁边的
+   转储一起认下来。真的隔几小时又崩一次不受影响（有测试守着）。
+
+**顺手修的两处：**
+
+- **服务端兜底去重**（`findTwin`）：老版本客户端仍可能报两遍，
+  收包时按「10 分钟内 + 错误码相同或一边未知」判重，重复的返回
+  `{ok:true, duplicated:true, id:<已有那条>}`，不再落第二份。演示报告不参与。
+- **中文错误码进请求头**：`未知（未读到蓝屏事件）` 直接被当成 UTF-8 塞进头里，
+  Node 按 latin1 解，落盘成了「æªç¥……」的乱码。客户端改成
+  `u:` + 百分号编码（`header_safe`），服务端 `decodeHeader` 解回来。
+  线上那条 `20261025-231747` 的乱码已按 latin1→UTF-8 还原成正确中文。
+
+**验证：**
+
+- `cargo test -p ppt-app` **63 passed**（新增 `the_same_crash_is_not_reported_twice_from_two_evidences`、
+  `an_event_that_lands_later_is_the_same_crash_not_a_new_one`、
+  `a_genuinely_new_crash_still_gets_reported`、`only_one_check_path_gets_to_analyse_a_crash`、
+  `non_ascii_bugcheck_is_encoded_for_the_header`）
+- 服务端 6 项去重冒烟全过：重复被认成同一场并指向已有 id、三小时后的新蓝屏照收、
+  错误码不同的另一次照收、磁盘上只多 3 条
+- **已部署到 `crash.xxccdl.cn`**（`175.27.141.172`）：`/opt/openpptview-crash/{server.mjs,remote.mjs}` +
+  `web/` 三个文件，`systemctl restart openpptview-crash` 后 active；
+  实测 `/health` 正常、`POST /crash/api/v1/remote/poll` 200、后台页面已出现「远程」导航
+
 ### 验证
 
 - [x] cargo test -p ppt-app：25 passed

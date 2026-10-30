@@ -1551,3 +1551,81 @@ td .sub {
     display: none;
   }
 }
+
+/* ------------------------------------------------------------------ */
+/* 远程协助                                                            */
+/* ------------------------------------------------------------------ */
+
+.remote-view {
+  min-height: 260px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  /* 屏幕内容自己会亮；这层底只是未出画面时的空白 */
+  background: #05070a;
+}
+
+#rm-img {
+  display: block;
+  width: 100%;
+  height: auto;
+  /* 十字准星：点哪儿就打哪儿 */
+  cursor: crosshair;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+
+#rm-img[hidden] {
+  display: none;
+}
+
+.remote-term {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.field.row {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+
+.field.row input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.remote-keys {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.remote-out {
+  max-height: 340px;
+  overflow: auto;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-soft);
+  border: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.remote-log pre {
+  margin: 4px 0 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--text-dim);
+}
+
+.remote-log.err pre {
+  color: var(--danger);
+}

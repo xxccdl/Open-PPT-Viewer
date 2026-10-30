@@ -38,6 +38,8 @@ tauri-plugin-single-instance = "2"
 reqwest = { version = "0.13", default-features = false, features = [
     "blocking",
     "native-tls",
+    # 远程协助的心跳（`remote`）用 JSON 请求体，收包那条链路走的是原始 zip
+    "json",
 ] }
 # 校验升级包的 SHA-256：github 的发布信息里带 digest，
 # 对得上才敢让一个要求管理员权限的安装程序跑起来
@@ -51,6 +53,9 @@ zip = { version = "8.6.0", default-features = false, features = [
 ] }
 # 解析 `wevtutil` 的 XML 输出：文本输出的错误码随系统语言变，字段名不变
 quick-xml = "0.42"
+# 远程协助：抓到的桌面位图要编成 JPEG 才传得动。
+# `ppt-render` 用的就是同一个 `image`，feature 取并集，二进制不会因此变大
+image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
 
 # 默认打开方式自动注册：只需读写 HKCU，纯 Rust 实现，无需管理员权限
 [target.'cfg(windows)'.dependencies]
@@ -67,4 +72,8 @@ windows = { version = "0.61", features = [
     "Win32_System_SystemInformation",
     # 修复日志解码：`sfc` / `chkdsk` 的输出是 OEM 代码页（中文机器上是 936）
     "Win32_Globalization",
+    # 远程协助的截屏：`BitBlt` + `GetDIBits` 抓当前桌面
+    "Win32_Graphics_Gdi",
+    # 远程协助的鼠标键盘：`mouse_event` / `keybd_event` / `SendInput`
+    "Win32_UI_Input_KeyboardAndMouse",
 ] }

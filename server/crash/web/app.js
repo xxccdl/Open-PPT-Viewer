@@ -36,6 +36,10 @@ const state = {
   initialized: false,
   authMode: 'login',
   route: '',
+  /** 远程页面的轮询定时器。换页时统一清掉。 */
+  remoteTimers: [],
+  /** 当前显示的那一帧画面的 blob URL，换页时要撤销，否则内存一直涨。 */
+  remoteFrameUrl: null,
 };
 
 function esc(value) {
@@ -184,6 +188,7 @@ const TITLES = {
   overview: '概览',
   crashes: '报告',
   detail: '报告详情',
+  remote: '远程',
   users: '成员',
   account: '账号',
 };
@@ -232,9 +237,21 @@ function parseRoute() {
   return { view, id: id || '' };
 }
 
+/** 页面里挂着的轮询定时器。换页 / 重进时必须一次性清掉。 */
+function clearRemoteTimers() {
+  for (const t of state.remoteTimers || []) clearInterval(t);
+  state.remoteTimers = [];
+  if (state.remoteFrameUrl) {
+    URL.revokeObjectURL(state.remoteFrameUrl);
+    state.remoteFrameUrl = null;
+  }
+}
+
 async function render() {
   const { view, id } = parseRoute();
   state.route = view;
+  // 远程页面自带轮询定时器：换页时必须停掉，否则旧页面在后台一直发请求
+  clearRemoteTimers();
   if (view === 'users' && state.user?.role !== 'admin') {
     location.hash = '#/overview';
     return;
@@ -246,6 +263,7 @@ async function render() {
     if (view === 'overview') await viewOverview(box);
     else if (view === 'crashes') await viewCrashes(box);
     else if (view === 'detail') await viewDetail(box, id);
+    else if (view === 'remote') await viewRemote(box, id);
     else if (view === 'users') await viewUsers(box);
     else if (view === 'account') viewAccount(box);
   } catch (e) {
@@ -823,6 +841,387 @@ function renderLog(text, container, name = 'logs/openpptview.log') {
     name
   )}</h2><span class="sub">${lines.length} 行${lines.length > MAX ? `（只显示前 ${MAX} 行）` : ''}</span></div>
   <div class="log-box">${body}</div>`;
+}
+
+/* ------------------------------------------------------------------ */
+/* 远程协助                                                           */
+/* ------------------------------------------------------------------ */
+
+const remoteFilter = { q: '' };
+
+/** 取一帧画面。`since` 是已经看到过的帧号：没变化时服务器回 204，省一条下行。 */
+async function fetchFrame(hwid, since) {
+  const res = await fetch(
+    `${API_BASE}remote/frame?hwid=${encodeURIComponent(hwid)}&since=${since}&_=${Date.now()}`,
+    { credentials: 'same-origin', headers: { 'X-Oppv-Client': 'admin' } }
+  );
+  if (res.status === 204) return null;
+  if (!res.ok) {
+    let msg = `取画面失败（${res.status}）`;
+    try {
+      msg = (await res.json()).error || msg;
+    } catch {
+      /* 不是 JSON 就用手拼的那句 */
+    }
+    throw new Error(msg);
+  }
+  const seq = Number(res.headers.get('X-Frame-Seq') || 0);
+  const w = Number(res.headers.get('X-Frame-W') || 0);
+  const h = Number(res.headers.get('X-Frame-H') || 0);
+  const url = URL.createObjectURL(await res.blob());
+  return { seq, w, h, url };
+}
+
+/** 发一条命令。失败只弹一句，不打断正在做的事。 */
+async function sendRemote(hwid, kind, arg) {
+  try {
+    await api('remote/cmd', { method: 'POST', body: { hwid, kind, arg } });
+    return true;
+  } catch (e) {
+    toast(e.message);
+    return false;
+  }
+}
+
+async function viewRemote(box, hwid) {
+  if (hwid) return viewRemoteMachine(box, hwid);
+
+  box.innerHTML = `
+    <div class="page-head">
+      <div>
+        <span class="eyebrow">Remote</span>
+        <h1>远程协助</h1>
+        <p>装了本程序、开着机、也没关掉「远程协助」的电脑，每隔几秒来报一次到。点一台进去看屏幕、跑命令。</p>
+      </div>
+    </div>
+
+    <div class="toolbar">
+      <div class="search">
+        <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5" /><path d="M20 20l-4.3-4.3" /></svg>
+        <input id="rm-q" placeholder="搜计算机名、机器码、用户或 IP" value="${esc(remoteFilter.q)}" />
+      </div>
+      <span class="sub" id="rm-count">正在读取…</span>
+    </div>
+
+    <div class="card"><div id="rm-list"><div class="empty">正在读取…</div></div></div>
+
+    <p class="sub" style="margin-top:14px;line-height:1.8">
+      心跳只说明「这台机器在」。机器上设置页的「远程协助」一关，它立刻不再上报，
+      这里就会显示离线 —— 离线之后，之前的命令和画面都不会再更新。
+    </p>`;
+
+  const listEl = $('#rm-list');
+  const countEl = $('#rm-count');
+
+  const paint = async () => {
+    try {
+      const data = await api('remote/machines');
+      const all = data.machines || [];
+      const q = remoteFilter.q.toLowerCase();
+      const items = q
+        ? all.filter((m) =>
+            [m.name, m.hwid, m.user, m.ip].join(' ').toLowerCase().includes(q)
+          )
+        : all;
+      countEl.textContent = `${all.filter((m) => m.online).length} 台在线 · 共 ${all.length} 台记录`;
+      listEl.innerHTML = items.length
+        ? `<div class="table-wrap"><table>
+            <thead><tr><th>状态</th><th>计算机</th><th>登录用户</th><th>权限</th><th>版本</th><th>地址</th><th>最后心跳</th><th>屏幕</th></tr></thead>
+            <tbody>${items
+              .map(
+                (m) => `<tr data-hwid="${esc(m.hwid)}">
+                  <td>${
+                    m.online
+                      ? '<span class="chip fixed"><i></i>在线</span>'
+                      : '<span class="chip muted">离线</span>'
+                  }</td>
+                  <td><span class="cell-title">${esc(m.name || '未命名')}</span>
+                    <span class="sub mono">${esc(m.hwid)}</span></td>
+                  <td>${esc(m.user || '—')}</td>
+                  <td>${
+                    m.admin
+                      ? '<span class="chip high">管理员</span>'
+                      : '<span class="chip muted">普通用户</span>'
+                  }</td>
+                  <td class="mono">${esc(m.version || '—')}</td>
+                  <td class="mono">${esc(m.ip || '—')}</td>
+                  <td class="mono">${esc(fmtTime(m.lastSeen))}${
+                    m.pending ? ` <span class="chip new">待执行 ${m.pending}</span>` : ''
+                  }</td>
+                  <td>${m.screen ? '<span class="chip code">推流中</span>' : '—'}</td>
+                </tr>`
+              )
+              .join('')}</tbody></table></div>`
+        : `<div class="empty"><strong>还没有机器来报到</strong>确认那台机器装了 0.3.13 及以上版本、开着「远程协助」，并且填的上报服务器就是这台。</div>`;
+      for (const row of listEl.querySelectorAll('tbody tr[data-hwid]')) {
+        row.addEventListener('click', () => {
+          location.hash = `#/remote/${row.dataset.hwid}`;
+        });
+      }
+    } catch (e) {
+      listEl.innerHTML = `<div class="empty"><strong>读不出机器列表</strong>${esc(e.message)}</div>`;
+    }
+  };
+
+  await paint();
+  state.remoteTimers.push(setInterval(paint, 4000));
+
+  const q = $('#rm-q');
+  q.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter') return;
+    remoteFilter.q = q.value.trim();
+    paint();
+  });
+  q.addEventListener('blur', () => {
+    if (q.value.trim() === remoteFilter.q) return;
+    remoteFilter.q = q.value.trim();
+    paint();
+  });
+}
+
+async function viewRemoteMachine(box, hwid) {
+  box.innerHTML = `
+    <div class="page-head">
+      <div>
+        <a class="link-btn" href="#/remote">‹ 返回机器列表</a>
+        <h1 id="rm-name">${esc(hwid)}</h1>
+        <p id="rm-meta">正在读取…</p>
+      </div>
+      <div>
+        <button class="btn btn-primary" id="rm-screen">打开屏幕</button>
+      </div>
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-head"><h2>屏幕</h2><span class="sub" id="rm-screen-sub">未打开</span></div>
+        <div class="remote-view">
+          <div class="empty" id="rm-placeholder"><strong>屏幕还没打开</strong>点上面的「打开屏幕」，机器 1～2 秒后开始推画面。</div>
+          <img id="rm-img" hidden alt="远程桌面" />
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>命令</h2><span class="sub">以那台机器当前的权限运行 cmd.exe</span></div>
+        <div class="remote-term">
+          <div class="field row">
+            <input id="rm-cmd" placeholder="whoami" spellcheck="false" autocomplete="off" />
+            <button class="btn btn-primary btn-sm" id="rm-run">执行</button>
+          </div>
+          <div class="remote-keys" id="rm-keys">
+            ${[
+              ['enter', 'Enter'],
+              ['esc', 'Esc'],
+              ['tab', 'Tab'],
+              ['backspace', '退格'],
+              ['up', '↑'],
+              ['down', '↓'],
+              ['left', '←'],
+              ['right', '→'],
+              ['win', 'Win'],
+              ['f5', 'F5'],
+            ]
+              .map(([k, label]) => `<button class="btn btn-sm" data-key="${k}">${label}</button>`)
+              .join('')}
+          </div>
+          <div class="field row">
+            <input id="rm-text" placeholder="往活动窗口打字（中文也可以）" autocomplete="off" />
+            <button class="btn btn-sm" id="rm-type">输入</button>
+          </div>
+          <div class="remote-out" id="rm-out"><span class="sub">还没有命令。</span></div>
+        </div>
+      </div>
+    </div>
+
+    <p class="sub" style="margin-top:14px;line-height:1.8">
+      点画面 = 单击，双击 = 双击，右键 = 右键，滚轮 = 上下滚。
+      命令结果会随机器下一次心跳（约 3 秒）传回来；单条最长跑 30 秒、输出最多 60 KB。
+    </p>`;
+
+  let seq = 0;
+  let screenOn = false;
+  let busy = false;
+  let clickTimer = null;
+
+  const paintHead = async () => {
+    try {
+      const data = await api('remote/machines');
+      const m = (data.machines || []).find((x) => x.hwid === hwid);
+      if (!m) {
+        $('#rm-meta').textContent = '这台机器还没有报到过，或者记录已经过期。';
+        $('#rm-screen').disabled = true;
+        return;
+      }
+      $('#rm-name').textContent = m.name || hwid;
+      $('#rm-meta').textContent = [
+        m.online ? '在线' : '离线',
+        m.user || '—',
+        m.admin ? '管理员权限' : '普通权限',
+        m.version || '版本未知',
+        m.ip || '',
+        `最后心跳 ${fmtTime(m.lastSeen)}`,
+      ].join(' · ');
+      screenOn = Boolean(m.online && m.screen);
+      $('#rm-screen').textContent = screenOn ? '关闭屏幕' : '打开屏幕';
+      $('#rm-screen').disabled = !m.online;
+    } catch (e) {
+      $('#rm-meta').textContent = `读不到状态：${e.message}`;
+    }
+  };
+
+  const paintResults = async () => {
+    try {
+      const data = await api(`remote/results?hwid=${encodeURIComponent(hwid)}&limit=20`);
+      const results = data.results || [];
+      $('#rm-out').innerHTML = results.length
+        ? results
+            .map(
+              (r) => `<div class="remote-log ${r.ok ? '' : 'err'}">
+                <span class="sub mono">${esc(fmtTime(r.at))} · ${r.ms} ms · ${r.ok ? '成功' : '失败'}</span>
+                <pre class="mono">${esc(r.out || '（没有输出）')}</pre>
+              </div>`
+            )
+            .join('')
+        : '<span class="sub">还没有命令。在上面的输入框里发一条试试。</span>';
+    } catch (e) {
+      $('#rm-out').textContent = `读不到命令结果：${e.message}`;
+    }
+  };
+
+  const step = async () => {
+    if (!screenOn || busy) return;
+    busy = true;
+    try {
+      const f = await fetchFrame(hwid, seq);
+      if (f) {
+        seq = f.seq;
+        const img = $('#rm-img');
+        if (img) {
+          if (state.remoteFrameUrl) URL.revokeObjectURL(state.remoteFrameUrl);
+          state.remoteFrameUrl = f.url;
+          img.src = f.url;
+          img.hidden = false;
+          $('#rm-placeholder')?.classList.add('hidden');
+          $('#rm-screen-sub').textContent = `${f.w}×${f.h} · 帧 ${f.seq}`;
+        }
+      }
+    } catch (e) {
+      const sub = $('#rm-screen-sub');
+      if (sub) sub.textContent = e.message;
+    }
+    busy = false;
+  };
+
+  await paintHead();
+  await paintResults();
+  state.remoteTimers.push(setInterval(paintHead, 2500));
+  state.remoteTimers.push(setInterval(paintResults, 2500));
+  state.remoteTimers.push(setInterval(step, 1000));
+
+  $('#rm-screen').addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    try {
+      const data = await api('remote/screen', {
+        method: 'POST',
+        body: { hwid, on: !screenOn },
+      });
+      screenOn = Boolean(data.screen);
+      if (!screenOn) {
+        $('#rm-img').hidden = true;
+        $('#rm-placeholder')?.classList.remove('hidden');
+        $('#rm-screen-sub').textContent = '未打开';
+      } else {
+        seq = 0;
+        $('#rm-placeholder')?.classList.add('hidden');
+        $('#rm-screen-sub').textContent = '正在等第一帧…';
+      }
+      toast(screenOn ? '已请那台机器开始推画面' : '已停止推画面');
+      await paintHead();
+    } catch (err) {
+      toast(err.message);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  // —— 鼠标 ——
+  const img = $('#rm-img');
+  const at = (e) => {
+    const r = img.getBoundingClientRect();
+    const clamp = (v) => Math.min(1, Math.max(0, v));
+    return {
+      x: clamp(r.width ? (e.clientX - r.left) / r.width : 0),
+      y: clamp(r.height ? (e.clientY - r.top) / r.height : 0),
+    };
+  };
+  const mouse = (p, a, dy = 0) =>
+    sendRemote(hwid, 'mouse', JSON.stringify({ x: p.x, y: p.y, a, dy }));
+
+  img.addEventListener('click', (e) => {
+    const p = at(e);
+    // 等一会儿再点：如果紧接着来了 dblclick，就只发一次双击，别把界面点乱
+    if (clickTimer) return;
+    clickTimer = setTimeout(() => {
+      clickTimer = null;
+      mouse(p, 'left');
+    }, 230);
+  });
+  img.addEventListener('dblclick', (e) => {
+    if (clickTimer) {
+      clearTimeout(clickTimer);
+      clickTimer = null;
+    }
+    mouse(at(e), 'double');
+  });
+  img.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    mouse(at(e), 'right');
+  });
+  img.addEventListener(
+    'wheel',
+    (e) => {
+      e.preventDefault();
+      mouse(at(e), 'wheel', Math.sign(e.deltaY) || 1);
+    },
+    { passive: false }
+  );
+
+  // —— 键盘 ——
+  for (const btn of $('#rm-keys').querySelectorAll('button[data-key]')) {
+    btn.addEventListener('click', () =>
+      sendRemote(hwid, 'key', JSON.stringify({ keys: [btn.dataset.key] }))
+    );
+  }
+
+  const sendText = () => {
+    const text = $('#rm-text').value;
+    if (!text) return;
+    sendRemote(hwid, 'key', JSON.stringify({ text }));
+    $('#rm-text').value = '';
+  };
+  $('#rm-type').addEventListener('click', sendText);
+  $('#rm-text').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      sendText();
+    }
+  });
+
+  const run = () => {
+    const text = $('#rm-cmd').value.trim();
+    if (!text) return;
+    sendRemote(hwid, 'shell', text);
+    $('#rm-cmd').value = '';
+    toast('已发出，结果会在几秒内回来');
+  };
+  $('#rm-run').addEventListener('click', run);
+  $('#rm-cmd').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      run();
+    }
+  });
 }
 
 /* ------------------------------------------------------------------ */

@@ -42,8 +42,6 @@ pub const FLAG: &str = "--crash-report";
 /// 演示开关：不真的蓝屏也能把整套流程走一遍（见 `mode`）。
 pub const DEMO_FLAG: &str = "--crash-report-demo";
 
-/// 「正在分析」至少停留这么久，不然一闪而过，老师看不见发生了什么。
-const INTRO_HOLD: Duration = Duration::from_millis(1500);
 /// 缩到右下角之后，成功/失败的结果再停留多久。
 const OUTRO_HOLD: Duration = Duration::from_millis(2000);
 /// 单次采集最多带多少个转储、总共多少字节。
@@ -126,6 +124,22 @@ pub struct Settings {
     /// 默认开：全是毫秒级到一两秒的查询，不占上课时间。
     #[serde(default = "default_true")]
     pub quick_checks: bool,
+    /// 诊断窗口「正在分析」的大卡片停留多久（毫秒），之后缩到右下角。
+    ///
+    /// 默认 5 秒：老师开机就看见它在做什么，一节课的时间不该被一块
+    /// 「正在分析」挡着，但短于 3 秒又来不及看清。
+    #[serde(default = "default_intro_ms")]
+    pub intro_ms: u64,
+    /// 允许管理员在管理后台对这台机器做远程协助（终端命令 / 看屏幕 / 点鼠标）。
+    ///
+    /// 默认开：这个功能的全部价值就是「老师不知道怎么办时，我能直接看到」，
+    /// 默认关等于没有。设置页写明了它做什么，关掉即彻底断开心跳。
+    #[serde(default = "default_true")]
+    pub remote: bool,
+}
+
+fn default_intro_ms() -> u64 {
+    5000
 }
 
 fn default_true() -> bool {
@@ -161,6 +175,8 @@ impl Default for Settings {
             repair_chkdsk: true,
             repair_drivers: true,
             quick_checks: true,
+            intro_ms: default_intro_ms(),
+            remote: true,
         }
     }
 }
@@ -275,6 +291,11 @@ pub struct Report {
     /// 也保证**检查跑早了（事件日志还没落盘）不会把这次蓝屏永久跳过**。
     #[serde(default)]
     pub fingerprint: String,
+    /// 同一场蓝屏的其它指纹（比如「事件」那次顺带认下的同名转储）。
+    ///
+    /// 不进 summary.json：它只用来往 `seen` 里补几笔，服务器没必要看见。
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub extra_seen: Vec<String>,
 }
 
 /// 转储文件路径（只在本次进程里用，不写进报告）。
@@ -345,8 +366,14 @@ fn mark_seen(report: &Report) {
         return;
     }
     let mut marker = read_marker().unwrap_or_default();
-    if !report.fingerprint.is_empty() && !marker.seen.contains(&report.fingerprint) {
-        marker.seen.push(report.fingerprint.clone());
+    // 主指纹 + 同一场蓝屏的「别名」（比如那次事件旁边那份转储）一起记。
+    // 只记主指纹的话，下一次检查会从转储那一边把**同一场**蓝屏又报一遍：
+    // 事件时刻与 minidump 的写入时刻差几秒，看上去就是两条记录。
+    for key in std::iter::once(&report.fingerprint).chain(report.extra_seen.iter()) {
+        if key.is_empty() || marker.seen.contains(key) {
+            continue;
+        }
+        marker.seen.push(key.clone());
         while marker.seen.len() > MAX_SEEN {
             marker.seen.remove(0);
         }
@@ -372,6 +399,23 @@ struct PendingBsod {
     bugcheck: String,
     fingerprint: String,
     has_dump: bool,
+    /// 同一场蓝屏的其它指纹：`at:<时刻>` 与旁边那份转储。
+    extra_seen: Vec<String>,
+}
+
+/// 「同一场蓝屏」的判定半径。
+///
+/// 事件 1001 记下的时刻与 `Minidump\*.dmp` 的写入时刻**不是同一秒**
+/// （WER 要先收尾再落盘），差几秒到一两分钟都正常。两条证据各自算指纹的话，
+/// 同一场蓝屏会被当成两场 —— 服务器上就是两条看起来一模一样、时间差几秒的记录。
+/// 取 10 分钟：足以罩住这一场蓝屏的所有痕迹，又远小于「两节课之间又崩一次」。
+const CLOSE_ENOUGH: u64 = 10 * 60;
+
+/// `seen` 里有没有「这个时刻附近」已经报过一场蓝屏。
+fn close_to_reported(seen: &[String], epoch: u64) -> bool {
+    seen.iter()
+        .filter_map(|s| s.strip_prefix("at:")?.parse::<u64>().ok())
+        .any(|at| epoch.abs_diff(at) <= CLOSE_ENOUGH)
 }
 
 /// 从「事件 + 转储」里挑出最近一次**还没上报过**的蓝屏。
@@ -394,23 +438,34 @@ fn pick_bsod(
     seen: &[String],
     since: u64,
 ) -> Option<PendingBsod> {
+    // 已经报过的那场蓝屏，它的痕迹要以**时刻**为单位排除：
+    // 事件和转储的写入时刻差几秒，只比对指纹会把同一场算成两场。
     let newest_event = events
         .iter()
-        .filter(|e| e.epoch >= since && e.epoch > 0)
+        .filter(|e| e.epoch >= since && e.epoch > 0 && !close_to_reported(seen, e.epoch))
         .max_by_key(|e| e.epoch);
     let newest_dump = dumps
         .iter()
-        .filter(|d| d.modified >= since)
+        .filter(|d| d.modified >= since && !close_to_reported(seen, d.modified))
         .max_by_key(|d| d.modified);
 
     // 1) 事件日志里最近的一条（它带错误码，信息最全）
     if let Some(e) = newest_event {
         if !seen.iter().any(|s| s == &event_key(e)) {
+            // 顺带把「这一刻」和旁边的转储一起认下来，
+            // 免得下一次检查从转储那边把同一场再报一遍。
+            let mut extra_seen = vec![format!("at:{}", e.epoch)];
+            for d in dumps {
+                if d.modified.abs_diff(e.epoch) <= CLOSE_ENOUGH {
+                    extra_seen.push(dump_key(d));
+                }
+            }
             return Some(PendingBsod {
                 epoch: e.epoch,
                 bugcheck: e.code.clone(),
                 fingerprint: event_key(e),
                 has_dump: dumps.iter().any(|d| d.modified >= since),
+                extra_seen,
             });
         }
     }
@@ -424,6 +479,8 @@ fn pick_bsod(
             epoch: d.modified,
             bugcheck: "未知（未读到蓝屏事件）".to_string(),
             fingerprint: dump_key(d),
+            // 只报转储时，事件那条（可能还没落盘）以后也得按同一场算
+            extra_seen: vec![format!("at:{}", d.modified)],
             has_dump: true,
         })
 }
@@ -445,6 +502,7 @@ pub fn detect(mode: Mode) -> Option<Report> {
             has_dump: false,
             demo: true,
             fingerprint: format!("demo:{now}"),
+            extra_seen: Vec::new(),
         });
     }
 
@@ -473,6 +531,28 @@ pub fn detect(mode: Mode) -> Option<Report> {
         return None;
     };
 
+    // 同一场蓝屏，同一时间只让一条检查路径去分析。
+    //
+    // # 为什么光靠 `seen` 不够
+    //
+    // 机器上同时有两条路会来做这件事：登录时的计划任务（带界面）和老师自己
+    // 打开应用时的静默补查。两者是**两个进程**，各自读到同一份 `seen`，
+    // 各自判定「这场蓝屏还没报过」，于是各自分析一遍 ——
+    // 老师看到的是「分析了两次」，服务器上则是两条几乎一样的记录。
+    // `seen` 是在**分析完、包落地之后**才写的，它管不住「正在分析」。
+    //
+    // 所以动手之前先抢一个文件锁：抢到的那条路负责分析，另一条原地退出。
+    // 锁带 1 小时的过期时间：哪怕上次进程被杀，下一次也不会永远卡住。
+    let Some(_claim) = Claim::acquire(&hit.fingerprint) else {
+        log::info!(
+            "同一场蓝屏已经在另一条检查路径里分析了（{}），这次跳过",
+            hit.fingerprint
+        );
+        touch_marker(now, &marker.seen);
+        return None;
+    };
+    release_claim_on_finish(_claim);
+
     // 报告 id 用**蓝屏发生时刻**，不是「现在」：
     // 同一场蓝屏无论被检查几次（比如上次分析到一半断电），都落在同一个 id 上，
     // 服务器上不会出现两条看起来一模一样的记录。
@@ -483,7 +563,104 @@ pub fn detect(mode: Mode) -> Option<Report> {
         has_dump: hit.has_dump,
         demo: false,
         fingerprint: hit.fingerprint,
+        extra_seen: hit.extra_seen,
     })
+}
+
+/* ------------------------------------------------------------------ */
+/* 「正在分析」的文件锁                                                */
+/* ------------------------------------------------------------------ */
+
+/// 锁文件放多久算失效。
+///
+/// 一次完整分析可能十几分钟（`sfc` 本来就要跑这么久），给一小时足够宽；
+/// 而且它只在**进程意外死掉**时才用得上，正常情况下文件在分析结束就删了。
+const CLAIM_TTL: u64 = 60 * 60;
+
+/// 同一个进程里，负责这次分析的锁。放在这里，等 `run` 结束再丢。
+static ACTIVE_CLAIM: std::sync::Mutex<Option<Claim>> = std::sync::Mutex::new(None);
+
+#[derive(Debug)]
+struct Claim {
+    path: PathBuf,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ClaimFile {
+    fingerprint: String,
+    pid: u32,
+    at: u64,
+}
+
+impl Claim {
+    fn acquire(fingerprint: &str) -> Option<Claim> {
+        Self::acquire_in(&root_dir().join("claims"), fingerprint)
+    }
+
+    /// 目录单独传进来是为了能测：测试不该往真实的用户目录里写文件。
+    fn acquire_in(dir: &Path, fingerprint: &str) -> Option<Claim> {
+        use sha2::{Digest, Sha256};
+        let _ = std::fs::create_dir_all(dir);
+        let mut hasher = Sha256::new();
+        hasher.update(fingerprint.as_bytes());
+        let digest = hasher.finalize();
+        // 取前 8 字节当文件名：够区分，又短到能一眼看完
+        let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+        let name = format!("{hex}.claim");
+        let path = dir.join(name);
+
+        // 最多试三次：撞上过期锁就删掉重抢，别和另一个进程无限拉锯
+        for _ in 0..3 {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path);
+            match file {
+                Ok(mut f) => {
+                    let body = ClaimFile {
+                        fingerprint: fingerprint.to_string(),
+                        pid: std::process::id(),
+                        at: now_epoch(),
+                    };
+                    let _ = f.write_all(serde_json::to_string(&body).unwrap_or_default().as_bytes());
+                    return Some(Claim { path });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let alive = std::fs::read_to_string(&path)
+                        .ok()
+                        .and_then(|t| serde_json::from_str::<ClaimFile>(&t).ok())
+                        .map(|c| now_epoch().saturating_sub(c.at) < CLAIM_TTL)
+                        .unwrap_or(false);
+                    if alive {
+                        return None;
+                    }
+                    // 上一次分析没走到收尾（断电、被杀）—— 这份锁已经作废
+                    let _ = std::fs::remove_file(&path);
+                }
+                Err(_) => return None,
+            }
+        }
+        None
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn release_claim_on_finish(claim: Claim) {
+    if let Ok(mut slot) = ACTIVE_CLAIM.lock() {
+        *slot = Some(claim);
+    }
+}
+
+/// 分析结束：放锁。不放在 `detect` 里，是因为「分析中途断电」时要能重来。
+fn release_claim() {
+    if let Ok(mut slot) = ACTIVE_CLAIM.lock() {
+        *slot = None;
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1432,6 +1609,23 @@ fn machine_id(parts: &[Option<String>]) -> String {
     format!("{}-{}-{}-{}", &hex[0..4], &hex[4..8], &hex[8..12], &hex[12..16])
 }
 
+/// 这台机器的机器码（缓存一次）。
+///
+/// 远程协助的心跳要靠它跟后台里的那台机器对上号。`system_info()` 里
+/// 可能要走一次 SMBIOS 查询（约一秒），心跳每几秒一次，不能每次都算。
+pub fn hwid() -> String {
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            system_info()
+                .into_iter()
+                .find(|(k, _)| k == "机器码")
+                .map(|(_, v)| v)
+                .unwrap_or_else(|| "unknown".to_string())
+        })
+        .clone()
+}
+
 fn reg_string(root: &str, path: &str, value: &str) -> Option<String> {
     use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
     use winreg::RegKey;
@@ -1907,7 +2101,7 @@ pub fn upload(receipt: &Receipt, report: &Report) -> Result<(), String> {
         .header("Content-Length", receipt.bytes.to_string())
         .header("X-Crash-Id", &report.id)
         .header("X-App-Version", env!("CARGO_PKG_VERSION"))
-        .header("X-Bugcheck", &report.bugcheck)
+        .header("X-Bugcheck", header_safe(&report.bugcheck))
         .header("X-Occurred-At", &report.occurred_at)
         .header("X-Report-Mode", if report.demo { "demo" } else { "real" })
         .body(file);
@@ -1923,6 +2117,33 @@ pub fn upload(receipt: &Receipt, report: &Report) -> Result<(), String> {
         return Err(format!("服务器返回 {}", resp.status()));
     }
     Ok(())
+}
+
+/// HTTP 头只能放可见 ASCII。
+///
+/// 「未知（未读到蓝屏事件）」这种中文错误码直接塞进头里会被 reqwest 拒绝
+/// （`HeaderValue` 只接受 0x20–0x7E），表现就是**转储兜底那一类报告永远发不出去**，
+/// 而且错误发生在 `send()` 之前，日志里只留一句「连不上服务器」。
+///
+/// 所以非 ASCII 的值走一次百分号编码，前面加 `u:` 让服务端知道要解回来；
+/// 正常的 `0x000000EF` 原样发出去，不用绕这一圈。
+fn header_safe(s: &str) -> String {
+    if s.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
+        return s.to_string();
+    }
+    let mut out = String::from("u:");
+    for ch in s.chars() {
+        let code = ch as u32;
+        if (0x20..=0x7e).contains(&code) && ch != '%' {
+            out.push(ch);
+        } else {
+            let mut buf = [0u8; 4];
+            for b in ch.encode_utf8(&mut buf).as_bytes() {
+                out.push_str(&format!("%{b:02X}"));
+            }
+        }
+    }
+    out
 }
 
 /// 应用正常启动时调一次：把上次没发出去的报告补发掉。
@@ -2203,7 +2424,9 @@ fn run(app: AppHandle, report: Report, ui: bool) {
     });
 
     if ui {
-        std::thread::sleep(INTRO_HOLD);
+        // 「正在分析」这张大卡片停留多久，设置页可调（默认 5 秒）。
+        // 0 也不拦着：有人嫌它挡课件，直接关掉缩角等待也行。
+        std::thread::sleep(Duration::from_millis(settings.intro_ms.min(60_000)));
     }
 
     // 「启动分析后，页面自动退出，优雅缩小到系统右下角」
@@ -2364,6 +2587,9 @@ fn run(app: AppHandle, report: Report, ui: bool) {
 /// 一次分析结束：有窗口的那条路直接退出进程（老师开机时不需要别的东西），
 /// 静默那条路把「正在分析」的闸门放下 —— 老师还在用这个应用，不能退。
 fn end_run(app: &AppHandle, ui: bool) {
+    // 这次分析到此为止（不管成没成），把「正在分析」的锁放下：
+    // 失败了下一次还能重来，成功了 `seen` 会挡住重复上报。
+    release_claim();
     if ui {
         app.exit(0);
     } else {
@@ -2452,6 +2678,10 @@ pub struct View {
     pub repair_drivers: bool,
     /// 采集时顺手做的快速体检。
     pub quick_checks: bool,
+    /// 「正在分析」大卡片停留多久（毫秒）。
+    pub intro_ms: u64,
+    /// 允许管理员远程协助这台机器。
+    pub remote: bool,
     pub dir: String,
     /// 还没送出去的包有几个。
     pub pending: usize,
@@ -2479,6 +2709,8 @@ pub fn view() -> View {
         repair_chkdsk: s.repair_chkdsk,
         repair_drivers: s.repair_drivers,
         quick_checks: s.quick_checks,
+        intro_ms: s.intro_ms,
+        remote: s.remote,
         dir: root_dir().to_string_lossy().to_string(),
         pending,
         admin: crate::crash_repair::is_admin(),
@@ -2628,6 +2860,19 @@ mod tests {
         );
     }
 
+    /// 中文错误码不能直接进请求头：reqwest 会拒绝整个请求，
+    /// 表现是「转储兜底那条报告永远发不出去」，而日志只会写「连不上服务器」。
+    #[test]
+    fn non_ascii_bugcheck_is_encoded_for_the_header() {
+        assert_eq!(header_safe("0x000000EF"), "0x000000EF");
+        let enc = header_safe("未知（未读到蓝屏事件）");
+        assert!(enc.starts_with("u:"), "要让服务端知道这是编码过的：{enc}");
+        assert!(
+            enc.bytes().all(|b| (0x20..=0x7e).contains(&b)),
+            "编码后必须是纯可见 ASCII：{enc}"
+        );
+    }
+
     /// 老版本留下的 `settings.json` 少字段时，不能把老师关掉的开关顶开。
     #[test]
     fn partial_settings_keep_what_the_teacher_chose() {
@@ -2735,6 +2980,85 @@ mod tests {
             pick_bsod(&[], &dumps, &seen, bsod - 60).is_none(),
             "同一份转储不该再报一次"
         );
+    }
+
+    /// 一场蓝屏只分析一次：事件时刻和转储写入时刻差几秒，
+    /// 报过事件之后不能再从转储那边把**同一场**报第二遍。
+    #[test]
+    fn the_same_crash_is_not_reported_twice_from_two_evidences() {
+        let crash = 1_790_000_000;
+        let events = vec![event(crash, "0x000000ef")];
+        // 转储比事件晚写了 12 秒，比事件更「新」
+        let dumps = vec![dump(crash + 12, "102526-6437-01.dmp")];
+
+        let first = pick_bsod(&events, &dumps, &[], crash - 3600).expect("第一轮应当挑到");
+        assert_eq!(first.fingerprint, format!("bsod:{crash}:0x000000ef"));
+        assert!(
+            first.extra_seen.contains(&format!("at:{crash}")),
+            "要把这场蓝屏的时刻一并认下来"
+        );
+        assert!(
+            first.extra_seen.contains(&format!("dump:102526-6437-01.dmp")),
+            "同一场蓝屏的转储也要认下来"
+        );
+
+        // 分析结束、写进 seen 之后，下一轮（比如老师又打开一次应用）
+        // 无论从事件还是转储那边看，都不该再挑出东西
+        let mut seen = vec![first.fingerprint.clone()];
+        seen.extend(first.extra_seen.iter().cloned());
+        assert!(pick_bsod(&events, &dumps, &seen, crash - 3600).is_none());
+    }
+
+    /// 反过来：事件日志还没落盘时先靠转储报了，之后事件出现了也不能再报一次。
+    #[test]
+    fn an_event_that_lands_later_is_the_same_crash_not_a_new_one() {
+        let crash = 1_790_000_000;
+        let events = vec![event(crash + 40, "0x000000ef")];
+        let dumps = vec![dump(crash, "102526-6437-01.dmp")];
+
+        let first = pick_bsod(&[], &dumps, &[], crash - 60).expect("先靠转储");
+        let mut seen = vec![first.fingerprint.clone()];
+        seen.extend(first.extra_seen.iter().cloned());
+
+        assert!(
+            pick_bsod(&events, &dumps, &seen, crash - 60).is_none(),
+            "同一场蓝屏不该因为事件晚落盘就报第二次"
+        );
+    }
+
+    /// 真的又崩了一次（隔了几小时）还是要报 —— 去重不能把「第二次蓝屏」也吃掉。
+    #[test]
+    fn a_genuinely_new_crash_still_gets_reported() {
+        let first = 1_790_000_000;
+        let second = first + 3 * 3600;
+        let events = vec![event(second, "0x000000d1"), event(first, "0x000000ef")];
+        let seen = vec![event_key(&events[1]), format!("at:{first}")];
+
+        let picked = pick_bsod(&events, &[], &seen, first - 60).expect("第二次要报");
+        assert_eq!(picked.epoch, second);
+    }
+
+    /// 同一场蓝屏只让一条检查路径分析：锁被占用时，第二条路直接退出。
+    /// （代码里确实有两条：登录自检与「应用启动时补查」，是两个进程。）
+    #[test]
+    fn only_one_check_path_gets_to_analyse_a_crash() {
+        let dir = std::env::temp_dir().join(format!("oppv-claim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let fp = "bsod:1790000000:0x000000ef";
+
+        let a = Claim::acquire_in(&dir, fp);
+        assert!(a.is_some(), "第一条路应当抢到");
+        assert!(
+            Claim::acquire_in(&dir, fp).is_none(),
+            "第二条路必须被挡回去"
+        );
+
+        drop(a);
+        assert!(
+            Claim::acquire_in(&dir, fp).is_some(),
+            "前一条路结束后，下一次应当还能重来"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 太老的记录（超出回看窗口）不翻旧账。

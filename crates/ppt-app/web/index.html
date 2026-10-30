@@ -512,6 +512,22 @@
               <span class="set-value" id="set-crash-quick">正在读取…</span>
               <button class="link-btn" id="btn-crash-quick">关闭</button>
             </div>
+            <!-- 分析窗口挡在教室屏幕中间是有代价的：老师要上课。这里定它停多久 -->
+            <div class="set-row">
+              <span class="set-label">分析窗口停留</span>
+              <span class="set-value" id="set-crash-intro">正在读取…</span>
+            </div>
+            <div class="set-inline step-chips">
+              <button class="link-btn" id="btn-intro-2">2 秒</button>
+              <button class="link-btn" id="btn-intro-5">5 秒</button>
+              <button class="link-btn" id="btn-intro-10">10 秒</button>
+              <button class="link-btn" id="btn-intro-20">20 秒</button>
+            </div>
+            <div class="set-row">
+              <span class="set-label">远程协助</span>
+              <span class="set-value" id="set-crash-remote">正在读取…</span>
+              <button class="link-btn" id="btn-crash-remote">关闭</button>
+            </div>
             <div class="set-row">
               <span class="set-label">上报服务器</span>
               <span class="set-value" id="set-crash-endpoint">正在读取…</span>
@@ -538,6 +554,16 @@
               上面四个小开关决定「这次跑哪几项」：全跑一遍可能要十几分钟，机房赶时间就留磁盘检查。
               「快速体检」只是采集时顺带读几项环境事实（系统盘容量、页面文件、快速启动、
               驱动加载失败），一两秒就完，建议一直开着 —— 这些往往就是蓝屏的真正原因。
+            </p>
+            <p class="assoc-hint">
+              「分析窗口停留」决定那块「正在分析」的大卡片在屏幕中间待多久：到时自动缩到
+              右下角，一节课都不挡幻灯片。默认 5 秒，嫌它碍事可以改成 2 秒。
+              点右下角的小窗口能重新展开看完整结果。
+            </p>
+            <p class="assoc-hint">
+              「远程协助」开着时，这台机器每隔几秒向上面那个服务器报到一次；管理员可以在
+              管理后台看到它在不在线，需要时打开它的屏幕、执行命令（比如重启某个服务）。
+              关掉即刻断开心跳，服务器再也连不上这台机器 —— 学校的公共机房建议关掉。
             </p>
             <p class="assoc-hint">
               传不出去（断网、服务器不可达）时报告会留在本机，

@@ -28,6 +28,7 @@ mod crash;
 mod crash_repair;
 mod fixos;
 mod install_pref;
+mod remote;
 mod resident;
 mod update;
 
@@ -1872,6 +1873,8 @@ fn set_crash_settings(
     repair_chkdsk: bool,
     repair_drivers: bool,
     quick_checks: bool,
+    intro_ms: u64,
+    remote: bool,
 ) -> Result<crash::View, String> {
     let endpoint = endpoint.trim().to_string();
     if !endpoint.is_empty()
@@ -1889,6 +1892,9 @@ fn set_crash_settings(
         repair_chkdsk,
         repair_drivers,
         quick_checks,
+        // 界面上是「秒」，存的是毫秒；夹在 0～60 秒之间，挡住输入框乱填的数。
+        intro_ms: intro_ms.min(60_000),
+        remote,
     })?;
     Ok(crash::view())
 }
@@ -2567,6 +2573,9 @@ fn main() {
             // 登录自检有可能没被 Windows 拉起来（任务被禁用、快速启动、清理软件）。
             // 老师每天都会打开应用，那就顺手补查一次：查到就静默分析并上报。
             crash::spawn_startup_check(app.handle().clone());
+
+            // 远程协助的心跳：设置里开着才真的联网（见 `remote`）
+            remote::spawn();
 
             // 主窗口在配置里是 `visible: false`：正常启动到这里才显示它。
             //

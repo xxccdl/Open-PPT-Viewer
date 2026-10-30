@@ -32,6 +32,7 @@ import crypto from 'node:crypto';
 import { Auth, HttpError } from './auth.mjs';
 import { Zip } from './zip.mjs';
 import { explain, diagnose, scanLog } from './analysis.mjs';
+import { createRemoteRoutes } from './remote.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const HOST = process.env.HOST || '127.0.0.1';
@@ -52,6 +53,9 @@ const COOKIE = 'oppv_admin';
 const SESSION_MAX_AGE = 30 * 24 * 3600;
 
 const auth = new Auth(STATE_DIR);
+
+/** 远程协助：机器心跳、命令、屏幕画面（见 `remote.mjs`）。 */
+const remote = createRemoteRoutes({ json, requireUser, machineAuthorized, clientIp });
 
 /* ------------------------------------------------------------------ */
 /* 小工具                                                              */
@@ -203,6 +207,51 @@ async function readAllMetas() {
   return items;
 }
 
+/**
+ * 请求头只能放可见 ASCII，所以客户端把中文（例如「未知（未读到蓝屏事件）」）
+ * 百分号编码后加 `u:` 前缀发过来。这里解回去，后台列表才显示得正常。
+ */
+function decodeHeader(raw) {
+  const s = String(raw || '');
+  if (!s.startsWith('u:')) return s;
+  try {
+    return decodeURIComponent(s.slice(2));
+  } catch {
+    return s.slice(2);
+  }
+}
+
+/** 「同一场蓝屏」的判定半径：事件与 minidump 的写入时刻差几秒是常事。 */
+const SAME_CRASH_MS = 10 * 60 * 1000;
+
+/**
+ * 磁盘上有没有同一场蓝屏的报告。
+ *
+ * 客户端的 `seen` 已经保证「一台机器只报一次」，但装机房里总有还没升级的旧版本，
+ * 它们会把同一场蓝屏报两遍（一条来自事件日志、一条来自转储）。后台看到的就是
+ * 「时间差几秒、错误码一样」的两条记录 —— 像是两节课之间崩了两次，很误导。
+ * 这里按时刻认重：10 分钟内、错误码相同或有一边是「未知」的，算同一场。
+ */
+async function findTwin(bugcheck, occurredAt) {
+  if (!occurredAt) return '';
+  const at = new Date(occurredAt).getTime();
+  if (Number.isNaN(at)) return '';
+  let items = [];
+  try {
+    items = await readAllMetas();
+  } catch {
+    return '';
+  }
+  const unknown = (code) => !code || /^未知/.test(code);
+  for (const m of items) {
+    const t = new Date(m.occurredAt).getTime();
+    if (Number.isNaN(t) || Math.abs(t - at) > SAME_CRASH_MS) continue;
+    const code = String(m.bugcheck || '');
+    if (code === bugcheck || unknown(code) || unknown(bugcheck)) return m.id;
+  }
+  return '';
+}
+
 /* ---- 处理状态与备注（管理员自己加的，不改原报告） ---- */
 
 const STATUSES = ['new', 'investigating', 'fixed', 'ignored'];
@@ -264,6 +313,23 @@ async function handleUpload(req, res) {
       .toString('hex')}`;
   }
 
+  const bugcheck = decodeHeader(req.headers['x-bugcheck']);
+  const occurredAt = String(req.headers['x-occurred-at'] || '');
+  // 同一场蓝屏只留一条记录（见 `findTwin`）：老版本客户端可能报两遍，
+  // 那时后台就会出现两条「时间差几秒、错误码一样」的记录，看着像两次独立故障。
+  // 演示报告不参与：它是同一台机器上一次一次手点出来的「假蓝屏」，
+  // 每一次都该进库里，否则验证流程时会以为「上传又坏了」。
+  const twin =
+    String(req.headers['x-report-mode'] || 'real') === 'demo'
+      ? ''
+      : await findTwin(bugcheck, occurredAt);
+  if (twin) {
+    req.resume();
+    console.log(`[${new Date().toISOString()}] 忽略重复上传 ${id}（和 ${twin} 是同一场蓝屏）`);
+    json(res, 200, { ok: true, id: twin, duplicated: true });
+    return;
+  }
+
   await fs.mkdir(DATA_DIR, { recursive: true });
   const zipPath = zipPathOf(id);
   const metaPath = metaPathOf(id);
@@ -301,8 +367,8 @@ async function handleUpload(req, res) {
     bytes: received,
     receivedAt: new Date().toISOString(),
     appVersion: String(req.headers['x-app-version'] || ''),
-    bugcheck: String(req.headers['x-bugcheck'] || ''),
-    occurredAt: String(req.headers['x-occurred-at'] || ''),
+    bugcheck,
+    occurredAt,
     mode: String(req.headers['x-report-mode'] || 'real'),
     remote: clientIp(req),
   };
@@ -706,6 +772,11 @@ const server = http.createServer((req, res) => {
 
   if (method === 'GET' && p === '/health') {
     json(res, 200, { ok: true, service: 'openpptview-crash', time: new Date().toISOString() });
+    return;
+  }
+
+  // —— 远程协助 ——（机器接口 + 后台接口都在这里分派）
+  if (remote(req, res, url, method)) {
     return;
   }
 

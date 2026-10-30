@@ -463,6 +463,34 @@
             </p>
           </section>
 
+          <!-- 启动与后台 -->
+          <section class="set-sec">
+            <div class="set-sec-head">
+              <span class="set-sec-title">启动与后台</span>
+            </div>
+            <div class="set-row">
+              <span class="set-label">开机自启动</span>
+              <span class="set-value" id="set-autostart">正在读取…</span>
+              <button class="link-btn" id="btn-autostart">开启</button>
+            </div>
+            <div class="set-row">
+              <span class="set-label">后台存活</span>
+              <span class="set-value" id="set-idle">正在读取…</span>
+            </div>
+            <div class="set-inline step-chips">
+              <button class="link-btn" id="btn-idle-0">常驻</button>
+              <button class="link-btn" id="btn-idle-30">30 分钟</button>
+              <button class="link-btn" id="btn-idle-60">1 小时</button>
+              <button class="link-btn" id="btn-idle-120">2 小时</button>
+            </div>
+            <p class="assoc-hint">
+              开机自启动时不弹窗口：进程只在托盘里待命，双击课件或点托盘图标才出来，
+              老师打开课件就是秒开。关窗也只是藏到托盘、不退出。
+              「后台存活」决定它藏起来多久之后自己退出（常驻就一直留着，占用约 100 MB）。
+              自启动写的是当前用户，不需要管理员权限，随开随关。
+            </p>
+          </section>
+
           <!-- 出问题时怎么查 -->
           <section class="set-sec">
             <div class="set-sec-head">

@@ -34,11 +34,11 @@ use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, Window};
 
-/// 窗口藏起来多久之后自动退出进程。
+/// 窗口藏起来多久之后自动退出进程 —— 由设置页决定（`resident_prefs`）。
 ///
-/// 60 分钟：够覆盖「连着上两节课、课间翻翻别的课件」，
-/// 又不至于放学后白占一晚内存（常驻一个 WebView2 约 100MB）。
-const IDLE_EXIT: Duration = Duration::from_secs(60 * 60);
+/// 默认 60 分钟：够覆盖「连着上两节课、课间翻翻别的课件」，
+/// 又不至于放学后白占一晚内存（常驻一个 WebView2 约 100MB）；
+/// 设成 0 则一直留着。
 
 /// 真退出前，最多等界面多久把标注落盘。
 const QUIT_GRACE: Duration = Duration::from_millis(1500);
@@ -77,6 +77,11 @@ impl Resident {
     /// 取走待打开的文件（取过就没了，避免同一次转交被处理两遍）。
     pub fn take_pending_open(&self) -> Option<String> {
         self.pending_open.lock().unwrap().take()
+    }
+
+    /// 窗口从一开始就没显示（开机自启进托盘）：从此刻开始算「藏在后台」。
+    pub fn mark_hidden_now(&self) {
+        *self.hidden_since.lock().unwrap() = Some(Instant::now());
     }
 }
 
@@ -160,9 +165,13 @@ pub fn spawn_idle_watchdog(app: AppHandle) {
         if resident.quitting.load(Ordering::SeqCst) {
             return;
         }
+        // 留多久由老师决定（0 = 常驻）。每一轮重新读：改设置不必重启应用
+        let Some(limit) = crate::resident_prefs::idle_duration() else {
+            continue;
+        };
         let hidden_since = *resident.hidden_since.lock().unwrap();
         if let Some(t) = hidden_since {
-            if t.elapsed() >= IDLE_EXIT {
+            if t.elapsed() >= limit {
                 log::info!(
                     "窗口已隐藏 {} 分钟，自动退出后台进程",
                     t.elapsed().as_secs() / 60

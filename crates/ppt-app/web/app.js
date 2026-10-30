@@ -168,6 +168,10 @@ const el = {
   btnStepChkdsk: $('btn-step-chkdsk'),
   btnStepDrivers: $('btn-step-drivers'),
   btnCrashQuick: $('btn-crash-quick'),
+  setAutoStart: $('set-autostart'),
+  btnAutoStart: $('btn-autostart'),
+  setIdle: $('set-idle'),
+  btnIdle: [0, 30, 60, 120].map((m) => $('btn-idle-' + m)),
   setMachine: $('set-machine'),
   btnMachineLogin: $('btn-machine-login'),
   btnMachineLogout: $('btn-machine-logout'),
@@ -4087,6 +4091,7 @@ function openSettings() {
   refreshCacheUsage();
   refreshCrash();
   refreshMachine();
+  refreshResident();
   refreshFixos();
   // 打开就查一次：点进来多半就是想看有没有新版
   refreshUpdate();
@@ -4285,6 +4290,74 @@ async function toggleCrashRemote(btn) {
     await invoke('set_crash_settings', crashArgs(cur, { remote: next }));
     await refreshCrash();
     toast(next ? '远程协助已开启' : '远程协助已关闭，这台机器不再接受远程操作');
+  } catch (e) {
+    toast(`改不了：${e}`, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/* ---------------- 启动与后台 ---------------- */
+
+/** 「后台存活」的人话。 */
+function idleLabel(minutes) {
+  if (!minutes) return '常驻（不自动退出）';
+  if (minutes < 60) return `${minutes} 分钟后退出`;
+  const hours = minutes / 60;
+  return `${Number.isInteger(hours) ? hours : hours.toFixed(1)} 小时后退出`;
+}
+
+async function refreshResident() {
+  if (!el.setAutoStart) return;
+  try {
+    const st = await invoke('resident_settings');
+    el.setAutoStart.textContent = st.autoStart
+      ? '已开启（开机后进托盘，不弹窗）'
+      : '未开启';
+    el.btnAutoStart.textContent = st.autoStart ? '关闭' : '开启';
+    el.btnAutoStart.classList.toggle('strong', st.autoStart);
+    el.setIdle.textContent = idleLabel(st.idleExitMinutes);
+    const choices = [0, 30, 60, 120];
+    el.btnIdle.forEach((btn, i) => {
+      if (!btn) return;
+      btn.classList.toggle('strong', choices[i] === st.idleExitMinutes);
+    });
+  } catch (e) {
+    el.setAutoStart.textContent = `读不到：${e}`;
+  }
+}
+
+async function toggleAutoStart(btn) {
+  btn.disabled = true;
+  try {
+    const cur = await invoke('resident_settings');
+    await invoke('set_resident_settings', {
+      autoStart: !cur.autoStart,
+      idleExitMinutes: cur.idleExitMinutes,
+    });
+    await refreshResident();
+    toast(
+      cur.autoStart
+        ? '已关闭开机自启动'
+        : '已开启开机自启动：开机后只在托盘待命，双击课件才出窗口'
+    );
+  } catch (e) {
+    toast(`改不了：${e}`, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function setIdleMinutes(btn, minutes) {
+  btn.disabled = true;
+  try {
+    const cur = await invoke('resident_settings');
+    await invoke('set_resident_settings', {
+      autoStart: cur.autoStart,
+      idleExitMinutes: minutes,
+    });
+    await refreshResident();
+    toast(minutes ? `关窗后最多留 ${idleLabel(minutes).replace('后退出', '')}` : '后台常驻，不会自动退出');
   } catch (e) {
     toast(`改不了：${e}`, true);
   } finally {
@@ -4826,6 +4899,15 @@ function bindUi() {
       toggleCrashRemote(el.btnCrashRemote)
     );
   }
+  // 启动与后台
+  if (el.btnAutoStart) {
+    el.btnAutoStart.addEventListener('click', () => toggleAutoStart(el.btnAutoStart));
+  }
+  [0, 30, 60, 120].forEach((mins, i) => {
+    const btn = el.btnIdle[i];
+    if (btn) btn.addEventListener('click', () => setIdleMinutes(btn, mins));
+  });
+
   // 班级归属：登录（浏览器授权回流）/ 退出
   if (el.btnMachineLogin) {
     el.btnMachineLogin.addEventListener('click', () => loginMachine(el.btnMachineLogin));

@@ -1899,6 +1899,18 @@ HKLM\...\Run\OpenPPTViewCrashReport。后来改用 `cargo tauri build`
 - 未做的最后一步：真机「浏览器里点授权」这一步没自动跑（开发机上有一个正在运行的旧实例，
   单实例插件会把它顶回去）；已用 CDP 验证到「登录命令返回授权地址」之前的链路
 
+### Task 64：开机自启动（后台）+ 可设后台存活时长（0.3.15）
+
+- `resident_prefs.rs`（新）：`%LOCALAPPDATA%\OpenPPTView\resident.json` 存意图
+  （`auto_start`、`idle_exit_minutes`，0 = 常驻），注册表 `HKCU\...\Run` 存实际行为
+  （值名 `OpenPPTView`，命令 `"<exe>" --background`）。界面显示以**注册表为准**。
+- `--background` 启动时**不弹窗口**，只在托盘待命，并把「藏在后台」的计时从现在开始算；
+  双击课件 / 点托盘图标才出窗口（走既有单实例转发）。
+- 原来的 `IDLE_EXIT`（写死 60 分钟）改为每轮读设置；窗口藏起来后到点自动退出进程。
+- 设置页新增「启动与后台」：自启动开关 + 常驻 / 30 分钟 / 1 小时 / 2 小时四档 + 说明。
+- 验证：`cargo test -p ppt-app` **74 passed**（新增 4 条：默认值保持旧行为、
+  0 = 常驻、`--background` 识别、自启动命令带引号）；打包 0.3.15。
+
 ### 验证
 
 - [x] cargo test -p ppt-app：25 passed

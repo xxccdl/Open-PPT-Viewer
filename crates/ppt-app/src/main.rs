@@ -31,6 +31,7 @@ mod install_pref;
 mod machine_link;
 mod remote;
 mod resident;
+mod resident_prefs;
 mod update;
 
 use std::collections::{HashMap, HashSet};
@@ -1944,6 +1945,40 @@ fn machine_cancel() -> bool {
     machine_link::cancel()
 }
 
+/* ---------------- 启动与后台 ---------------- */
+
+/// 设置页「启动与后台」那一块。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResidentView {
+    /// 以**注册表**为准：那才是开机时真的会发生的事
+    auto_start: bool,
+    /// 窗口藏起来多久后退出；0 = 常驻
+    idle_exit_minutes: u64,
+}
+
+#[tauri::command]
+fn resident_settings() -> ResidentView {
+    let p = resident_prefs::load();
+    ResidentView {
+        auto_start: resident_prefs::registry_enabled(),
+        idle_exit_minutes: p.idle_exit_minutes,
+    }
+}
+
+/// 改「开机自启动 / 后台存活」。自启动写 HKCU 的 Run 键，不需要管理员权限。
+#[tauri::command]
+fn set_resident_settings(auto_start: bool, idle_exit_minutes: u64) -> Result<ResidentView, String> {
+    let mut p = resident_prefs::load();
+    p.idle_exit_minutes = idle_exit_minutes.min(43_200);
+    resident_prefs::save(&p)?;
+    let actual = resident_prefs::set_autostart(auto_start)?;
+    Ok(ResidentView {
+        auto_start: actual,
+        idle_exit_minutes: p.idle_exit_minutes,
+    })
+}
+
 /* ---------------- openFixOS（实验性） ---------------- */
 
 /// 设置页「openFixOS」那一块：开关、恢复环境可用性、有没有挂上、上次结果。
@@ -2615,9 +2650,21 @@ fn main() {
             // 诊断那条路根本不会 show，正常启动也只晚几个毫秒。
             {
                 use tauri::Manager;
+                let background = resident_prefs::started_in_background(
+                    &std::env::args().collect::<Vec<_>>(),
+                );
                 if let Some(win) = app.get_webview_window("main") {
-                    let _ = win.show();
-                    let _ = win.set_focus();
+                    if background {
+                        // 开机自启：只在托盘待命，不弹窗口。
+                        // 闲置计时从这一刻开始算，「后台存活时长」才对得上。
+                        log::info!("后台启动：窗口不显示，留在托盘待命");
+                        if let Some(state) = app.try_state::<resident::Resident>() {
+                            state.mark_hidden_now();
+                        }
+                    } else {
+                        let _ = win.show();
+                        let _ = win.set_focus();
+                    }
                 }
             }
 
@@ -2684,6 +2731,8 @@ fn main() {
             machine_login,
             machine_logout,
             machine_cancel,
+            resident_settings,
+            set_resident_settings,
             open_crash_dir,
             crash_ready,
             fixos_status,

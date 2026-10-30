@@ -28,6 +28,7 @@ mod crash;
 mod crash_repair;
 mod fixos;
 mod install_pref;
+mod machine_link;
 mod remote;
 mod resident;
 mod update;
@@ -1895,6 +1896,9 @@ fn set_crash_settings(
         // 界面上是「秒」，存的是毫秒；夹在 0～60 秒之间，挡住输入框乱填的数。
         intro_ms: intro_ms.min(60_000),
         remote,
+        // 归属不在这里改：它由「登录/退出」单独写（见 `machine_link`），
+        // 设置页只改开关，不能把老师的登录状态顺手抹掉
+        machine: crash::load_settings().machine,
     })?;
     Ok(crash::view())
 }
@@ -1912,6 +1916,32 @@ fn crash_self_test() -> crash::SelfTest {
 #[tauri::command]
 fn crash_skip_step() -> bool {
     crash::skip_current_step()
+}
+
+/* ---------------- 这台电脑属于哪个班 ---------------- */
+
+/// 当前归属（设置页「班级」那一行用它画）。
+#[tauri::command]
+fn machine_status() -> machine_link::Status {
+    machine_link::status()
+}
+
+/// 点「登录」：起本地端口 + 打开浏览器，返回要打开的地址。
+#[tauri::command]
+fn machine_login() -> Result<String, String> {
+    machine_link::login()
+}
+
+/// 点「退出」：撤销令牌并清本地。
+#[tauri::command]
+fn machine_logout() -> Result<(), String> {
+    machine_link::logout()
+}
+
+/// 取消正在等浏览器的那次授权。
+#[tauri::command]
+fn machine_cancel() -> bool {
+    machine_link::cancel()
 }
 
 /* ---------------- openFixOS（实验性） ---------------- */
@@ -2650,6 +2680,10 @@ fn main() {
             set_crash_settings,
             crash_self_test,
             crash_skip_step,
+            machine_status,
+            machine_login,
+            machine_logout,
+            machine_cancel,
             open_crash_dir,
             crash_ready,
             fixos_status,

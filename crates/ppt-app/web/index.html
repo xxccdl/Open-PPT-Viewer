@@ -486,6 +486,13 @@
                 <button class="link-btn" id="btn-open-crash">打开报告文件夹</button>
               </div>
             </div>
+            <!-- 这台电脑属于哪个班：报告与远程都按它隔离 -->
+            <div class="set-row">
+              <span class="set-label">班级归属</span>
+              <span class="set-value" id="set-machine">正在读取…</span>
+              <button class="link-btn" id="btn-machine-login">登录</button>
+              <button class="link-btn hidden" id="btn-machine-logout">退出</button>
+            </div>
             <div class="set-row">
               <span class="set-label">开机自检</span>
               <span class="set-value" id="set-crash-startup">正在读取…</span>
@@ -554,6 +561,12 @@
               上面四个小开关决定「这次跑哪几项」：全跑一遍可能要十几分钟，机房赶时间就留磁盘检查。
               「快速体检」只是采集时顺带读几项环境事实（系统盘容量、页面文件、快速启动、
               驱动加载失败），一两秒就完，建议一直开着 —— 这些往往就是蓝屏的真正原因。
+            </p>
+            <p class="assoc-hint">
+              「班级归属」决定这台电脑的报告和远程协助给谁看：点「登录」后浏览器会打开授权页，
+              登录后在列表里选一个班、点「授权这台电脑」，浏览器会自动跳回来。
+              没登录时报告仍然会上传，但只会进「未分类」，只有平台超管看得到；
+              远程协助也不会启动 —— 没有归属的电脑不该出现在任何人的列表里。
             </p>
             <p class="assoc-hint">
               「分析窗口停留」决定那块「正在分析」的大卡片在屏幕中间待多久：到时自动缩到

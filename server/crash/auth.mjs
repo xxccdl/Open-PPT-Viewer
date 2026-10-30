@@ -62,7 +62,15 @@ export class Auth {
     try {
       const text = await fs.readFile(this.usersPath, 'utf8');
       const data = JSON.parse(text);
-      return Array.isArray(data) ? data : [];
+      if (!Array.isArray(data)) return [];
+      // 老版本只有 admin / viewer 两种角色。这里统一归一：
+      // admin → platform（平台超管），viewer → user（普通账号，靠班级成员身份拿权限）。
+      // 归一放在读的时候做，写回时自然落新值 —— 同一个文件被读几次也幂等。
+      return data.map((u) => {
+        const role =
+          u.role === 'platform' ? 'platform' : u.role === 'admin' ? 'platform' : 'user';
+        return { ...u, role };
+      });
     } catch {
       return [];
     }
@@ -163,7 +171,9 @@ export class Auth {
       const user = {
         id: crypto.randomBytes(8).toString('hex'),
         username: name,
-        role: users.length === 0 ? 'admin' : 'viewer',
+        // 第一个账号是平台超管（能建学校、看全部）；其余都是普通账号，
+        // 具体能看什么由「在哪些班里」决定（见 org.mjs）。
+        role: users.length === 0 ? 'platform' : 'user',
         salt,
         hash: await Auth.#hash(pass, salt),
         createdAt: new Date().toISOString(),
@@ -242,15 +252,17 @@ export class Auth {
   }
 
   async setRole(id, role) {
-    if (!['admin', 'viewer'].includes(role)) throw new HttpError(400, '角色只有 admin / viewer');
+    if (!['platform', 'user'].includes(role)) {
+      throw new HttpError(400, '角色只有 platform / user');
+    }
     return this.#serial(async () => {
       const users = await this.#readUsers();
       const user = users.find((u) => u.id === id);
       if (!user) throw new HttpError(404, '没有这个账号');
-      // 最后一个管理员不能降级，否则没人能管人了
-      if (user.role === 'admin' && role !== 'admin') {
-        if (users.filter((u) => u.role === 'admin').length <= 1) {
-          throw new HttpError(400, '至少留一个管理员');
+      // 最后一个平台超管不能降级，否则没人能建学校了
+      if (user.role === 'platform' && role !== 'platform') {
+        if (users.filter((u) => u.role === 'platform').length <= 1) {
+          throw new HttpError(400, '至少留一个平台超管');
         }
       }
       user.role = role;
@@ -265,8 +277,8 @@ export class Auth {
       const users = await this.#readUsers();
       const target = users.find((u) => u.id === id);
       if (!target) throw new HttpError(404, '没有这个账号');
-      if (target.role === 'admin' && users.filter((u) => u.role === 'admin').length <= 1) {
-        throw new HttpError(400, '至少留一个管理员');
+      if (target.role === 'platform' && users.filter((u) => u.role === 'platform').length <= 1) {
+        throw new HttpError(400, '至少留一个平台超管');
       }
       const left = users.filter((u) => u.id !== id);
       await this.#writeUsers(left);

@@ -1629,3 +1629,55 @@ td .sub {
 .remote-log.err pre {
   color: var(--danger);
 }
+
+/* ------------------------------------------------------------------ */
+/* 学校与班级                                                          */
+/* ------------------------------------------------------------------ */
+
+.org-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 4px 0 0;
+}
+
+.org-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.org-row:last-child {
+  border-bottom: none;
+}
+
+.org-row .cell-title {
+  display: block;
+  font-weight: 600;
+}
+
+.org-row .sub {
+  display: block;
+  color: var(--muted);
+  font-size: 12.5px;
+  margin-top: 2px;
+}
+
+.org-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: none;
+}
+
+.org-expand {
+  padding: 4px 0 10px;
+  border-bottom: 1px solid var(--line);
+}
+
+.org-expand[hidden] {
+  display: none;
+}

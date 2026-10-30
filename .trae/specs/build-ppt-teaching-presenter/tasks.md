@@ -1858,6 +1858,47 @@ HKLM\...\Run\OpenPPTViewCrashReport。后来改用 `cargo tauri build`
   `web/` 三个文件，`systemctl restart openpptview-crash` 后 active；
   实测 `/health` 正常、`POST /crash/api/v1/remote/poll` 200、后台页面已出现「远程」导航
 
+### Task 63：多租户隔离 —— 平台 / 学校 / 班级（0.3.14）
+
+设计见 `multi-tenant-design.md`（同目录）。落地内容：
+
+- **服务端 `org.mjs`**（新）：学校、班级、成员、加入申请、授权码、机器令牌。
+  令牌只存 SHA-256；同一 `hwid` 重新授权会作废旧令牌；授权码 60 秒、只能用一次。
+- **`auth.mjs` 角色归一**：老 `admin → platform`、`viewer → user`，读时归一、写回落新值；
+  「至少留一个平台超管」的保护同步改名。
+- **`server.mjs` 隔离**：`machineAuth` 返回 `classId/schoolId`；报告上传写入归属；
+  列表 / 详情 / 文件 / 下载 / 状态 / 删除 / 统计全部按 `scopeOf(user)` 过滤；
+  未分类只给平台超管；改状态/删除限班级管理员（`canManageReport`）。
+- **`remote.mjs` 隔离**：机器接口只认带令牌的心跳（没登录的机器连不上，也不出现在任何列表）；
+  后台机器列表按可见班级过滤；`cmd` / `screen` / `frame` / `results` 要 `canRemoteClass`
+  （班级管理员），普通成员只读（列表里带 `canRemote`，界面据此置灰）。
+- **新接口**：`/authorize` 授权页（`web/authorize.html`）、`machine/authorize|exchange|logout|choices`、
+  `org`、`schools`、`classes`（含 `/find`、`/join`、`/members`）、`join-requests`、`machines`（含 `/revoke`）、
+  `users/find`（精确用户名，避免被枚举）。
+- **客户端**：`Settings.machine`（`MachineLink`）+ 新模块 `machine_link.rs`
+  （本机临时端口 + `state` 校验 + 一次性 code 换令牌）；设置页「班级归属」一行（登录 / 换班 / 退出）；
+  上传与远程心跳都带机器令牌；**没登录不启动远程心跳**。
+- **后台**：新增「学校班级」页（我的班级、找班/申请、建班、建校、指定管理员、审批申请、成员管理、
+  已授权电脑与撤销）；报告列表加「班级」列与筛选（超管多一个「未分类」）；远程列表加「班级」列；
+  顶栏显示「用户名 · 平台超管 / 学校管理员 · XX / 班级管理员 · XX」。
+
+**验证：**
+
+- `cargo test -p ppt-app` **69 passed**（新增 `settings_without_machine_field_still_load`、
+  `machine_link_survives_a_round_trip`、`authorize_url_points_at_the_page_not_the_api`、
+  `state_must_match_exactly`、`query_is_parsed_without_decoding`、`random_hex_is_hex_and_long_enough`）
+- 服务端隔离冒烟 **30/30**：跨班/跨校看不到、超管全见（含未分类）、授权码单次、令牌撤销后
+  上传落未分类并带警告、心跳 401、普通成员发不了远程命令、令牌只存哈希
+- **已部署**：`/opt/openpptview-crash` 增加 `org.mjs` + `web/authorize.html`，服务重启后 active；
+  线上 `/health` 正常、`/authorize` 页面可打开、未登录 `/api/v1/org` 401
+- 打包 `OpenPPTView_0.3.14_x64-setup.exe`
+- **修「登录只能点一次」**：原来第一次点完之后本地端口要等 3 分钟，这期间再点直接返回
+  「上一次还在等」，看着像按钮坏了；浏览器没打开时那个等待还会一直挂着。
+  改成用「授权编号」：再点一次即重启一轮，上一轮自己收摊；新增 `machine_cancel`
+  （等待期间按钮变「取消登录」）；浏览器打不开时自动收尾。`cargo test` **70 passed**。
+- 未做的最后一步：真机「浏览器里点授权」这一步没自动跑（开发机上有一个正在运行的旧实例，
+  单实例插件会把它顶回去）；已用 CDP 验证到「登录命令返回授权地址」之前的链路
+
 ### 验证
 
 - [x] cargo test -p ppt-app：25 passed

@@ -92,6 +92,13 @@ svg {
   flex: none;
 }
 
+/* 只有这一处用全局 `.hidden`：设置页里「退出」按钮的显示/隐藏。
+ * 其余 `.hidden` 都是 id 作用域下带过渡的（见 #settings / #welcome / #toolbar），
+ * 不能给它们套 display:none，否则淡出动画会直接消失。 */
+#btn-machine-logout.hidden {
+  display: none;
+}
+
 /* ---------- 布局 ---------- */
 
 #app {

@@ -57,6 +57,8 @@ export class RemoteHub {
     if (!m) {
       m = {
         hwid,
+        /** 归属班级：来自机器令牌。没有它就说明这台机器还没登录，不该出现在任何人的列表里 */
+        classId: '',
         name: '',
         user: '',
         admin: false,
@@ -79,6 +81,14 @@ export class RemoteHub {
   poll(meta) {
     this.prune();
     const m = this.ensure(meta.hwid);
+    // 归属以令牌为准：换了班，旧的命令与画面不该留在新班里
+    if (meta.classId && meta.classId !== m.classId) {
+      m.classId = meta.classId;
+      m.commands = [];
+      m.results = [];
+      m.screen = false;
+      m.frame = null;
+    }
     m.name = String(meta.name || m.name || '').slice(0, 64);
     m.user = String(meta.user || m.user || '').slice(0, 64);
     m.admin = Boolean(meta.admin);
@@ -151,6 +161,7 @@ export class RemoteHub {
       .sort((a, b) => String(b.lastSeen).localeCompare(String(a.lastSeen)))
       .map((m) => ({
         hwid: m.hwid,
+        classId: m.classId,
         name: m.name,
         user: m.user,
         admin: m.admin,
@@ -209,36 +220,51 @@ async function readRaw(req, max) {
 }
 
 /** 远程路由的处理器：主服务按路径把请求交给它。 */
-export function createRemoteRoutes({ json, requireUser, machineAuthorized, clientIp }) {
+export function createRemoteRoutes({ json, requireUser, machineAuth, clientIp, org }) {
   const hub = new RemoteHub();
+
+  /**
+   * 机器接口的准入：必须带一枚有效机器令牌。
+   *
+   * 没有归属的机器（没登录 / 令牌被撤销）连心跳都不该被接受 ——
+   * 否则它会出现在某个后台列表里，而没人应该「拥有」它。
+   * 用令牌里的 `hwid` 而不是请求体里的：客户端改个数也冒充不了别的机器。
+   */
+  async function machineOk(req) {
+    const auth = await machineAuth(req);
+    if (!auth.ok || !auth.classId) return null;
+    return auth;
+  }
 
   // —— 机器接口 ——
   async function poll(req, res) {
-    if (!machineAuthorized(req)) return json(res, 401, { ok: false, error: 'unauthorized' });
+    const auth = await machineOk(req);
+    if (!auth) return json(res, 401, { ok: false, error: '这台电脑还没有登录，无法远程协助' });
     const body = await readJson(req, 256 * 1024);
-    const hwid = validHwid(body.hwid);
-    if (!hwid) return json(res, 400, { ok: false, error: 'hwid 不合法' });
-    const out = hub.poll({ ...body, hwid, ip: clientIp(req) });
+    const out = hub.poll({
+      ...body,
+      hwid: auth.hwid,
+      classId: auth.classId,
+      ip: clientIp(req),
+    });
     return json(res, 200, { ok: true, commands: out.commands, screen: out.screen });
   }
 
   async function result(req, res) {
-    if (!machineAuthorized(req)) return json(res, 401, { ok: false, error: 'unauthorized' });
+    const auth = await machineOk(req);
+    if (!auth) return json(res, 401, { ok: false, error: 'unauthorized' });
     const body = await readJson(req, 1024 * 1024);
-    const hwid = validHwid(body.hwid);
-    if (!hwid) return json(res, 400, { ok: false, error: 'hwid 不合法' });
-    hub.result(hwid, body.results);
+    hub.result(auth.hwid, body.results);
     return json(res, 200, { ok: true });
   }
 
   async function framePost(req, res) {
-    if (!machineAuthorized(req)) return json(res, 401, { ok: false, error: 'unauthorized' });
-    const hwid = validHwid(req.headers['x-hwid']);
-    if (!hwid) return json(res, 400, { ok: false, error: 'hwid 不合法' });
+    const auth = await machineOk(req);
+    if (!auth) return json(res, 401, { ok: false, error: 'unauthorized' });
     const buf = await readRaw(req, MAX_FRAME);
     if (!buf.length) return json(res, 400, { ok: false, error: '空图片' });
     hub.frame(
-      hwid,
+      auth.hwid,
       buf,
       req.headers['x-frame-seq'],
       req.headers['x-frame-w'],
@@ -247,19 +273,45 @@ export function createRemoteRoutes({ json, requireUser, machineAuthorized, clien
     return json(res, 200, { ok: true, seq: Number(req.headers['x-frame-seq']) || 0 });
   }
 
+  /** 这台机器在不在这个账号的「可见且可远程」范围里。 */
+  function remoteTarget(user, hwid) {
+    const m = hub.machines.get(hwid);
+    if (!m || !m.classId) return null;
+    if (!org.canRemoteClass(user, m.classId)) return null;
+    return m;
+  }
+
   // —— 后台接口 ——
   async function machines(req, res) {
-    await requireUser(req);
-    return json(res, 200, { ok: true, machines: hub.list() });
+    const user = await requireUser(req);
+    const scope = org.scopeOf(user);
+    // 只列出「我这个范围里的班」的机器；没登录的机器（classId 空）谁都不给看
+    const list = hub
+      .list()
+      .filter((m) => m.classId && (scope.all || scope.classIds.includes(m.classId)))
+      .map((m) => {
+        const c = org.class(m.classId);
+        return {
+          ...m,
+          className: c ? c.name : '',
+          schoolName: c ? c.schoolName : '',
+          // 能看到机器 ≠ 能远程操作：普通成员只读
+          canRemote: org.canRemoteClass(user, m.classId),
+        };
+      });
+    return json(res, 200, { ok: true, machines: list });
   }
 
   async function cmd(req, res) {
-    // 远程执行命令是这台服务上权限最高的一件事：只给管理员。
-    // 只读成员能看报告、能看机器列表，但不能碰别人的电脑。
-    await requireUser(req, { write: true, admin: true });
+    // 远程执行命令是这台服务上权限最高的一件事：只给**这个班的管理员**。
+    // 报告谁都能看，但别人的电脑不能被随便碰。
+    const user = await requireUser(req, { write: true });
     const body = await readJson(req, 256 * 1024);
     const hwid = validHwid(body.hwid);
     if (!hwid) return json(res, 400, { ok: false, error: 'hwid 不合法' });
+    if (!remoteTarget(user, hwid)) {
+      return json(res, 403, { ok: false, error: '这台机器不在你能管理的班里' });
+    }
     const kind = String(body.kind || '');
     if (!['shell', 'mouse', 'key'].includes(kind)) {
       return json(res, 400, { ok: false, error: '不认识的命令类型' });
@@ -269,19 +321,25 @@ export function createRemoteRoutes({ json, requireUser, machineAuthorized, clien
   }
 
   async function screen(req, res) {
-    // 能让别人的屏幕开始往这儿推，也是管理员的事
-    await requireUser(req, { write: true, admin: true });
+    // 能让别人的屏幕开始往这儿推，同样是这个班管理员的事
+    const user = await requireUser(req, { write: true });
     const body = await readJson(req, 256 * 1024);
     const hwid = validHwid(body.hwid);
     if (!hwid) return json(res, 400, { ok: false, error: 'hwid 不合法' });
+    if (!remoteTarget(user, hwid)) {
+      return json(res, 403, { ok: false, error: '这台机器不在你能管理的班里' });
+    }
     const on = hub.setScreen(hwid, body.on);
     return json(res, 200, { ok: true, screen: on });
   }
 
   async function frameGet(req, res, url) {
-    await requireUser(req);
+    const user = await requireUser(req);
     const hwid = validHwid(url.searchParams.get('hwid'));
     if (!hwid) throw Object.assign(new Error('hwid 不合法'), { status: 400 });
+    if (!remoteTarget(user, hwid)) {
+      throw Object.assign(new Error('这台机器不在你能管理的班里'), { status: 403 });
+    }
     const m = hub.machines.get(hwid);
     if (!m || !m.frame) throw Object.assign(new Error('这台机器还没推上来画面'), { status: 404 });
 
@@ -305,9 +363,12 @@ export function createRemoteRoutes({ json, requireUser, machineAuthorized, clien
   }
 
   async function results(req, res, url) {
-    await requireUser(req);
+    const user = await requireUser(req);
     const hwid = validHwid(url.searchParams.get('hwid'));
     if (!hwid) throw Object.assign(new Error('hwid 不合法'), { status: 400 });
+    if (!remoteTarget(user, hwid)) {
+      throw Object.assign(new Error('这台机器不在你能管理的班里'), { status: 403 });
+    }
     const m = hub.machines.get(hwid);
     if (!m) return json(res, 200, { ok: true, results: [] });
     const limit = Math.min(Number(url.searchParams.get('limit') || 30), RESULT_MAX);

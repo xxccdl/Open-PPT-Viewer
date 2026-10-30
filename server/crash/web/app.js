@@ -36,6 +36,8 @@ const state = {
   initialized: false,
   authMode: 'login',
   route: '',
+  /** 学校 / 班级概览（`/api/v1/org` 的结果），顶部身份与筛选都用它。 */
+  org: null,
   /** 远程页面的轮询定时器。换页时统一清掉。 */
   remoteTimers: [],
   /** 当前显示的那一帧画面的 blob URL，换页时要撤销，否则内存一直涨。 */
@@ -189,6 +191,7 @@ const TITLES = {
   crashes: '报告',
   detail: '报告详情',
   remote: '远程',
+  org: '学校班级',
   users: '成员',
   account: '账号',
 };
@@ -198,8 +201,11 @@ async function enterApp() {
   $('#boot').classList.add('hidden');
   $('#app').classList.remove('hidden');
   $('#rail-user').textContent = state.user ? `${state.user.username} · ${state.user.role}` : '—';
-  $('#who').textContent = state.user?.username || '—';
-  $('#nav-users').hidden = state.user?.role !== 'admin';
+  $('#nav-users').hidden = state.user?.role !== 'platform';
+  // 顶部那个「我是谁」要看得到「在哪个班」—— 只写用户名的话，
+  // 班里两个人同时在线时分不清谁在管。
+  state.org = null;
+  loadOrg().then(paintIdentity).catch(paintIdentity);
   refreshPendingBadge();
   if (!location.hash || location.hash === '#/') location.hash = '#/overview';
   await render();
@@ -264,6 +270,7 @@ async function render() {
     else if (view === 'crashes') await viewCrashes(box);
     else if (view === 'detail') await viewDetail(box, id);
     else if (view === 'remote') await viewRemote(box, id);
+    else if (view === 'org') await viewOrg(box);
     else if (view === 'users') await viewUsers(box);
     else if (view === 'account') viewAccount(box);
   } catch (e) {
@@ -449,13 +456,15 @@ function bindRows(box) {
 /* 报告列表                                                           */
 /* ------------------------------------------------------------------ */
 
-const listFilter = { status: '', q: '', mode: '' };
+const listFilter = { status: '', q: '', mode: '', class: '' };
 
 async function viewCrashes(box) {
+  const org = await loadOrg();
   const params = new URLSearchParams();
   if (listFilter.status) params.set('status', listFilter.status);
   if (listFilter.q) params.set('q', listFilter.q);
   if (listFilter.mode) params.set('mode', listFilter.mode);
+  if (listFilter.class) params.set('class', listFilter.class);
   const data = await api(`crashes?${params.toString()}`);
 
   box.innerHTML = `
@@ -491,13 +500,33 @@ async function viewCrashes(box) {
         <option value="real" ${listFilter.mode === 'real' ? 'selected' : ''}>真实蓝屏</option>
         <option value="demo" ${listFilter.mode === 'demo' ? 'selected' : ''}>演示数据</option>
       </select>
+      ${
+        org.classes.length > 1 || (org.all && org.classes.length)
+          ? `<select id="f-class">
+              <option value="">全部班级</option>
+              ${org.classes
+                .map(
+                  (c) =>
+                    `<option value="${esc(c.id)}" ${listFilter.class === c.id ? 'selected' : ''}>${esc(
+                      c.name
+                    )}</option>`
+                )
+                .join('')}
+              ${
+                org.all
+                  ? `<option value="none" ${listFilter.class === 'none' ? 'selected' : ''}>未分类</option>`
+                  : ''
+              }
+            </select>`
+          : ''
+      }
     </div>
 
     <div class="card">
       ${
         data.items.length
           ? `<div class="table-wrap"><table>
-        <thead><tr><th>级别</th><th>错误码</th><th>报告</th><th>机器</th><th>版本</th><th>收到时间</th><th>状态</th><th></th></tr></thead>
+        <thead><tr><th>级别</th><th>错误码</th><th>报告</th><th>班级</th><th>机器</th><th>版本</th><th>收到时间</th><th>状态</th><th></th></tr></thead>
         <tbody>${data.items
           .map(
             (r) => `<tr data-id="${esc(r.id)}">
@@ -505,6 +534,11 @@ async function viewCrashes(box) {
               <td><span class="chip code">${esc(r.analysis?.code || r.bugcheck || '未知')}</span></td>
               <td><span class="cell-title">${esc(r.analysis?.title || '—')}</span>
                 <span class="sub mono">${esc(r.id)}</span></td>
+              <td>${
+                r.className
+                  ? `${esc(r.className)}<span class="sub">${esc(r.schoolName)}</span>`
+                  : '<span class="chip muted">未分类</span>'
+              }</td>
               <td class="mono">${esc(r.remote || '—')}</td>
               <td class="mono">${esc(r.appVersion || '—')}</td>
               <td class="mono">${esc(fmtTime(r.receivedAt))}</td>
@@ -544,6 +578,12 @@ async function viewCrashes(box) {
     listFilter.mode = e.target.value;
     viewCrashes(box);
   });
+  if ($('#f-class')) {
+    $('#f-class').addEventListener('change', (e) => {
+      listFilter.class = e.target.value;
+      viewCrashes(box);
+    });
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -926,7 +966,7 @@ async function viewRemote(box, hwid) {
       countEl.textContent = `${all.filter((m) => m.online).length} 台在线 · 共 ${all.length} 台记录`;
       listEl.innerHTML = items.length
         ? `<div class="table-wrap"><table>
-            <thead><tr><th>状态</th><th>计算机</th><th>登录用户</th><th>权限</th><th>版本</th><th>地址</th><th>最后心跳</th><th>屏幕</th></tr></thead>
+            <thead><tr><th>状态</th><th>计算机</th><th>班级</th><th>登录用户</th><th>权限</th><th>版本</th><th>地址</th><th>最后心跳</th><th>屏幕</th></tr></thead>
             <tbody>${items
               .map(
                 (m) => `<tr data-hwid="${esc(m.hwid)}">
@@ -937,6 +977,7 @@ async function viewRemote(box, hwid) {
                   }</td>
                   <td><span class="cell-title">${esc(m.name || '未命名')}</span>
                     <span class="sub mono">${esc(m.hwid)}</span></td>
+                  <td>${esc(m.className || '—')}<span class="sub">${esc(m.schoolName || '')}</span></td>
                   <td>${esc(m.user || '—')}</td>
                   <td>${
                     m.admin
@@ -1063,7 +1104,17 @@ async function viewRemoteMachine(box, hwid) {
       ].join(' · ');
       screenOn = Boolean(m.online && m.screen);
       $('#rm-screen').textContent = screenOn ? '关闭屏幕' : '打开屏幕';
-      $('#rm-screen').disabled = !m.online;
+      // 普通成员只读：按钮置灰，并说明原因（不然点了没反应会以为坏了）
+      $('#rm-screen').disabled = !m.online || !m.canRemote;
+      $('#rm-screen-sub').title = m.canRemote ? '' : '只有这个班的班级管理员能远程控制';
+      for (const sel of ['#rm-cmd', '#rm-text', '#rm-run', '#rm-type']) {
+        const el2 = $(sel);
+        if (el2) el2.disabled = !m.canRemote;
+      }
+      for (const btn of $('#rm-keys').querySelectorAll('button')) btn.disabled = !m.canRemote;
+      if (!m.canRemote) {
+        $('#rm-screen-sub').textContent = '只读：只有班级管理员能远程控制';
+      }
     } catch (e) {
       $('#rm-meta').textContent = `读不到状态：${e.message}`;
     }
@@ -1222,6 +1273,392 @@ async function viewRemoteMachine(box, hwid) {
       run();
     }
   });
+}
+
+/* ------------------------------------------------------------------ */
+/* 学校与班级                                                          */
+/* ------------------------------------------------------------------ */
+
+async function loadOrg() {
+  const data = await api('org');
+  state.org = data;
+  return data;
+}
+
+/** 顶栏那句「用户名 · 什么身份」。 */
+function paintIdentity() {
+  const org = state.org;
+  const name = state.user?.username || '—';
+  if (!org) {
+    $('#who').textContent = name;
+    return;
+  }
+  let label = '未加入班级';
+  if (org.all) label = '平台超管';
+  else {
+    const school = org.schools.find((s) => s.admins.includes(state.user.id));
+    if (school) label = `学校管理员 · ${school.name}`;
+    else {
+      const admin = org.classes.find((c) => c.admins.includes(state.user.id));
+      if (admin) label = `班级管理员 · ${admin.name}`;
+      else if (org.classes.length) label = `班级成员 · ${org.classes[0].name}`;
+    }
+  }
+  $('#who').textContent = `${name} · ${label}`;
+}
+
+async function viewOrg(box) {
+  const org = await loadOrg();
+  paintIdentity();
+  const isPlatform = state.user?.role === 'platform';
+
+  box.innerHTML = `
+    <div class="page-head">
+      <div>
+        <span class="eyebrow">Classes</span>
+        <h1>学校与班级</h1>
+        <p>
+          报告和远程控制都按班级隔离：每个人只看得到自己班级的电脑。
+          ${isPlatform ? '你是平台超管，能看到全部，包括还没归属的「未分类」记录。' : ''}
+        </p>
+      </div>
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-head"><h2>我的班级</h2><span class="sub">${org.classes.length} 个</span></div>
+        <div id="org-classes"></div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>找班 / 建班</h2><span class="sub">加入要班级管理员同意</span></div>
+        <div class="org-actions">
+          <div class="field row">
+            <input id="org-search" placeholder="搜班级名，比如「初二(3)班」" autocomplete="off" />
+            <button class="btn btn-sm" id="org-search-btn">搜索</button>
+          </div>
+          <div id="org-results"></div>
+          ${org.schools.length ? `
+          <div class="field row">
+            <input id="org-new-class" placeholder="新班级名" autocomplete="off" />
+            <select id="org-school-pick">
+              ${org.schools.map((s) => `<option value="${esc(s.id)}">${esc(s.name)}</option>`).join('')}
+            </select>
+            <button class="btn btn-sm" id="org-create-class">建班</button>
+          </div>` : ''}
+          ${isPlatform ? `
+          <div class="field row">
+            <input id="org-new-school" placeholder="新学校名（建校后可指定学校管理员）" autocomplete="off" />
+            <button class="btn btn-sm" id="org-create-school">建校</button>
+          </div>
+          <div id="org-schools"></div>` : ''}
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>待审批的加入申请</h2>
+        <span class="sub" id="org-joins-sub"></span>
+      </div>
+      <div id="org-joins"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h2>已授权的电脑</h2><span class="sub">被撤销的会标出来</span></div>
+      <div id="org-machines"></div>
+    </div>`;
+
+  // —— 我的班级 ——
+  const classBox = $('#org-classes');
+  classBox.innerHTML = org.classes.length
+    ? org.classes
+        .map(
+          (c) => `<div class="org-row">
+            <div>
+              <span class="cell-title">${esc(c.name)}</span>
+              <span class="sub">${esc(c.schoolName)} · ${c.memberCount} 人 · ${c.machineCount} 台电脑 · ${
+                c.myRole === 'admin' ? '我是管理员' : '我是成员'
+              }</span>
+            </div>
+            <div class="org-row-actions">
+              ${c.myRole === 'admin' ? `<button class="link-btn" data-members="${esc(c.id)}">成员</button>` : ''}
+              ${c.myRole === 'admin' || isPlatform ? `<button class="link-btn" data-admins="${esc(c.id)}">管理员</button>` : ''}
+            </div>
+          </div>
+          <div class="org-expand" id="expand-${esc(c.id)}" hidden></div>`
+        )
+        .join('')
+    : `<div class="empty"><strong>还没有加入任何班级</strong>
+       在右边搜班级名、申请加入；或者先用管理员账号建班。</div>`;
+
+  for (const btn of classBox.querySelectorAll('button[data-members]')) {
+    btn.addEventListener('click', () => showMembers(btn.dataset.members));
+  }
+  for (const btn of classBox.querySelectorAll('button[data-admins]')) {
+    btn.addEventListener('click', () => setClassAdmins(btn.dataset.admins));
+  }
+
+  // —— 找班 ——
+  if ($('#org-search-btn')) {
+    const doSearch = async () => {
+      const q = $('#org-search').value.trim();
+      if (!q) return;
+      const data = await api(`classes/find?q=${encodeURIComponent(q)}`);
+      $('#org-results').innerHTML = data.classes.length
+        ? data.classes
+            .map(
+              (c) => `<div class="org-row">
+                <div><span class="cell-title">${esc(c.name)}</span>
+                  <span class="sub">${esc(c.schoolName)} · ${c.memberCount} 人</span></div>
+                <div class="org-row-actions">${
+                  c.joined
+                    ? '<span class="chip fixed"><i></i>已加入</span>'
+                    : `<button class="link-btn" data-join="${esc(c.id)}">申请加入</button>`
+                }</div>
+              </div>`
+            )
+            .join('')
+        : '<p class="sub">没搜到。确认名字没写错，或让管理员先把班建好。</p>';
+      for (const btn of $('#org-results').querySelectorAll('button[data-join]')) {
+        btn.addEventListener('click', async () => {
+          try {
+            await api(`classes/${btn.dataset.join}/join`, { method: 'POST', body: {} });
+            toast('已申请，等班级管理员同意');
+            btn.disabled = true;
+          } catch (e) {
+            toast(e.message);
+          }
+        });
+      }
+    };
+    $('#org-search-btn').addEventListener('click', doSearch);
+    $('#org-search').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') doSearch();
+    });
+  }
+
+  // —— 建班 / 建校 ——
+  if ($('#org-create-class')) {
+    $('#org-create-class').addEventListener('click', async () => {
+      const name = $('#org-new-class').value.trim();
+      const schoolId = $('#org-school-pick').value;
+      if (!name) return;
+      try {
+        await api('classes', { method: 'POST', body: { schoolId, name } });
+        toast('班级已建好，你是它的管理员');
+        await render();
+      } catch (e) {
+        toast(e.message);
+      }
+    });
+  }
+  if ($('#org-create-school')) {
+    $('#org-create-school').addEventListener('click', async () => {
+      const name = $('#org-new-school').value.trim();
+      if (!name) return;
+      try {
+        await api('schools', { method: 'POST', body: { name } });
+        toast('学校已建好');
+        await render();
+      } catch (e) {
+        toast(e.message);
+      }
+    });
+  }
+  if ($('#org-schools')) {
+    $('#org-schools').innerHTML = org.schools.length
+      ? org.schools
+          .map(
+            (s) => `<div class="org-row">
+              <div><span class="cell-title">${esc(s.name)}</span>
+                <span class="sub">学校管理员：${esc((s.adminNames || []).join('、') || '还没指定')}</span></div>
+              <div class="org-row-actions">
+                <button class="link-btn" data-school-admin="${esc(s.id)}">指定管理员</button>
+              </div>
+            </div>`
+          )
+          .join('')
+      : '<p class="sub">还没有学校。先在上面建一所。</p>';
+    for (const btn of $('#org-schools').querySelectorAll('button[data-school-admin]')) {
+      btn.addEventListener('click', () => setSchoolAdmin(btn.dataset.schoolAdmin));
+    }
+  }
+
+  // —— 待审批 ——
+  const joinBox = $('#org-joins');
+  const joins = (await api('join-requests')).requests || [];
+  $('#org-joins-sub').textContent = joins.length ? `${joins.length} 条` : '没有新的';
+  joinBox.innerHTML = joins.length
+    ? joins
+        .map(
+          (r) => `<div class="org-row">
+            <div><span class="cell-title">${esc(r.username)}</span>
+              <span class="sub">申请加入 ${esc(r.className)}（${esc(r.schoolName)}）· ${esc(fmtTime(r.at))}</span></div>
+            <div class="org-row-actions">
+              <button class="btn btn-sm btn-primary" data-decide="approve" data-req="${esc(r.id)}">同意</button>
+              <button class="btn btn-sm" data-decide="reject" data-req="${esc(r.id)}">拒绝</button>
+            </div>
+          </div>`
+        )
+        .join('')
+    : '<div class="empty">没有待处理的申请。</div>';
+  for (const btn of joinBox.querySelectorAll('button[data-decide]')) {
+    btn.addEventListener('click', async () => {
+      try {
+        await api(`join-requests/${btn.dataset.req}`, {
+          method: 'POST',
+          body: { action: btn.dataset.decide },
+        });
+        toast(btn.dataset.decide === 'approve' ? '已同意' : '已拒绝');
+        await render();
+      } catch (e) {
+        toast(e.message);
+      }
+    });
+  }
+
+  // —— 已授权电脑 ——
+  const machineBox = $('#org-machines');
+  const machines = (await api('machines')).machines || [];
+  machineBox.innerHTML = machines.length
+    ? `<div class="table-wrap"><table>
+        <thead><tr><th>电脑</th><th>班级</th><th>授权时间</th><th>最后心跳</th><th>状态</th><th></th></tr></thead>
+        <tbody>${machines
+          .map(
+            (m) => `<tr>
+              <td><span class="cell-title">${esc(m.name || m.hwid)}</span>
+                <span class="sub mono">${esc(m.hwid)}</span></td>
+              <td>${esc(m.className)}<span class="sub">${esc(m.schoolName)}</span></td>
+              <td class="mono">${esc(fmtTime(m.authorizedAt))}</td>
+              <td class="mono">${esc(fmtTime(m.lastSeen))}</td>
+              <td>${
+                m.revokedAt
+                  ? '<span class="chip muted">已撤销</span>'
+                  : '<span class="chip fixed"><i></i>有效</span>'
+              }</td>
+              <td>${
+                m.revokedAt
+                  ? ''
+                  : `<button class="link-btn" data-revoke="${esc(m.hwid)}">撤销</button>`
+              }</td>
+            </tr>`
+          )
+          .join('')}</tbody></table></div>`
+    : '<div class="empty">还没有任何电脑被授权。</div>';
+  for (const btn of machineBox.querySelectorAll('button[data-revoke]')) {
+    btn.addEventListener('click', async () => {
+      if (!confirm('撤销后这台电脑的报告会进「未分类」，远程也连不上。确定吗？')) return;
+      try {
+        await api('machines/revoke', { method: 'POST', body: { hwid: btn.dataset.revoke } });
+        toast('已撤销');
+        await render();
+      } catch (e) {
+        toast(e.message);
+      }
+    });
+  }
+
+  /** 展开一个班的成员列表（含移除）；再点一次收起。 */
+  async function showMembers(classId) {
+    const box2 = $(`#expand-${classId}`);
+    if (!box2) return;
+    if (!box2.hidden) {
+      box2.hidden = true;
+      return;
+    }
+    box2.hidden = false;
+    await fillMembers(classId, box2);
+  }
+
+  /** 把成员列表画进 `box2`（不切换展开状态）。 */
+  async function fillMembers(classId, box2) {
+    const data = await api(`classes/${classId}/members`);
+    box2.innerHTML = `
+      ${data.members
+        .map(
+          (m) => `<div class="org-row">
+            <div><span class="cell-title">${esc(m.username)}</span>
+              <span class="sub">${m.admin ? '班级管理员' : '成员'} · ${esc(fmtTime(m.at))}</span></div>
+            <div class="org-row-actions">
+              <button class="link-btn" data-remove="${esc(m.id)}">移除</button>
+            </div>
+          </div>`
+        )
+        .join('')}
+      <div class="field row">
+        <input data-add-input placeholder="输入对方注册时的用户名，加进来" autocomplete="off" />
+        <button class="btn btn-sm" data-add="${classId}">添加</button>
+      </div>`;
+    for (const btn of box2.querySelectorAll('button[data-remove]')) {
+      btn.addEventListener('click', async () => {
+        try {
+          await api(`classes/${classId}/members`, {
+            method: 'POST',
+            body: { userId: btn.dataset.remove, action: 'remove' },
+          });
+          toast('已移除');
+          await fillMembers(classId, box2);
+        } catch (e) {
+          toast(e.message);
+        }
+      });
+    }
+    box2.querySelector('button[data-add]').addEventListener('click', async (e) => {
+      const name = box2.querySelector('input[data-add-input]').value.trim();
+      if (!name) return;
+      try {
+        const found = await api(`users/find?username=${encodeURIComponent(name)}`);
+        if (!found.user) return toast('没有这个账号，让对方先注册');
+        await api(`classes/${classId}/members`, {
+          method: 'POST',
+          body: { userId: found.user.id },
+        });
+        toast('已加入');
+        await fillMembers(classId, box2);
+      } catch (err) {
+        toast(err.message);
+      }
+    });
+  }
+
+  /** 指定某个班的管理员（按用户名）。 */
+  async function setClassAdmins(classId) {
+    const c = state.org.classes.find((x) => x.id === classId);
+    const name = prompt('把谁设为这个班的管理员？输入用户名（可以是多个，用逗号分隔）');
+    if (!name) return;
+    try {
+      const ids = [];
+      for (const one of name.split(/[,，\s]+/).filter(Boolean)) {
+        const found = await api(`users/find?username=${encodeURIComponent(one)}`);
+        if (!found.user) return toast(`没有账号：${one}`);
+        ids.push(found.user.id);
+      }
+      // 保留原有管理员，避免「指定一个就顶掉别人」
+      const admins = [...new Set([...(c?.admins || []), ...ids])];
+      await api(`classes/${classId}`, { method: 'PATCH', body: { admins } });
+      toast('已设为班级管理员');
+      await render();
+    } catch (e) {
+      toast(e.message);
+    }
+  }
+
+  /** 指定学校管理员（平台超管）。 */
+  async function setSchoolAdmin(schoolId) {
+    const name = prompt('把谁设为这所学校的学校管理员？输入用户名');
+    if (!name) return;
+    try {
+      const found = await api(`users/find?username=${encodeURIComponent(name)}`);
+      if (!found.user) return toast('没有这个账号');
+      const s = state.org.schools.find((x) => x.id === schoolId);
+      const admins = [...new Set([...(s?.admins || []), found.user.id])];
+      await api(`schools/${schoolId}`, { method: 'PATCH', body: { admins } });
+      toast('已设为学校管理员');
+      await render();
+    } catch (e) {
+      toast(e.message);
+    }
+  }
 }
 
 /* ------------------------------------------------------------------ */

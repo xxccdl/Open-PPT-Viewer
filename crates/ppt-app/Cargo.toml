@@ -76,4 +76,6 @@ windows = { version = "0.61", features = [
     "Win32_Graphics_Gdi",
     # 远程协助的鼠标键盘：`mouse_event` / `keybd_event` / `SendInput`
     "Win32_UI_Input_KeyboardAndMouse",
+    # 班级授权的 `state` 用系统 CSPRNG：它是这条流程唯一的防线
+    "Win32_Security_Cryptography",
 ] }

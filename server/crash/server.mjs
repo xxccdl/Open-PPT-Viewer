@@ -33,6 +33,7 @@ import { Auth, HttpError } from './auth.mjs';
 import { Zip } from './zip.mjs';
 import { explain, diagnose, scanLog } from './analysis.mjs';
 import { createRemoteRoutes } from './remote.mjs';
+import { Org } from './org.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const HOST = process.env.HOST || '127.0.0.1';
@@ -53,9 +54,17 @@ const COOKIE = 'oppv_admin';
 const SESSION_MAX_AGE = 30 * 24 * 3600;
 
 const auth = new Auth(STATE_DIR);
+/** 学校 / 班级 / 成员 / 机器授权（见 `org.mjs`）。 */
+const org = new Org(STATE_DIR);
 
 /** 远程协助：机器心跳、命令、屏幕画面（见 `remote.mjs`）。 */
-const remote = createRemoteRoutes({ json, requireUser, machineAuthorized, clientIp });
+const remote = createRemoteRoutes({
+  json,
+  requireUser,
+  machineAuth,
+  clientIp,
+  org,
+});
 
 /* ------------------------------------------------------------------ */
 /* 小工具                                                              */
@@ -110,10 +119,29 @@ function bearer(req) {
   return m ? m[1].trim() : '';
 }
 
-/** 机器上传用的共享令牌（没设 TOKEN 就是全放行）。 */
-function machineAuthorized(req) {
-  if (!TOKEN) return true;
-  return bearer(req) === TOKEN;
+/**
+ * 机器认证：一枚令牌对应「哪台电脑、哪个班」。
+ *
+ * 三种情况：
+ * - 全局 `TOKEN`（环境变量设的那个）：运维用，视为未分类，能上传但不会属于任何班；
+ * - 机器令牌（app 里授权后拿到的）：查出 `classId` / `schoolId`，报告与远程都按它归属；
+ * - 没带令牌：沿用旧行为 —— 没设 TOKEN 就放行（落未分类），设了就拒绝。
+ *
+ * `invalid` 单独标出来：令牌失效（被撤销）时**仍然收报告**，只是归到未分类
+ * 并回一句提示 —— 装机时还没登录就蓝屏的情况不少，把报告丢掉才是更坏的结果。
+ */
+async function machineAuth(req) {
+  const token = bearer(req);
+  if (TOKEN && token === TOKEN) {
+    return { ok: true, classId: '', schoolId: '', hwid: '', invalid: false };
+  }
+  if (token) {
+    const hit = org.resolveToken(token);
+    if (hit) return { ok: true, ...hit, invalid: false };
+    return { ok: false, classId: '', schoolId: '', hwid: '', invalid: true };
+  }
+  if (!TOKEN) return { ok: true, classId: '', schoolId: '', hwid: '', invalid: false };
+  return { ok: false, classId: '', schoolId: '', hwid: '', invalid: false };
 }
 
 /** 报告 id 只允许字母数字和 `-_.`：它要变成文件名，不能被路径穿越。 */
@@ -162,8 +190,35 @@ async function requireUser(req, { write = false, admin = false } = {}) {
   if (write && req.headers['x-oppv-client'] !== 'admin') {
     throw new HttpError(403, '缺少客户端标识');
   }
-  if (admin && user.role !== 'admin') throw new HttpError(403, '需要管理员权限');
+  if (admin && user.role !== 'platform') throw new HttpError(403, '需要平台超管权限');
   return user;
+}
+
+/**
+ * 这个账号能看见的班级范围。`all` = 平台超管。
+ *
+ * 未分类（`classId` 为空）不在任何班级范围内 —— 只有平台超管能看，
+ * 见 `visibleReport`。
+ */
+function scopeOf(user) {
+  return org.scopeOf(user);
+}
+
+/** 一条报告是否在这个范围里。 */
+function visibleReport(meta, scope) {
+  if (scope.all) return true;
+  const classId = String((meta && meta.classId) || '');
+  if (!classId) return false;
+  return scope.classIds.includes(classId);
+}
+
+/** 能不能改这个班的报告（改状态、删除）。 */
+function canManageReport(user, meta) {
+  if (!user) return false;
+  if (user.role === 'platform') return true;
+  const classId = String((meta && meta.classId) || '');
+  if (!classId) return false;
+  return org.canManageClass(user, classId);
 }
 
 /* ------------------------------------------------------------------ */
@@ -287,7 +342,9 @@ function annotationOf(id) {
 /* ------------------------------------------------------------------ */
 
 async function handleUpload(req, res) {
-  if (!machineAuthorized(req)) {
+  const machine = await machineAuth(req);
+  // 带了失效的令牌（被撤销）：仍然收，落未分类，并在响应里提醒客户端重新登录
+  if (!machine.ok && !machine.invalid) {
     json(res, 401, { ok: false, error: 'unauthorized' });
     req.resume();
     return;
@@ -371,6 +428,9 @@ async function handleUpload(req, res) {
     occurredAt,
     mode: String(req.headers['x-report-mode'] || 'real'),
     remote: clientIp(req),
+    // 归哪个班：来自机器令牌。没登录 / 令牌失效 → 空 = 未分类（只有平台超管看得到）
+    classId: machine.classId || '',
+    schoolId: machine.schoolId || '',
   };
   await fs.writeFile(metaPath, JSON.stringify(meta, null, 2), 'utf8');
 
@@ -378,7 +438,13 @@ async function handleUpload(req, res) {
     `[${meta.receivedAt}] 收到 ${id}（${(received / 1048576).toFixed(2)} MB，` +
       `${meta.bugcheck || '未知错误码'}，${meta.appVersion || '未知版本'}，${meta.mode}）`
   );
-  json(res, 200, { ok: true, id, bytes: received });
+  json(res, 200, {
+    ok: true,
+    id,
+    bytes: received,
+    classId: meta.classId,
+    ...(machine.invalid ? { warning: 'machine-token-invalid' } : {}),
+  });
 }
 
 /* ------------------------------------------------------------------ */
@@ -388,6 +454,7 @@ async function handleUpload(req, res) {
 function enrich(meta) {
   const info = explain(meta.bugcheck);
   const a = annotationOf(meta.id);
+  const klass = meta.classId ? org.class(meta.classId) : null;
   return {
     ...meta,
     analysis: { code: info.code, title: info.title, severity: info.severity, known: info.known },
@@ -395,11 +462,24 @@ function enrich(meta) {
     note: a.note,
     updatedAt: a.at,
     updatedBy: a.by,
+    // 后台表格里直接写「XX学校 · XX班」；未分类就是未分类
+    className: klass ? klass.name : '',
+    schoolName: klass ? klass.schoolName : '',
   };
 }
 
+/** 取一份报告并确认在这个账号的可见范围内；看不见就当作不存在。 */
+async function visibleMeta(req, id) {
+  const user = await requireUser(req);
+  const meta = await readMeta(id);
+  const scope = scopeOf(user);
+  if (!meta || !visibleReport(meta, scope)) throw new HttpError(404, '没有这份报告');
+  return { user, meta, scope };
+}
+
 async function handleList(req, res, url) {
-  await requireUser(req);
+  const user = await requireUser(req);
+  const scope = scopeOf(user);
   const q = (url.searchParams.get('q') || '').trim().toLowerCase();
   const bugcheck = (url.searchParams.get('bugcheck') || '').trim().toUpperCase();
   const version = (url.searchParams.get('version') || '').trim();
@@ -407,7 +487,16 @@ async function handleList(req, res, url) {
   const status = (url.searchParams.get('status') || '').trim();
   const limit = Math.min(Number(url.searchParams.get('limit') || 100), 500);
 
-  let items = (await readAllMetas()).map(enrich);
+  // 先按可见范围裁剪，再筛选 —— 顺序反了的话，别人班的记录会通过「总数」泄露
+  let items = (await readAllMetas()).filter((m) => visibleReport(m, scope)).map(enrich);
+
+  const classId = (url.searchParams.get('class') || '').trim();
+  if (classId) {
+    // `none` = 未分类（没有归属的机器报上来的）。只有平台超管会这么筛
+    items = items.filter((m) =>
+      classId === 'none' ? !m.classId : String(m.classId || '') === classId
+    );
+  }
 
   if (q) {
     items = items.filter((m) =>
@@ -427,9 +516,7 @@ async function handleList(req, res, url) {
 }
 
 async function handleDetail(req, res, id) {
-  await requireUser(req);
-  const meta = await readMeta(id);
-  if (!meta) throw new HttpError(404, '没有这份报告');
+  const { meta } = await visibleMeta(req, id);
 
   const detail = {
     ...enrich(meta),
@@ -478,7 +565,7 @@ async function handleDetail(req, res, id) {
 }
 
 async function handleFile(req, res, id, url) {
-  await requireUser(req);
+  await visibleMeta(req, id);
   const name = String(url.searchParams.get('name') || '');
   if (!name) throw new HttpError(400, '缺少 name');
   const zip = await Zip.open(zipPathOf(id));
@@ -498,7 +585,7 @@ async function handleFile(req, res, id, url) {
 }
 
 async function handleDownload(req, res, id) {
-  await requireUser(req);
+  await visibleMeta(req, id);
   const file = zipPathOf(id);
   let stat;
   try {
@@ -516,8 +603,9 @@ async function handleDownload(req, res, id) {
 
 async function handlePatch(req, res, id) {
   const user = await requireUser(req, { write: true });
-  const meta = await readMeta(id);
-  if (!meta) throw new HttpError(404, '没有这份报告');
+  const { meta } = await visibleMeta(req, id);
+  // 能看 ≠ 能改：状态和备注是「这个班怎么处理这次蓝屏」，只有管这个班的人能写
+  if (!canManageReport(user, meta)) throw new HttpError(403, '只能由班级管理员修改');
   const body = await readJsonBody(req);
   const next = annotationOf(id);
   if (body.status !== undefined) {
@@ -533,7 +621,9 @@ async function handlePatch(req, res, id) {
 }
 
 async function handleDelete(req, res, id) {
-  await requireUser(req, { write: true, admin: true });
+  const user = await requireUser(req, { write: true });
+  const { meta } = await visibleMeta(req, id);
+  if (!canManageReport(user, meta)) throw new HttpError(403, '只能由班级管理员删除');
   await fs.rm(zipPathOf(id), { force: true });
   await fs.rm(metaPathOf(id), { force: true });
   if (annotations[id]) {
@@ -556,9 +646,11 @@ function dayKey(iso) {
 }
 
 async function handleStats(req, res, url) {
-  await requireUser(req);
+  const user = await requireUser(req);
+  const scope = scopeOf(user);
   const days = Math.min(Math.max(Number(url.searchParams.get('days') || 14), 7), 60);
-  const all = (await readAllMetas()).map(enrich);
+  // 统计也只算自己看得到的那些：概览页上的数字同样是信息
+  const all = (await readAllMetas()).filter((m) => visibleReport(m, scope)).map(enrich);
 
   const today = new Date();
   const series = [];
@@ -700,6 +792,296 @@ async function handleUsers(req, res, url, method) {
 }
 
 /* ------------------------------------------------------------------ */
+/* 学校 / 班级 / 成员 / 机器授权                                        */
+/* ------------------------------------------------------------------ */
+
+/** 顶部身份与可见范围：后台据此画导航、填「班级」下拉。 */
+async function orgSummary(user) {
+  const scope = org.scopeOf(user);
+  const users = await auth.listUsers();
+  const nameOf = (id) => {
+    const u = users.find((x) => x.id === id);
+    return u ? u.username : '（账号已删除）';
+  };
+  const schools = org
+    .schools()
+    .filter((s) => scope.all || s.admins.includes(user.id))
+    .map((s) => ({ ...s, adminNames: s.admins.map(nameOf) }));
+  const classes = org
+    .classes()
+    .filter((c) => scope.all || scope.classIds.includes(c.id))
+    .map((c) => ({
+      ...c,
+      adminNames: c.admins.map(nameOf),
+      myRole: c.admins.includes(user.id) ? 'admin' : 'member',
+    }));
+  const pendingJoins = org.joinRequests({
+    pendingOnly: true,
+    classIds: scope.all ? undefined : scope.classIds,
+  }).length;
+  return { role: user.role, all: scope.all, schools, classes, pendingJoins };
+}
+
+async function handleOrg(req, res, url, method) {
+  const write = method !== 'GET';
+  const user = await requireUser(req, { write });
+  const p = url.pathname;
+  const body = write ? await readJsonBody(req) : {};
+
+  // —— 概览 ——
+  if (p === '/api/v1/org' && method === 'GET') {
+    json(res, 200, { ok: true, ...(await orgSummary(user)) });
+    return;
+  }
+
+  // —— 按用户名找人（加成员用）：只做精确匹配，避免被拿来枚举全体账号 ——
+  if (p === '/api/v1/users/find' && method === 'GET') {
+    const name = String(url.searchParams.get('username') || '').trim().toLowerCase();
+    if (!name) throw new HttpError(400, '缺少 username');
+    const hit = (await auth.listUsers()).find((u) => u.username.toLowerCase() === name);
+    json(res, 200, { ok: true, user: hit ? { id: hit.id, username: hit.username } : null });
+    return;
+  }
+
+  // —— 学校 ——
+  if (p === '/api/v1/schools' && method === 'POST') {
+    if (user.role !== 'platform') throw new HttpError(403, '只有平台超管能建学校');
+    json(res, 200, { ok: true, school: await org.createSchool(body.name) });
+    return;
+  }
+  let m = /^\/api\/v1\/schools\/([\w-]{4,40})$/.exec(p);
+  if (m && method === 'PATCH') {
+    if (user.role !== 'platform') throw new HttpError(403, '只有平台超管能改学校');
+    if (!org.school(m[1])) throw new HttpError(404, '没有这个学校');
+    const users = await auth.listUsers();
+    if (Array.isArray(body.admins)) {
+      await org.setSchoolAdmins(
+        m[1],
+        body.admins.filter((id) => users.some((u) => u.id === id))
+      );
+    }
+    json(res, 200, { ok: true, school: org.school(m[1]) });
+    return;
+  }
+
+  // —— 班级 ——
+  if (p === '/api/v1/classes' && method === 'POST') {
+    const schoolId = String(body.schoolId || '');
+    if (!org.isSchoolAdmin(user, schoolId)) {
+      throw new HttpError(403, '只有本校管理员或平台超管能建班');
+    }
+    json(res, 200, { ok: true, class: await org.createClass(schoolId, body.name, user.id) });
+    return;
+  }
+  // 找班（申请加入用）：按名字搜。只给「名字 + 学校 + 人数」，看不到任何报告
+  if (p === '/api/v1/classes/find' && method === 'GET') {
+    const q = String(url.searchParams.get('q') || '').trim().toLowerCase();
+    if (!q) {
+      json(res, 200, { ok: true, classes: [] });
+      return;
+    }
+    const items = org
+      .classes()
+      .filter((c) => `${c.name} ${c.schoolName}`.toLowerCase().includes(q))
+      .slice(0, 20)
+      .map((c) => ({
+        id: c.id,
+        name: c.name,
+        schoolName: c.schoolName,
+        memberCount: c.memberCount,
+        joined: org.isMember(user.id, c.id),
+      }));
+    json(res, 200, { ok: true, classes: items });
+    return;
+  }
+
+  m = /^\/api\/v1\/classes\/([\w-]{4,40})(\/[a-z]+)?$/.exec(p);
+  if (m) {
+    const classId = m[1];
+    const sub = m[2] || '';
+    const klass = org.class(classId);
+    if (!klass) throw new HttpError(404, '没有这个班级');
+
+    if (sub === '' && method === 'PATCH') {
+      if (!org.isSchoolAdmin(user, klass.schoolId) && !org.canManageClass(user, classId)) {
+        throw new HttpError(403, '只能由本校管理员修改班级');
+      }
+      const users = await auth.listUsers();
+      if (Array.isArray(body.admins)) {
+        const ids = body.admins.filter((id) => users.some((u) => u.id === id));
+        if (!ids.length) throw new HttpError(400, '班级至少留一个管理员');
+        await org.setClassAdmins(classId, ids);
+      }
+      json(res, 200, { ok: true, class: org.class(classId) });
+      return;
+    }
+
+    if (sub === '/members') {
+      if (!org.canManageClass(user, classId)) throw new HttpError(403, '只有班级管理员能管成员');
+      if (method === 'GET') {
+        const users = await auth.listUsers();
+        const members = org.membersOf(classId).map((mem) => {
+          const u = users.find((x) => x.id === mem.userId);
+          return {
+            id: mem.userId,
+            username: u ? u.username : '（账号已删除）',
+            admin: klass.admins.includes(mem.userId),
+            at: mem.at,
+          };
+        });
+        json(res, 200, { ok: true, members });
+        return;
+      }
+      if (method === 'POST') {
+        const targetId = String(body.userId || '');
+        if (body.action === 'remove') {
+          if (klass.admins.includes(targetId) && klass.admins.length <= 1) {
+            throw new HttpError(400, '至少要留一个班级管理员');
+          }
+          await org.removeMember(classId, targetId);
+        } else {
+          await org.addMember(classId, targetId);
+        }
+        json(res, 200, { ok: true, class: org.class(classId) });
+        return;
+      }
+    }
+
+    // —— 申请加入 ——
+    if (sub === '/join' && method === 'POST') {
+      if (org.isMember(user.id, classId)) throw new HttpError(409, '你已经是这个班的成员了');
+      json(res, 200, { ok: true, request: await org.requestJoin(classId, user.id) });
+      return;
+    }
+  }
+
+  // —— 加入申请 ——
+  if (p === '/api/v1/join-requests' && method === 'GET') {
+    const scope = org.scopeOf(user);
+    const users = await auth.listUsers();
+    const items = org
+      .joinRequests({ pendingOnly: true, classIds: scope.all ? undefined : scope.classIds })
+      .map((r) => {
+        const u = users.find((x) => x.id === r.userId);
+        const c = org.class(r.classId);
+        return {
+          ...r,
+          username: u ? u.username : '（账号已删除）',
+          className: c ? c.name : '',
+          schoolName: c ? c.schoolName : '',
+        };
+      })
+      .filter((r) => org.canManageClass(user, r.classId));
+    json(res, 200, { ok: true, requests: items });
+    return;
+  }
+  m = /^\/api\/v1\/join-requests\/([\w-]{4,40})$/.exec(p);
+  if (m && method === 'POST') {
+    const req0 = org.joinRequests().find((r) => r.id === m[1]);
+    if (!req0) throw new HttpError(404, '没有这条申请');
+    if (!org.canManageClass(user, req0.classId)) throw new HttpError(403, '只有班级管理员能审批');
+    const approved = body.action === 'approve';
+    json(res, 200, { ok: true, request: await org.decideJoin(m[1], approved) });
+    return;
+  }
+
+  // —— 已授权机器 ——
+  if (p === '/api/v1/machines' && method === 'GET') {
+    const scope = org.scopeOf(user);
+    const items = org
+      .machinesList()
+      .filter((m) => scope.all || scope.classIds.includes(m.classId))
+      .map((m) => {
+        const c = org.class(m.classId);
+        return { ...m, className: c ? c.name : '', schoolName: c ? c.schoolName : '' };
+      });
+    json(res, 200, { ok: true, machines: items });
+    return;
+  }
+  if (p === '/api/v1/machines/revoke' && method === 'POST') {
+    const hwid = String(body.hwid || '');
+    const rec = org.machine(hwid);
+    if (!rec) throw new HttpError(404, '没有这台机器的授权记录');
+    if (!org.canManageClass(user, rec.classId)) throw new HttpError(403, '只能撤销本班机器');
+    const n = await org.revokeMachine(hwid);
+    json(res, 200, { ok: true, revoked: n });
+    return;
+  }
+
+  throw new HttpError(404, 'not found');
+}
+
+/** 机器侧（授权后拿令牌、退出时撤销）。 */
+async function handleMachineApi(req, res, url, method) {
+  const p = url.pathname;
+
+  // 换令牌：没有会话，凭一次性授权码
+  if (p === '/api/v1/machine/exchange' && method === 'POST') {
+    const body = await readJsonBody(req);
+    const hwid = String(body.hwid || '').trim();
+    if (!/^[A-Za-z0-9_-]{4,64}$/.test(hwid)) throw new HttpError(400, 'hwid 不合法');
+    const out = await org.exchange(body.code, hwid, {
+      name: body.name,
+      version: body.version,
+    });
+    json(res, 200, { ok: true, ...out });
+    return;
+  }
+
+  // 授权页要列「我能授权的班级」
+  if (p === '/api/v1/machine/choices' && method === 'GET') {
+    const user = await requireUser(req);
+    const scope = org.scopeOf(user);
+    const classes = org
+      .classes()
+      .filter((c) => scope.all || scope.classIds.includes(c.id))
+      .map((c) => ({
+        id: c.id,
+        name: c.name,
+        schoolName: c.schoolName,
+        role: c.admins.includes(user.id) ? 'admin' : 'member',
+      }));
+    json(res, 200, {
+      ok: true,
+      user: { username: user.username, role: user.role },
+      classes,
+    });
+    return;
+  }
+
+  // 浏览器点「授权这台电脑」
+  if (p === '/api/v1/machine/authorize' && method === 'POST') {
+    const user = await requireUser(req, { write: true });
+    const body = await readJsonBody(req);
+    const classId = String(body.classId || '');
+    const state = String(body.state || '');
+    const port = Number(body.port || 0);
+    if (!(port >= 1024 && port <= 65535)) throw new HttpError(400, '端口不合法');
+    if (!state || state.length > 64) throw new HttpError(400, 'state 不合法');
+    if (user.role !== 'platform' && !org.isMember(user.id, classId)) {
+      throw new HttpError(403, '你不在这个班里，不能授权它的电脑');
+    }
+    const code = await org.issueCode({ state, classId, userId: user.id });
+    const redirect =
+      `http://127.0.0.1:${port}/callback` +
+      `?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}`;
+    json(res, 200, { ok: true, redirect });
+    return;
+  }
+
+  // 机器退出（撤销自己的令牌）
+  if (p === '/api/v1/machine/logout' && method === 'POST') {
+    const machine = await machineAuth(req);
+    if (!machine.ok || !machine.hwid) throw new HttpError(401, '机器令牌无效');
+    await org.revokeMachine(machine.hwid);
+    json(res, 200, { ok: true });
+    return;
+  }
+
+  throw new HttpError(404, 'not found');
+}
+
+/* ------------------------------------------------------------------ */
 /* 静态文件（后台网页）                                                */
 /* ------------------------------------------------------------------ */
 
@@ -765,7 +1147,9 @@ const server = http.createServer((req, res) => {
 
   const run = (fn) =>
     fn().catch((e) => {
-      const status = e instanceof HttpError ? e.status : 500;
+      // `org.mjs` 抛的是带 `status` 的普通 Error（它不该依赖本文件的 HttpError），
+      // 只顾 HttpError 的话「授权码已用过」会被当成 500 报出去。
+      const status = e instanceof HttpError ? e.status : Number(e && e.status) || 500;
       if (status >= 500) console.error('处理失败：', e);
       if (!res.headersSent) json(res, status, { ok: false, error: String(e.message || e) });
     });
@@ -777,6 +1161,36 @@ const server = http.createServer((req, res) => {
 
   // —— 远程协助 ——（机器接口 + 后台接口都在这里分派）
   if (remote(req, res, url, method)) {
+    return;
+  }
+
+  // —— 授权页（app 点「登录」时在浏览器里打开的那一页）——
+  if ((method === 'GET' || method === 'HEAD') && p === '/authorize') {
+    url.pathname = '/authorize.html';
+    run(() => serveStatic(req, res, url));
+    return;
+  }
+
+  // —— 机器侧：换令牌 / 授权 / 退出 ——
+  if (p.startsWith('/api/v1/machine/')) {
+    run(() => handleMachineApi(req, res, url, method));
+    return;
+  }
+
+  // —— 学校 / 班级 / 成员 / 机器授权 ——
+  if (
+    p === '/api/v1/org' ||
+    p === '/api/v1/users/find' ||
+    p === '/api/v1/schools' ||
+    p.startsWith('/api/v1/schools/') ||
+    p === '/api/v1/classes' ||
+    p.startsWith('/api/v1/classes/') ||
+    p === '/api/v1/join-requests' ||
+    p.startsWith('/api/v1/join-requests/') ||
+    p === '/api/v1/machines' ||
+    p.startsWith('/api/v1/machines/')
+  ) {
+    run(() => handleOrg(req, res, url, method));
     return;
   }
 
@@ -831,6 +1245,7 @@ const server = http.createServer((req, res) => {
 
 await fs.mkdir(DATA_DIR, { recursive: true });
 await auth.init();
+await org.init();
 await loadAnnotations();
 
 server.listen(PORT, HOST, () => {

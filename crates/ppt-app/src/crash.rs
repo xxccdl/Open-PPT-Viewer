@@ -136,6 +136,26 @@ pub struct Settings {
     /// 默认关等于没有。设置页写明了它做什么，关掉即彻底断开心跳。
     #[serde(default = "default_true")]
     pub remote: bool,
+    /// 这台电脑登录到了哪个班（见 `crate::machine_link`）。
+    ///
+    /// `None` = 没登录：报告落「未分类」（只有平台超管看得到），
+    /// 远程协助也不会启动 —— 没有归属的机器不该出现在任何人的列表里。
+    #[serde(default)]
+    pub machine: Option<MachineLink>,
+}
+
+/// 一次「在浏览器里授权这台电脑」的结果。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineLink {
+    /// 机器令牌（服务端只存它的哈希）。
+    pub token: String,
+    #[serde(default)]
+    pub school_name: String,
+    #[serde(default)]
+    pub class_name: String,
+    #[serde(default)]
+    pub linked_at: String,
 }
 
 fn default_intro_ms() -> u64 {
@@ -177,8 +197,20 @@ impl Default for Settings {
             quick_checks: true,
             intro_ms: default_intro_ms(),
             remote: true,
+            machine: None,
         }
     }
+}
+
+/// 这台电脑现在归属哪个班（没登录就是 `None`）。
+pub fn machine() -> Option<MachineLink> {
+    load_settings().machine
+}
+
+pub fn set_machine(link: Option<MachineLink>) -> Result<(), String> {
+    let mut s = load_settings();
+    s.machine = link;
+    save_settings(&s)
 }
 
 /// `%LOCALAPPDATA%\OpenPPTView\crash`。
@@ -2106,10 +2138,16 @@ pub fn upload(receipt: &Receipt, report: &Report) -> Result<(), String> {
         .header("X-Report-Mode", if report.demo { "demo" } else { "real" })
         .body(file);
 
-    if let Ok(token) = std::env::var("OPENPPTVIEW_CRASH_TOKEN") {
-        if !token.trim().is_empty() {
-            req = req.bearer_auth(token);
-        }
+    // 这台机器登录过班级就带机器令牌（服务端据此把报告归到那个班）；
+    // 没有就退回运维用的环境变量令牌 —— 两条都不能丢，机房排障时还要用后者。
+    let bearer_token = settings
+        .machine
+        .as_ref()
+        .map(|m| m.token.clone())
+        .or_else(|| std::env::var("OPENPPTVIEW_CRASH_TOKEN").ok())
+        .unwrap_or_default();
+    if !bearer_token.trim().is_empty() {
+        req = req.bearer_auth(bearer_token.trim());
     }
 
     let resp = req.send().map_err(|e| format!("连不上服务器：{e}"))?;
@@ -2871,6 +2909,31 @@ mod tests {
             enc.bytes().all(|b| (0x20..=0x7e).contains(&b)),
             "编码后必须是纯可见 ASCII：{enc}"
         );
+    }
+
+    /// 老 `settings.json` 里没有 `machine`（还没有班级功能时写的），不能整份解析失败。
+    #[test]
+    fn settings_without_machine_field_still_load() {
+        let s: Settings =
+            serde_json::from_str(r#"{"endpoint":"https://x/crash","enabled":true}"#)
+                .expect("应当能解析");
+        assert!(s.machine.is_none(), "没登录过就应当是 None");
+    }
+
+    /// 班级归属写进设置后要能原样读回来（令牌不能丢，否则每次开机都要重新授权）。
+    #[test]
+    fn machine_link_survives_a_round_trip() {
+        let link = MachineLink {
+            token: "tok-123".into(),
+            school_name: "示例中学".into(),
+            class_name: "初二(3)班".into(),
+            linked_at: "2026-10-30T08:00:00Z".into(),
+        };
+        let mut s = Settings::default();
+        s.machine = Some(link);
+        let text = serde_json::to_string(&s).unwrap();
+        let back: Settings = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.machine.unwrap().token, "tok-123");
     }
 
     /// 老版本留下的 `settings.json` 少字段时，不能把老师关掉的开关顶开。

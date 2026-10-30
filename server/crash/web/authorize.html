@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <title>授权这台电脑 · OpenPPTView</title>
+    <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="./style.css?v=20261030a" />
+    <style>
+      /* 授权页只需要一张卡：不要导航、不要背景装饰的层次 */
+      body {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 100vh;
+        padding: 24px;
+      }
+      .authz {
+        width: min(560px, 100%);
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        padding: 28px;
+        box-shadow: var(--shadow);
+      }
+      .authz h1 {
+        font-size: 20px;
+        margin: 0 0 6px;
+      }
+      .authz .sub {
+        color: var(--muted);
+        margin: 0 0 20px;
+        line-height: 1.7;
+      }
+      .authz .who {
+        color: var(--text-dim);
+        font-size: 13px;
+        margin-bottom: 14px;
+      }
+      .authz-list {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        margin: 0 0 18px;
+        max-height: 320px;
+        overflow: auto;
+      }
+      .authz-item {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 12px 14px;
+        border: 1px solid var(--line);
+        border-radius: var(--radius-sm);
+        background: var(--bg-soft);
+        cursor: pointer;
+        text-align: left;
+      }
+      .authz-item:hover {
+        border-color: var(--line-strong);
+      }
+      .authz-item b {
+        font-weight: 600;
+      }
+      .authz-item .sub {
+        margin: 2px 0 0;
+        font-size: 12px;
+      }
+      .authz-msg {
+        margin: 14px 0 0;
+        font-size: 13px;
+        color: var(--muted);
+        line-height: 1.7;
+      }
+      .authz-msg.err {
+        color: var(--danger);
+      }
+      .authz-msg.ok {
+        color: var(--ok);
+      }
+      .authz-login {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+      .authz-login input {
+        width: 100%;
+      }
+      .hidden {
+        display: none !important;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="authz">
+      <h1>授权这台电脑</h1>
+      <p class="sub">
+        授权后，这台电脑的蓝屏记录与远程协助只对所选班级的管理员可见。
+        随时可以在 OpenPPTView 设置里退出。
+      </p>
+
+      <div id="who" class="who hidden"></div>
+
+      <!-- 登录态：选班级 -->
+      <div id="pick" class="hidden">
+        <div id="classes" class="authz-list"></div>
+        <p class="authz-msg">
+          选好后点一下班级那一行，这台电脑就归它了。浏览器会立刻跳回 OpenPPTView。
+        </p>
+      </div>
+
+      <!-- 未登录：先登录 -->
+      <form id="login" class="authz-login hidden" autocomplete="on">
+        <label class="field">
+          <span>用户名</span>
+          <input id="u" name="username" autocomplete="username" required minlength="2" />
+        </label>
+        <label class="field">
+          <span>密码</span>
+          <input id="p" name="password" type="password" autocomplete="current-password" required minlength="8" />
+        </label>
+        <button class="btn btn-primary" type="submit">登录</button>
+      </form>
+
+      <p id="msg" class="authz-msg"></p>
+    </div>
+
+    <script>
+      const q = new URLSearchParams(location.search);
+      const port = Number(q.get('port') || 0);
+      const state = q.get('state') || '';
+      const apiBase = `${location.pathname.replace(/[^/]*$/, '')}api/v1/`;
+      const $ = (id) => document.getElementById(id);
+      const msg = (text, kind = '') => {
+        const el = $('msg');
+        el.textContent = text;
+        el.className = `authz-msg ${kind}`;
+      };
+
+      async function api(path, opts = {}) {
+        const res = await fetch(apiBase + path, {
+          method: opts.method || 'GET',
+          credentials: 'same-origin',
+          headers: {
+            'X-Oppv-Client': 'admin',
+            ...(opts.body ? { 'Content-Type': 'application/json' } : {}),
+          },
+          body: opts.body ? JSON.stringify(opts.body) : undefined,
+        });
+        let data = {};
+        try {
+          data = await res.json();
+        } catch {
+          data = {};
+        }
+        if (!res.ok) throw new Error(data.error || `请求失败（${res.status}）`);
+        return data;
+      }
+
+      function showLogin() {
+        $('login').classList.remove('hidden');
+        $('pick').classList.add('hidden');
+      }
+
+      async function loadClasses() {
+        const status = await api('auth/status');
+        if (!status.user) {
+          showLogin();
+          return;
+        }
+        $('who').textContent = `已登录：${status.user.username}`;
+        $('who').classList.remove('hidden');
+        $('login').classList.add('hidden');
+
+        const data = await api('machine/choices');
+        const box = $('classes');
+        if (!data.classes.length) {
+          box.innerHTML =
+            '<p class="authz-msg">这个账号还没有加入任何班级。请先在后台「学校班级」里加入或创建一个班。</p>';
+          $('pick').classList.remove('hidden');
+          return;
+        }
+        box.innerHTML = data.classes
+          .map(
+            (c) => `<button class="authz-item" data-id="${c.id}">
+              <span><b>${c.name}</b><p class="sub">${c.schoolName}${
+                c.role === 'admin' ? ' · 我是班级管理员' : ' · 我是班级成员'
+              }</p></span>
+              <span class="sub">授权这台电脑 ›</span>
+            </button>`
+          )
+          .join('');
+        for (const btn of box.querySelectorAll('button[data-id]')) {
+          btn.addEventListener('click', () => authorize(btn.dataset.id, btn));
+        }
+        $('pick').classList.remove('hidden');
+      }
+
+      async function authorize(classId, btn) {
+        if (!port || !state) {
+          msg('这个链接不完整（缺少 port / state）。请回到 OpenPPTView 设置里重新点「登录」。', 'err');
+          return;
+        }
+        btn.disabled = true;
+        try {
+          const data = await api('machine/authorize', {
+            method: 'POST',
+            body: { classId, port, state },
+          });
+          msg('已授权，正在回到 OpenPPTView…', 'ok');
+          location.href = data.redirect;
+        } catch (e) {
+          msg(e.message, 'err');
+          btn.disabled = false;
+        }
+      }
+
+      $('login').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const btn = e.target.querySelector('button');
+        btn.disabled = true;
+        try {
+          await api('auth/login', {
+            method: 'POST',
+            body: { username: $('u').value.trim(), password: $('p').value },
+          });
+          $('p').value = '';
+          await loadClasses();
+        } catch (err) {
+          msg(err.message, 'err');
+        } finally {
+          btn.disabled = false;
+        }
+      });
+
+      loadClasses().catch((e) => msg(e.message, 'err'));
+    </script>
+  </body>
+</html>

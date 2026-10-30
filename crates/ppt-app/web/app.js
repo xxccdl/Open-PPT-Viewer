@@ -168,6 +168,9 @@ const el = {
   btnStepChkdsk: $('btn-step-chkdsk'),
   btnStepDrivers: $('btn-step-drivers'),
   btnCrashQuick: $('btn-crash-quick'),
+  setMachine: $('set-machine'),
+  btnMachineLogin: $('btn-machine-login'),
+  btnMachineLogout: $('btn-machine-logout'),
   setCrashIntro: $('set-crash-intro'),
   setCrashRemote: $('set-crash-remote'),
   btnCrashRemote: $('btn-crash-remote'),
@@ -4083,6 +4086,7 @@ function openSettings() {
   el.settings.classList.remove('hidden');
   refreshCacheUsage();
   refreshCrash();
+  refreshMachine();
   refreshFixos();
   // 打开就查一次：点进来多半就是想看有没有新版
   refreshUpdate();
@@ -4283,6 +4287,107 @@ async function toggleCrashRemote(btn) {
     toast(next ? '远程协助已开启' : '远程协助已关闭，这台机器不再接受远程操作');
   } catch (e) {
     toast(`改不了：${e}`, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/* ---------------- 这台电脑属于哪个班 ---------------- */
+
+async function refreshMachine() {
+  if (!el.setMachine) return;
+  try {
+    const st = await invoke('machine_status');
+    if (st.error) {
+      el.setMachine.textContent = `授权没成功：${st.error}`;
+    } else if (st.linked) {
+      el.setMachine.textContent = `${st.school || '未命名学校'} · ${st.class}`;
+    } else if (st.pending) {
+      el.setMachine.textContent = '等待浏览器授权…';
+    } else {
+      el.setMachine.textContent = '未登录（报告只进「未分类」，只有平台超管看得到）';
+    }
+    // 正在等浏览器时，这个按钮就是「取消」—— 否则它会一直停在「登录」，
+    // 再点一下只会得到「上一次还在等」，看起来就像按钮坏了
+    el.btnMachineLogin.textContent = st.pending ? '取消登录' : st.linked ? '换班' : '登录';
+    el.btnMachineLogout.classList.toggle('hidden', !st.linked);
+  } catch (e) {
+    el.setMachine.textContent = `读不到：${e}`;
+  }
+}
+
+/** 登录等待计时器：取消时要能停掉它。 */
+let machineLoginTimer = null;
+
+function stopMachineLoginTimer() {
+  if (machineLoginTimer) {
+    clearInterval(machineLoginTimer);
+    machineLoginTimer = null;
+  }
+}
+
+/** 点「登录 / 换班」：打开浏览器，然后在这里等结果；正在等时这一下就是取消。 */
+async function loginMachine(btn) {
+  btn.disabled = true;
+  try {
+    const st = await invoke('machine_status').catch(() => null);
+    if (st && st.pending) {
+      await cancelMachineLogin();
+      return;
+    }
+
+    await invoke('machine_login');
+    toast('已打开浏览器：登录后选班级，点「授权这台电脑」');
+    el.setMachine.textContent = '等待浏览器授权…';
+    stopMachineLoginTimer();
+    // 浏览器那边点完，本地端口会把结果带回来 —— 这里只负责发现它到了
+    const started = Date.now();
+    machineLoginTimer = setInterval(async () => {
+      let now = null;
+      try {
+        now = await invoke('machine_status');
+      } catch {
+        return;
+      }
+      await refreshMachine();
+      if (now.linked) {
+        stopMachineLoginTimer();
+        toast(`${now.school || ''} · ${now.class}，这台电脑已经加入`);
+      } else if (!now.pending) {
+        // 主动取消 / 超时 / 失败（错误已经写在设置值里）
+        stopMachineLoginTimer();
+        if (!now.error) toast('已取消等待授权');
+      } else if (Date.now() - started > 190_000) {
+        stopMachineLoginTimer();
+      }
+    }, 1500);
+  } catch (e) {
+    toast(`打不开授权页：${e}`, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/** 取消正在等的那次授权（本地端口随即收摊，浏览器里再点也没用了）。 */
+async function cancelMachineLogin() {
+  stopMachineLoginTimer();
+  try {
+    await invoke('machine_cancel');
+  } catch {
+    /* 没有在等的就算了 */
+  }
+  await refreshMachine();
+  toast('已取消等待授权');
+}
+
+async function logoutMachine(btn) {
+  btn.disabled = true;
+  try {
+    await invoke('machine_logout');
+    await refreshMachine();
+    toast('已退出班级：这台电脑的报告会进「未分类」');
+  } catch (e) {
+    toast(`退出失败：${e}`, true);
   } finally {
     btn.disabled = false;
   }
@@ -4719,6 +4824,15 @@ function bindUi() {
   if (el.btnCrashRemote) {
     el.btnCrashRemote.addEventListener('click', () =>
       toggleCrashRemote(el.btnCrashRemote)
+    );
+  }
+  // 班级归属：登录（浏览器授权回流）/ 退出
+  if (el.btnMachineLogin) {
+    el.btnMachineLogin.addEventListener('click', () => loginMachine(el.btnMachineLogin));
+  }
+  if (el.btnMachineLogout) {
+    el.btnMachineLogout.addEventListener('click', () =>
+      logoutMachine(el.btnMachineLogout)
     );
   }
 

@@ -85,10 +85,13 @@ struct ResultItem {
 ///
 /// 两个接口挂在同一个服务上，路径只差最后一段；不写死域名是因为
 /// 学校完全可以把整套服务搬到自己的服务器上（见设置页的「上报服务器」）。
-fn remote_base(endpoint: &str) -> String {
+pub(crate) fn api_base(endpoint: &str) -> String {
     let e = endpoint.trim().trim_end_matches('/');
-    let base = e.strip_suffix("/crash").unwrap_or(e);
-    format!("{base}/remote")
+    e.strip_suffix("/crash").unwrap_or(e).to_string()
+}
+
+fn remote_base(endpoint: &str) -> String {
+    format!("{}/remote", api_base(endpoint))
 }
 
 /* ------------------------------------------------------------------ */
@@ -120,6 +123,11 @@ fn run() {
         // 每一轮都重新读设置：老师在设置页点「关闭」，几秒内就真的断开
         let settings = crate::crash::load_settings();
         if !settings.remote {
+            std::thread::sleep(Duration::from_secs(8));
+            continue;
+        }
+        // 没登录班级的机器不该出现在任何人的远程列表里：连心跳都不发
+        if settings.machine.is_none() {
             std::thread::sleep(Duration::from_secs(8));
             continue;
         }
@@ -198,7 +206,13 @@ fn identity() -> Identity {
 /* ------------------------------------------------------------------ */
 
 fn with_token(req: reqwest::blocking::RequestBuilder) -> reqwest::blocking::RequestBuilder {
-    // 与收包用的是同一个令牌：后台一设，两条链路一起收紧
+    // 优先用这台机器登录班级后拿到的那枚令牌（服务端靠它认出「这台机器归哪个班」）；
+    // 没有才退回运维用的环境变量令牌。
+    if let Some(link) = crate::crash::machine() {
+        if !link.token.trim().is_empty() {
+            return req.bearer_auth(link.token.trim());
+        }
+    }
     match std::env::var("OPENPPTVIEW_CRASH_TOKEN") {
         Ok(t) if !t.trim().is_empty() => req.bearer_auth(t.trim()),
         _ => req,
